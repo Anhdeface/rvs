@@ -30,17 +30,14 @@ impl R2Driver {
             return Err(AppError::FileNotFound(path.display().to_string()));
         }
         if path.is_dir() {
-            return Err(AppError::InvalidBinary(format!(
+            return Err(AppError::FileNotFound(format!(
                 "Target path is a directory, not a binary file: {}",
                 path.display()
             )));
         }
         if let Ok(metadata) = std::fs::metadata(&path) {
             if metadata.len() == 0 {
-                return Err(AppError::InvalidBinary(format!(
-                    "Target binary file is empty (0 bytes): {}",
-                    path.display()
-                )));
+                return Err(AppError::ZeroByteFile(path.display().to_string()));
             }
         }
         Ok(Self {
@@ -106,7 +103,7 @@ impl R2Driver {
         let stdout = sanitize_terminal_output(&String::from_utf8_lossy(&stdout_bytes));
         let stderr = sanitize_terminal_output(&String::from_utf8_lossy(&stderr_bytes));
 
-        if !status.success() && stdout.trim().is_empty() {
+        if !status.success() {
             if stderr.contains("Permission denied") {
                 return Err(AppError::PermissionDenied(self.binary_path.display().to_string()));
             }
@@ -172,6 +169,13 @@ impl R2Driver {
         let stdout = sanitize_terminal_output(&String::from_utf8_lossy(&stdout_bytes));
         let stderr = sanitize_terminal_output(&String::from_utf8_lossy(&stderr_bytes));
 
+        if stderr.contains("Cannot assemble") || stderr.contains("ERROR") {
+            return Err(AppError::AssemblyFailed {
+                instruction: r2_cmd.to_string(),
+                details: stderr.trim().to_string(),
+            });
+        }
+
         if !status.success() {
             if stderr.contains("Permission denied") {
                 return Err(AppError::PermissionDenied(self.binary_path.display().to_string()));
@@ -180,13 +184,6 @@ impl R2Driver {
                 "Write operation failed (status {}): {}",
                 status, stderr.trim()
             )));
-        }
-
-        if stderr.contains("ERROR: Cannot assemble") {
-            return Err(AppError::AssemblyFailed {
-                instruction: r2_cmd.to_string(),
-                details: stderr.trim().to_string(),
-            });
         }
 
         Ok(stdout)
@@ -244,7 +241,7 @@ impl R2Driver {
             }
         }
 
-        let preview = if trimmed.len() > 200 { &trimmed[..200] } else { trimmed };
+        let preview: String = trimmed.chars().take(200).collect();
         Err(AppError::R2ExecutionError(format!(
             "Failed to parse JSON from radare2 output: {}",
             preview
@@ -254,6 +251,18 @@ impl R2Driver {
     /// Resolves target string (hex, decimal, symbol or expression) to virtual address.
     pub fn resolve_address(&self, target: &str) -> Result<u64, AppError> {
         let trimmed = target.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::InvalidArgument("Target address or symbol cannot be empty".to_string()));
+        }
+        const FORBIDDEN_CHARS: &[char] = &[
+            ';', '\n', '\r', '`', '|', '&', '$', '>', '<', '~', '!', '\\', '"', '\'', '#',
+        ];
+        if trimmed.chars().any(|c| FORBIDDEN_CHARS.contains(&c) || c.is_control()) {
+            return Err(AppError::InvalidArgument(format!(
+                "Invalid characters in target address or symbol: {}",
+                trimmed
+            )));
+        }
         if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
             if let Ok(addr) = u64::from_str_radix(&trimmed[2..], 16) {
                 return Ok(addr);
@@ -346,7 +355,7 @@ fn execute_command_with_timeout(
                     let _ = child.wait();
                     let _ = stdout_handle.join();
                     let _ = stderr_handle.join();
-                    return Err(AppError::R2ExecutionError(format!(
+                    return Err(AppError::Timeout(format!(
                         "radare2 process timed out after {}s",
                         timeout.as_secs()
                     )));

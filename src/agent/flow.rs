@@ -30,9 +30,12 @@ pub struct BranchGateNode {
 }
 
 pub fn run_flow(driver: &R2Driver, function: &str) -> Result<AgentFlowData, AppError> {
-    let target_addr = driver.resolve_address(function).map_err(|_| {
-        AppError::SymbolNotFound(function.to_string())
-    })?;
+    let target_addr = match driver.resolve_address(function) {
+        Ok(addr) => addr,
+        Err(AppError::InvalidArgument(e)) => return Err(AppError::InvalidArgument(e)),
+        Err(AppError::Timeout(e)) => return Err(AppError::Timeout(e)),
+        Err(_) => return Err(AppError::SymbolNotFound(function.to_string())),
+    };
 
     // Analyze basic blocks
     let blocks_resp = match analysis::analyze_blocks(driver, function, true) {

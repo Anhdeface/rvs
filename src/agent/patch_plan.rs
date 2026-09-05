@@ -77,11 +77,12 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
 
         match step.step_type.to_lowercase().as_str() {
             "instruction" => {
-                if step.assembly.is_none() {
-                    return Err(AppError::PatchPlanError(format!(
+                let asm = step.assembly.as_ref().ok_or_else(|| {
+                    AppError::PatchPlanError(format!(
                         "Step {idx} of type 'instruction' missing required field 'assembly'"
-                    )));
-                }
+                    ))
+                })?;
+                crate::patch::validate_assembly(asm)?;
             }
             "bytes" => {
                 if step.hex.is_none() {
@@ -118,7 +119,11 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
 
             match step.step_type.to_lowercase().as_str() {
                 "instruction" => {
-                    let asm = step.assembly.as_ref().unwrap();
+                    let asm = step.assembly.as_ref().ok_or_else(|| {
+                        AppError::PatchPlanError(format!(
+                            "Step {idx} of type 'instruction' missing required field 'assembly'"
+                        ))
+                    })?;
                     let asm_hex = driver
                         .cmd(&format!("s {addr_num}; pa {asm}"))?
                         .trim()
@@ -144,7 +149,11 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
                     });
                 }
                 "bytes" => {
-                    let h = step.hex.as_ref().unwrap();
+                    let h = step.hex.as_ref().ok_or_else(|| {
+                        AppError::PatchPlanError(format!(
+                            "Step {idx} of type 'bytes' missing required field 'hex'"
+                        ))
+                    })?;
                     let clean_hex = h.trim().trim_start_matches("0x").replace(' ', "");
                     if clean_hex.len() % 2 != 0 || !clean_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                         return Err(AppError::InvalidHexString {
@@ -183,7 +192,11 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
                     });
                 }
                 "string" => {
-                    let new_str = step.new_string.as_ref().unwrap();
+                    let new_str = step.new_string.as_ref().ok_or_else(|| {
+                        AppError::PatchPlanError(format!(
+                            "Step {idx} of type 'string' missing required field 'new_string'"
+                        ))
+                    })?;
                     let str_hex: String = new_str.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
                     let orig_bytes = driver.read_bytes_hex(&addr_hex, new_str.len()).unwrap_or_default();
 
@@ -198,7 +211,12 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
                         message: Some("Dry run simulation successful".to_string()),
                     });
                 }
-                _ => unreachable!(),
+                _ => {
+                    return Err(AppError::PatchPlanError(format!(
+                        "Unsupported step type '{}'",
+                        step.step_type
+                    )));
+                }
             }
         }
 
@@ -222,7 +240,11 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
 
             match step.step_type.to_lowercase().as_str() {
                 "instruction" => {
-                    let asm = step.assembly.as_ref().unwrap();
+                    let asm = step.assembly.as_ref().ok_or_else(|| {
+                        AppError::PatchPlanError(format!(
+                            "Step {idx} of type 'instruction' missing required field 'assembly'"
+                        ))
+                    })?;
                     let p_res = patch::patch_instruction(
                         driver,
                         &step.addr,
@@ -242,7 +264,11 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
                     });
                 }
                 "bytes" => {
-                    let h = step.hex.as_ref().unwrap();
+                    let h = step.hex.as_ref().ok_or_else(|| {
+                        AppError::PatchPlanError(format!(
+                            "Step {idx} of type 'bytes' missing required field 'hex'"
+                        ))
+                    })?;
                     let p_res = patch::patch_bytes(driver, &step.addr, h, false)?;
                     step_results.push(PatchStepResult {
                         step_index: idx,
@@ -276,7 +302,11 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
                     });
                 }
                 "string" => {
-                    let new_str = step.new_string.as_ref().unwrap();
+                    let new_str = step.new_string.as_ref().ok_or_else(|| {
+                        AppError::PatchPlanError(format!(
+                            "Step {idx} of type 'string' missing required field 'new_string'"
+                        ))
+                    })?;
                     let p_res = patch::patch_string(
                         driver,
                         Some(&step.addr),
@@ -297,7 +327,12 @@ pub fn run_patch_plan(driver: &R2Driver, plan_str: &str) -> Result<AgentPatchPla
                         message: Some(format!("Wrote string '{new_str}'")),
                     });
                 }
-                _ => unreachable!(),
+                _ => {
+                    return Err(AppError::PatchPlanError(format!(
+                        "Unsupported step type '{}'",
+                        step.step_type
+                    )));
+                }
             }
         }
 

@@ -34,6 +34,12 @@ pub enum AppError {
         reason: String,
     },
 
+    #[error("Dynamic emulation failed for '{target}': {reason}")]
+    EmulationFailed {
+        target: String,
+        reason: String,
+    },
+
     #[error("Failed to assemble instruction '{instruction}': {details}")]
     AssemblyFailed {
         instruction: String,
@@ -110,7 +116,8 @@ impl AppError {
             | AppError::SymbolNotFound(_)
             | AppError::AddressOutOfBounds(_)
             | AppError::DecompilationFailed { .. }
-            | AppError::FlowAnalysisFailed { .. } => 3,
+            | AppError::FlowAnalysisFailed { .. }
+            | AppError::EmulationFailed { .. } => 3,
 
             AppError::AssemblyFailed { .. }
             | AppError::InvalidHexString { .. }
@@ -121,9 +128,13 @@ impl AppError {
 
             AppError::Timeout(_) => 5,
 
+            AppError::IoError(e) => match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => 2,
+                _ => 6,
+            },
+
             AppError::R2ExecutionError(_)
             | AppError::Internal(_)
-            | AppError::IoError(_)
             | AppError::JsonError(_) => 6,
         }
     }
@@ -202,6 +213,15 @@ impl AppError {
             .with_category(cat)
             .with_exit_code(code_u8)
             .with_suggestion("Check basic blocks using 'rvs -f <file> analyze blocks <func>'."),
+
+            AppError::EmulationFailed { target, reason } => ApiError::with_details(
+                "EMULATION_FAILED",
+                format!("Dynamic emulation failed for '{target}': {reason}"),
+                serde_json::json!({ "target": target, "reason": reason }),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("Verify target address or function contains executable instructions and preset registers are valid."),
 
             AppError::AssemblyFailed { instruction, details } => ApiError::with_details(
                 "ASSEMBLY_FAILED",

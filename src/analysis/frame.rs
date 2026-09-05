@@ -182,7 +182,7 @@ fn detect_prologue(ops: &[serde_json::Value]) -> Option<FrameBoundary> {
         .and_then(|o| o.get("addr").or_else(|| o.get("offset")).and_then(|v| v.as_u64()))
         .unwrap_or(0);
 
-    let last_op = prologue_ops.last().unwrap();
+    let last_op = prologue_ops.last()?;
     let last_offset = last_op.get("addr").or_else(|| last_op.get("offset")).and_then(|v| v.as_u64()).unwrap_or(0);
     let last_size = last_op.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
     let end_addr = last_offset + last_size;
@@ -217,7 +217,10 @@ fn extract_epilogue_at(ops: &[serde_json::Value], target_idx: usize) -> Option<F
     let mut idx = target_idx as isize;
 
     while idx >= 0 {
-        let op = &ops[idx as usize];
+        let op = match ops.get(idx as usize) {
+            Some(o) => o,
+            None => break,
+        };
         let opcode = op.get("opcode").or_else(|| op.get("disasm")).and_then(|v| v.as_str()).unwrap_or("");
         let is_epilogue_inst = opcode.starts_with("ret")
             || opcode.starts_with("leave")
@@ -267,7 +270,7 @@ fn extract_epilogue_at(ops: &[serde_json::Value], target_idx: usize) -> Option<F
         .and_then(|o| o.get("addr").or_else(|| o.get("offset")).and_then(|v| v.as_u64()))
         .unwrap_or(0);
 
-    let last_op = epilogue_ops.last().unwrap();
+    let last_op = epilogue_ops.last()?;
     let last_offset = last_op.get("addr").or_else(|| last_op.get("offset")).and_then(|v| v.as_u64()).unwrap_or(0);
     let last_size = last_op.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
     let end_addr = last_offset + last_size;

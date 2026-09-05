@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(short = 'q', long = "quiet", global = true)]
     pub quiet: bool,
 
+    /// Execution timeout in seconds for radare2 subprocesses
+    #[arg(long = "timeout", global = true)]
+    pub timeout: Option<u64>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -73,6 +77,10 @@ pub enum Commands {
     /// Apply binary modifications and patches
     #[command(subcommand, alias = "p")]
     Patch(PatchCommands),
+
+    /// Dynamic reverse engineering and ESIL emulation
+    #[command(subcommand, alias = "dyn", alias = "emu")]
+    Dynamic(DynamicCommands),
 
     /// High-level composite commands designed for AI agents
     #[command(subcommand, alias = "ag")]
@@ -127,6 +135,112 @@ pub enum AgentCommands {
         /// JSON patch plan string or path to JSON plan file
         #[arg(long = "plan", required = true)]
         plan: String,
+    },
+
+    /// Dynamic emulation with AI summary, register diffs, and decision gate branch outcomes
+    #[command(alias = "emu")]
+    Emulate {
+        /// Target function name or address
+        #[arg(required = true)]
+        target: String,
+
+        /// Maximum steps to emulate
+        #[arg(short = 's', long = "steps", default_value = "100")]
+        steps: usize,
+
+        /// Stop emulation at address
+        #[arg(short = 'u', long = "until")]
+        until: Option<String>,
+
+        /// Preset registers before execution (format: 'reg=val', e.g. 'rax=0x42', can be repeated)
+        #[arg(short = 'r', long = "reg")]
+        reg: Vec<String>,
+
+        /// Memory address to inspect after emulation
+        #[arg(long = "read-mem")]
+        read_mem: Option<String>,
+
+        /// Length of memory to inspect (default: 32)
+        #[arg(long = "mem-len", default_value = "32")]
+        mem_len: usize,
+    },
+
+    /// Execution trace recording instruction sequence and register deltas
+    #[command(alias = "tr")]
+    Trace {
+        /// Target function name or address
+        #[arg(required = true)]
+        target: String,
+
+        /// Number of steps to trace
+        #[arg(short = 's', long = "steps", default_value = "20")]
+        steps: usize,
+
+        /// Preset registers before trace (format: 'reg=val', can be repeated)
+        #[arg(short = 'r', long = "reg")]
+        reg: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DynamicCommands {
+    /// Emulate execution of a function or address range using radare2 ESIL
+    #[command(alias = "emu")]
+    Emulate {
+        /// Target function name or start address (e.g. 'main', 'sym.check_auth', '0x1146')
+        #[arg(required = true)]
+        target: String,
+
+        /// Maximum number of ESIL steps to emulate (default: 100)
+        #[arg(short = 's', long = "steps", default_value = "100")]
+        steps: usize,
+
+        /// Stop emulation when program counter reaches this address
+        #[arg(short = 'u', long = "until")]
+        until: Option<String>,
+
+        /// Preset registers before execution (format: 'reg=val', e.g. 'rax=1', can be repeated)
+        #[arg(short = 'r', long = "reg")]
+        reg_set: Vec<String>,
+
+        /// Read memory at address after emulation (hex or symbol)
+        #[arg(long = "read-mem")]
+        read_mem: Option<String>,
+
+        /// Number of memory bytes to read (default: 32)
+        #[arg(long = "mem-len", default_value = "32")]
+        mem_len: usize,
+    },
+
+    /// Trace instruction execution step-by-step with register diffs
+    #[command(alias = "tr")]
+    Trace {
+        /// Target function name or start address
+        #[arg(required = true)]
+        target: String,
+
+        /// Number of instructions to trace (default: 20)
+        #[arg(short = 's', long = "steps", default_value = "20")]
+        steps: usize,
+
+        /// Preset registers before trace (format: 'reg=val', e.g. 'rax=1', can be repeated)
+        #[arg(short = 'r', long = "reg")]
+        reg_set: Vec<String>,
+    },
+
+    /// Emulate single step (or N steps) and show register changes
+    Step {
+        /// Target function name or start address
+        #[arg(required = true)]
+        target: String,
+
+        /// Number of steps (default: 1)
+        #[arg(short = 'n', long = "count", alias = "steps", short_alias = 's', default_value = "1")]
+        count: usize,
+
+        /// Preset registers before step (format: 'reg=val', can be repeated)
+        #[arg(short = 'r', long = "reg")]
+        reg_set: Vec<String>,
     },
 }
 

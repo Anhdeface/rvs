@@ -233,13 +233,30 @@ pub fn analyze_xrefs(
         }
     }
 
+    #[inline]
+    fn xref_type_to_u8(t: &str) -> u8 {
+        match t {
+            "call" => 1,
+            "code" => 2,
+            "string" => 3,
+            "data" => 4,
+            "read" => 5,
+            "write" => 6,
+            other => other.bytes().fold(0u8, |acc, b| acc.wrapping_mul(31).wrapping_add(b)),
+        }
+    }
+
+    #[inline]
+    fn xref_key(e: &XrefEntry) -> (u64, u64, u8) {
+        (e.from_addr, e.to_addr, xref_type_to_u8(&e.xref_type))
+    }
+
     // Deduplicate helper
     fn deduplicate(entries: Vec<XrefEntry>) -> Vec<XrefEntry> {
-        let mut unique = Vec::new();
+        let mut seen = std::collections::HashSet::with_capacity(entries.len());
+        let mut unique = Vec::with_capacity(entries.len());
         for entry in entries {
-            if !unique.iter().any(|e: &XrefEntry| {
-                e.from_addr == entry.from_addr && e.to_addr == entry.to_addr && e.xref_type == entry.xref_type
-            }) {
+            if seen.insert(xref_key(&entry)) {
                 unique.push(entry);
             }
         }
@@ -259,26 +276,21 @@ pub fn analyze_xrefs(
     to_entries.sort_by(|a, b| a.from_addr.cmp(&b.from_addr).then_with(|| a.to_addr.cmp(&b.to_addr)));
     from_entries.sort_by(|a, b| a.from_addr.cmp(&b.from_addr).then_with(|| a.to_addr.cmp(&b.to_addr)));
 
-    let mut all_unique = Vec::new();
-    for entry in to_entries.iter().chain(from_entries.iter()) {
-        if !all_unique.iter().any(|e: &XrefEntry| {
-            e.from_addr == entry.from_addr && e.to_addr == entry.to_addr && e.xref_type == entry.xref_type
-        }) {
-            all_unique.push(entry.clone());
+    let (count, xrefs) = match direction {
+        XrefDirection::To => (to_entries.len(), to_entries.clone()),
+        XrefDirection::From => (from_entries.len(), from_entries.clone()),
+        XrefDirection::All => {
+            let mut seen = std::collections::HashSet::with_capacity(to_entries.len() + from_entries.len());
+            let mut all_unique = Vec::with_capacity(to_entries.len() + from_entries.len());
+            for entry in to_entries.iter().chain(from_entries.iter()) {
+                if seen.insert(xref_key(entry)) {
+                    all_unique.push(entry.clone());
+                }
+            }
+            all_unique.sort_by(|a, b| a.from_addr.cmp(&b.from_addr).then_with(|| a.to_addr.cmp(&b.to_addr)));
+            let count = all_unique.len();
+            (count, all_unique)
         }
-    }
-    all_unique.sort_by(|a, b| a.from_addr.cmp(&b.from_addr).then_with(|| a.to_addr.cmp(&b.to_addr)));
-
-    let count = match direction {
-        XrefDirection::To => to_entries.len(),
-        XrefDirection::From => from_entries.len(),
-        XrefDirection::All => all_unique.len(),
-    };
-
-    let xrefs = match direction {
-        XrefDirection::To => to_entries.clone(),
-        XrefDirection::From => from_entries.clone(),
-        XrefDirection::All => all_unique,
     };
 
     Ok(XrefsResponse {

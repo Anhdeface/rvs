@@ -153,7 +153,7 @@ class TestMcpProtocolAndJsonRpc(TestChallengerBase):
         self.assertEqual(r3.get("jsonrpc"), "2.0")
         self.assertEqual(r3.get("id"), 3)
         tools = r3["result"].get("tools", [])
-        self.assertEqual(len(tools), 13)
+        self.assertEqual(len(tools), 16)
 
         # Resp 4: tools/call
         r4 = resps[3]
@@ -337,9 +337,9 @@ class TestMcpProtocolAndJsonRpc(TestChallengerBase):
 # =============================================================================
 
 class TestUniversalToolSchemas(TestChallengerBase):
-    """Exhaustive validation of all 13 canonical tool schemas across 4 formats."""
+    """Exhaustive validation of all 16 canonical tool schemas across 4 formats."""
 
-    EXPECTED_13_TOOLS = [
+    EXPECTED_16_TOOLS = [
         "rvs_info",
         "rvs_functions",
         "rvs_disasm",
@@ -353,13 +353,17 @@ class TestUniversalToolSchemas(TestChallengerBase):
         "rvs_patch_bytes",
         "rvs_agent_triage",
         "rvs_agent_patch_plan",
+        "rvs_dynamic_emulate",
+        "rvs_dynamic_trace",
+        "rvs_dynamic_step",
     ]
+    EXPECTED_13_TOOLS = EXPECTED_16_TOOLS  # backward compatibility alias
 
     def test_01_canonical_tools_count_and_completeness(self):
-        """Verify CANONICAL_TOOLS contains all 13 expected tools with valid definitions."""
-        self.assertEqual(len(CANONICAL_TOOLS), 13)
+        """Verify CANONICAL_TOOLS contains all 16 expected tools with valid definitions."""
+        self.assertEqual(len(CANONICAL_TOOLS), 16)
         tool_names = [t["name"] for t in CANONICAL_TOOLS]
-        self.assertEqual(tool_names, self.EXPECTED_13_TOOLS)
+        self.assertEqual(tool_names, self.EXPECTED_16_TOOLS)
 
         for t in CANONICAL_TOOLS:
             self.assertIn("name", t)
@@ -374,12 +378,12 @@ class TestUniversalToolSchemas(TestChallengerBase):
     def test_02_openai_schema_compliance(self):
         """Verify OpenAI function calling schema specifications."""
         schemas = get_tool_schemas("openai")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
             self.assertEqual(s.get("type"), "function")
             fn = s.get("function")
             self.assertIsInstance(fn, dict)
-            self.assertIn(fn.get("name"), self.EXPECTED_13_TOOLS)
+            self.assertIn(fn.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(fn.get("description"), str)
             self.assertGreater(len(fn.get("description", "")), 10)
             params = fn.get("parameters")
@@ -392,9 +396,9 @@ class TestUniversalToolSchemas(TestChallengerBase):
     def test_03_anthropic_schema_compliance(self):
         """Verify Anthropic tool calling schema specifications."""
         schemas = get_tool_schemas("anthropic")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
-            self.assertIn(s.get("name"), self.EXPECTED_13_TOOLS)
+            self.assertIn(s.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(s.get("description"), str)
             self.assertGreater(len(s.get("description", "")), 10)
             input_schema = s.get("input_schema")
@@ -407,10 +411,10 @@ class TestUniversalToolSchemas(TestChallengerBase):
     def test_04_gemini_schema_compliance(self):
         """Verify Gemini function declaration schema with uppercase types."""
         schemas = get_tool_schemas("gemini")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         valid_gemini_types = {"STRING", "INTEGER", "NUMBER", "BOOLEAN", "OBJECT", "ARRAY"}
         for s in schemas:
-            self.assertIn(s.get("name"), self.EXPECTED_13_TOOLS)
+            self.assertIn(s.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(s.get("description"), str)
             params = s.get("parameters")
             self.assertIsInstance(params, dict)
@@ -427,9 +431,9 @@ class TestUniversalToolSchemas(TestChallengerBase):
     def test_05_mcp_schema_compliance(self):
         """Verify MCP tool schema specifications."""
         schemas = get_tool_schemas("mcp")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
-            self.assertIn(s.get("name"), self.EXPECTED_13_TOOLS)
+            self.assertIn(s.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(s.get("description"), str)
             schema = s.get("inputSchema")
             self.assertIsInstance(schema, dict)
@@ -443,7 +447,7 @@ class TestUniversalToolSchemas(TestChallengerBase):
             schemas = get_tool_schemas(fmt)  # type: ignore
             dumped = json.dumps(schemas)
             loaded = json.loads(dumped)
-            self.assertEqual(len(loaded), 13)
+            self.assertEqual(len(loaded), 16)
 
 
 # =============================================================================

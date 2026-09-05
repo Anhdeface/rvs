@@ -18,9 +18,12 @@ pub struct AgentDecompileData {
 }
 
 pub fn run_decompile(driver: &R2Driver, function: &str) -> Result<AgentDecompileData, AppError> {
-    let target_addr = driver.resolve_address(function).map_err(|_| {
-        AppError::SymbolNotFound(function.to_string())
-    })?;
+    let target_addr = match driver.resolve_address(function) {
+        Ok(addr) => addr,
+        Err(AppError::InvalidArgument(e)) => return Err(AppError::InvalidArgument(e)),
+        Err(AppError::Timeout(e)) => return Err(AppError::Timeout(e)),
+        Err(_) => return Err(AppError::SymbolNotFound(function.to_string())),
+    };
 
     // Find function info
     let funcs_resp = analysis::analyze_functions(driver, None, false)?;

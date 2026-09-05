@@ -52,9 +52,10 @@ fn generate_callgraph(
     format: GraphFormat,
 ) -> Result<GraphResponse, AppError> {
     let (raw_funcs, raw_cg): (Vec<serde_json::Value>, Vec<serde_json::Value>) = if let Some(t) = target {
+        let target_addr = driver.resolve_address(t)?;
         let batch = driver.cmd_batch(&[
             "aa; aflj",
-            &format!("s {}; agcj", t),
+            &format!("s {:#x}; agcj", target_addr),
         ])?;
         (
             R2Driver::parse_json(batch.first().map(|s| s.as_str()).unwrap_or("")).unwrap_or_default(),

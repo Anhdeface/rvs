@@ -20,6 +20,36 @@ pub struct PatchResult {
     pub verified: bool,
 }
 
+pub const FORBIDDEN_ASM_CHARS: &[char] = &[
+    ';', '\n', '\r', '`', '|', '&', '$', '>', '<', '~', '!', '\\', '"', '\'', '#', '@',
+];
+
+pub fn validate_assembly(asm: &str) -> Result<(), AppError> {
+    let trimmed = asm.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::AssemblyFailed {
+            instruction: asm.to_string(),
+            details: "Assembly instruction cannot be empty".to_string(),
+        });
+    }
+
+    if let Some(c) = trimmed.chars().find(|c| FORBIDDEN_ASM_CHARS.contains(c) || (c.is_control() && *c != '\t')) {
+        return Err(AppError::AssemblyFailed {
+            instruction: asm.to_string(),
+            details: format!("Forbidden character '{}' in assembly instruction", c),
+        });
+    }
+
+    if trimmed.ends_with(',') || trimmed.contains(",,") {
+        return Err(AppError::AssemblyFailed {
+            instruction: asm.to_string(),
+            details: "Invalid or incomplete assembly syntax (trailing comma or double comma)".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 pub fn patch_instruction(
     driver: &R2Driver,
     addr: &str,
@@ -65,13 +95,8 @@ pub fn patch_instruction(
             verified: true,
         })
     } else if let Some(asm) = assembly {
+        validate_assembly(asm)?;
         let trimmed_asm = asm.trim();
-        if trimmed_asm.is_empty() || trimmed_asm.ends_with(',') || trimmed_asm.contains(",,") {
-            return Err(AppError::AssemblyFailed {
-                instruction: asm.to_string(),
-                details: "Invalid or incomplete assembly syntax (empty instruction or trailing comma)".to_string(),
-            });
-        }
 
         // Pre-assemble instruction with seek awareness to properly compute relative offsets (jumps, calls, RIP-relative addressing)
         let pa_out = driver.cmd(&format!("s {}; pa {}", addr_hex, trimmed_asm))?;

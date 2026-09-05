@@ -341,7 +341,7 @@ fn test_timeout_enforcement_and_process_cleanup() {
 
     assert!(result.is_err(), "Hanging command should error due to timeout");
     match result.unwrap_err() {
-        AppError::R2ExecutionError(msg) => {
+        AppError::Timeout(msg) => {
             assert!(msg.contains("timed out"), "Error message must indicate timeout: {}", msg);
         }
         other => panic!("Unexpected error type: {:?}", other),
@@ -429,8 +429,8 @@ fn test_driver_binary_validation_exhaustive() {
     let err_dir = R2Driver::new("/tmp", None, None, false);
     assert!(err_dir.is_err());
     match err_dir.unwrap_err() {
-        AppError::InvalidBinary(msg) => assert!(msg.contains("directory")),
-        other => panic!("Expected InvalidBinary, got {:?}", other),
+        AppError::FileNotFound(msg) => assert!(msg.contains("directory")),
+        other => panic!("Expected FileNotFound, got {:?}", other),
     }
 
     // 3. 0-byte empty file
@@ -441,7 +441,202 @@ fn test_driver_binary_validation_exhaustive() {
     let err_empty = R2Driver::new(&empty_file, None, None, false);
     assert!(err_empty.is_err());
     match err_empty.unwrap_err() {
-        AppError::InvalidBinary(msg) => assert!(msg.contains("empty (0 bytes)")),
-        other => panic!("Expected InvalidBinary for 0-byte file, got {:?}", other),
+        AppError::ZeroByteFile(path) => assert!(path.contains("zero_bytes.bin")),
+        other => panic!("Expected ZeroByteFile for 0-byte file, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_driver_resolve_address_sanitization() {
+    let binary = get_test_binary();
+    let driver = R2Driver::new(&binary, None, None, true).expect("Driver creation failed");
+
+    // Empty target
+    let err_empty = driver.resolve_address("");
+    assert!(err_empty.is_err());
+    match err_empty.unwrap_err() {
+        AppError::InvalidArgument(msg) => assert!(msg.contains("empty")),
+        other => panic!("Expected InvalidArgument for empty target, got {:?}", other),
+    }
+
+    // Semicolon injection
+    let err_semi = driver.resolve_address("sym.main; ?e injected");
+    assert!(err_semi.is_err());
+    match err_semi.unwrap_err() {
+        AppError::InvalidArgument(msg) => assert!(msg.contains("Invalid characters")),
+        other => panic!("Expected InvalidArgument for semicolon injection, got {:?}", other),
+    }
+
+    // Newline injection
+    let err_newline = driver.resolve_address("sym.main\n?e injected");
+    assert!(err_newline.is_err());
+    match err_newline.unwrap_err() {
+        AppError::InvalidArgument(msg) => assert!(msg.contains("Invalid characters")),
+        other => panic!("Expected InvalidArgument for newline injection, got {:?}", other),
+    }
+
+    // Backtick injection
+    let err_backtick = driver.resolve_address("`whoami`");
+    assert!(err_backtick.is_err());
+    match err_backtick.unwrap_err() {
+        AppError::InvalidArgument(msg) => {
+            assert!(msg.contains("Invalid characters"));
+        }
+        other => panic!("Expected InvalidArgument for backtick injection, got {:?}", other),
+    }
+
+    // Radare2 shell redirection operators: >, <, >>
+    for payload in &[
+        "sym.main > /tmp/test_redir",
+        "0x401000 >> /tmp/test_redir",
+        "< /tmp/test_redir",
+        "> /tmp/test_redir",
+        ">> /tmp/test_redir",
+        "sym.main < /dev/null",
+    ] {
+        let err = driver.resolve_address(payload);
+        assert!(err.is_err(), "Payload '{}' must be rejected", payload);
+        let app_err = err.unwrap_err();
+        assert_eq!(app_err.exit_code(), 1, "Exit code must be 1 (InvalidArgument)");
+        match app_err {
+            AppError::InvalidArgument(msg) => {
+                assert!(msg.contains("Invalid characters in target address or symbol"));
+            }
+            other => panic!("Expected InvalidArgument for '{}', got {:?}", payload, other),
+        }
+    }
+
+    // Shell and r2 meta-characters: ~, !, \, ", ', #, |, &, $
+    for payload in &[
+        "sym.main~grep",
+        "sym.main!cat",
+        "sym.main\\escape",
+        "sym.main\"quote",
+        "sym.main'quote",
+        "sym.main#comment",
+        "sym.main|pipe",
+        "sym.main&bg",
+        "sym.main$var",
+    ] {
+        let err = driver.resolve_address(payload);
+        assert!(err.is_err(), "Payload '{}' must be rejected", payload);
+        let app_err = err.unwrap_err();
+        assert_eq!(app_err.exit_code(), 1, "Exit code must be 1 (InvalidArgument)");
+        match app_err {
+            AppError::InvalidArgument(msg) => {
+                assert!(msg.contains("Invalid characters in target address or symbol"));
+            }
+            other => panic!("Expected InvalidArgument for '{}', got {:?}", payload, other),
+        }
+    }
+}
+
+#[test]
+fn test_driver_resolve_address_redirection_prevention_on_filesystem() {
+    let binary = get_test_binary();
+    let driver = R2Driver::new(&binary, None, None, true).expect("Driver creation failed");
+
+    let temp_dir = TempDir::new().expect("Failed to create tempdir");
+    let canary_gt = temp_dir.path().join("canary_gt.txt");
+    let canary_append = temp_dir.path().join("canary_append.txt");
+    let canary_lt = temp_dir.path().join("canary_lt.txt");
+    let canary_pwn = temp_dir.path().join("canary_pwn.txt");
+
+    // Redirection payloads targeting temp filesystem paths
+    let attack_vectors = [
+        format!("0x401000 > {}", canary_gt.display()),
+        format!("sym.main > {}", canary_pwn.display()),
+        format!("0x401000 >> {}", canary_append.display()),
+        format!("< {}", canary_lt.display()),
+        format!("> {}", canary_gt.display()),
+    ];
+
+    for attack in &attack_vectors {
+        let res = driver.resolve_address(attack);
+        assert!(res.is_err(), "Attack vector '{}' should have failed", attack);
+        let err = res.unwrap_err();
+        assert_eq!(err.exit_code(), 1, "Exit code must be 1 for InvalidArgument");
+        match err {
+            AppError::InvalidArgument(msg) => {
+                assert!(msg.contains("Invalid characters in target address or symbol"));
+            }
+            other => panic!("Expected InvalidArgument, got {:?}", other),
+        }
+    }
+
+    // Verify none of the canary files were created on the filesystem
+    assert!(!canary_gt.exists(), "canary_gt.txt must NOT be created on disk");
+    assert!(!canary_pwn.exists(), "canary_pwn.txt must NOT be created on disk");
+    assert!(!canary_append.exists(), "canary_append.txt must NOT be created on disk");
+    assert!(!canary_lt.exists(), "canary_lt.txt must NOT be created on disk");
+}
+
+#[test]
+fn test_agent_decompile_and_flow_preserve_invalid_argument_exit_code() {
+    let binary = get_test_binary();
+    let driver = R2Driver::new(&binary, None, None, true).expect("Driver creation failed");
+
+    let temp_dir = TempDir::new().expect("Failed to create tempdir");
+    let canary_decomp = temp_dir.path().join("canary_decomp.txt");
+    let canary_flow = temp_dir.path().join("canary_flow.txt");
+
+    let redir_decomp_payload = format!("sym.main > {}", canary_decomp.display());
+    let redir_flow_payload = format!("sym.main > {}", canary_flow.display());
+
+    // 1. Redirection payloads in agent decompile and flow
+    let err_decomp = rvs::agent::run_decompile(&driver, &redir_decomp_payload);
+    assert!(err_decomp.is_err());
+    let err_d = err_decomp.unwrap_err();
+    assert_eq!(err_d.exit_code(), 1, "agent decompile must return exit code 1 for InvalidArgument");
+    match err_d {
+        AppError::InvalidArgument(msg) => assert!(msg.contains("Invalid characters")),
+        other => panic!("Expected InvalidArgument, got {:?}", other),
+    }
+    assert!(!canary_decomp.exists(), "agent decompile must NOT create canary file");
+
+    let err_flow = rvs::agent::run_flow(&driver, &redir_flow_payload);
+    assert!(err_flow.is_err());
+    let err_f = err_flow.unwrap_err();
+    assert_eq!(err_f.exit_code(), 1, "agent flow must return exit code 1 for InvalidArgument");
+    match err_f {
+        AppError::InvalidArgument(msg) => assert!(msg.contains("Invalid characters")),
+        other => panic!("Expected InvalidArgument, got {:?}", other),
+    }
+    assert!(!canary_flow.exists(), "agent flow must NOT create canary file");
+
+    // 2. Command injection payloads in agent decompile and flow
+    let semi_payload = "sym.main; ?e injected";
+    let err_semi_d = rvs::agent::run_decompile(&driver, semi_payload).unwrap_err();
+    assert_eq!(err_semi_d.exit_code(), 1, "agent decompile with semicolon must return exit code 1");
+    assert!(matches!(err_semi_d, AppError::InvalidArgument(_)));
+
+    let err_semi_f = rvs::agent::run_flow(&driver, semi_payload).unwrap_err();
+    assert_eq!(err_semi_f.exit_code(), 1, "agent flow with semicolon must return exit code 1");
+    assert!(matches!(err_semi_f, AppError::InvalidArgument(_)));
+
+    // 3. Normal non-existent symbol must still return SymbolNotFound (exit code 3)
+    let non_existent = "nonexistent_function_symbol_xyz";
+    let err_nonexist_d = rvs::agent::run_decompile(&driver, non_existent).unwrap_err();
+    assert_eq!(err_nonexist_d.exit_code(), 3, "Nonexistent symbol in decompile must return exit code 3");
+    assert!(matches!(err_nonexist_d, AppError::SymbolNotFound(_)));
+
+    let err_nonexist_f = rvs::agent::run_flow(&driver, non_existent).unwrap_err();
+    assert_eq!(err_nonexist_f.exit_code(), 3, "Nonexistent symbol in flow must return exit code 3");
+    assert!(matches!(err_nonexist_f, AppError::SymbolNotFound(_)));
+}
+
+#[test]
+fn test_driver_parse_json_utf8_multibyte_boundary() {
+    // Construct output with multi-byte UTF-8 character (e.g. 🦀, 4 bytes) straddling byte 200
+    let mut payload = "A".repeat(198);
+    payload.push_str("🦀🦀🦀 invalid json trailing content");
+
+    let parsed = R2Driver::parse_json::<serde_json::Value>(&payload);
+    assert!(parsed.is_err(), "Invalid JSON should error");
+    match parsed.unwrap_err() {
+        AppError::R2ExecutionError(msg) => {
+            assert!(msg.contains("Failed to parse JSON"));
+        }
+        other => panic!("Expected R2ExecutionError, got {:?}", other),
     }
 }

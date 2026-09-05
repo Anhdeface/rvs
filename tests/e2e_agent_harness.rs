@@ -442,3 +442,36 @@ fn test_harness_full_crackme_resolution_flow() {
     assert!(stdout.contains("Valid serial"));
     assert!(stdout.contains("Join us : https://t.me/+blTRfHi8oKJiN2E0"));
 }
+
+#[test]
+fn test_harness_dynamic_emulation_and_session_cache() {
+    let target = crackme_path();
+    let target_str = target.to_str().unwrap();
+
+    // 1. Test running dynamic emulate through the python harness
+    let out_emu = run_python_harness(&[
+        "-f", target_str,
+        "-c",
+        "dynamic", "emulate", "main",
+        "--steps", "5",
+    ]);
+    assert!(out_emu.status.success(), "Dynamic emulate via harness failed: {:?}", out_emu.status);
+    let v: serde_json::Value = serde_json::from_slice(&out_emu.stdout).expect("Failed to parse JSON");
+    assert_eq!(v["success"], true);
+    assert_eq!(v["command"], "dynamic emulate");
+    assert_eq!(v["data"]["steps"], 5);
+
+    // 2. Test running agent emulate composite command through the harness
+    let out_agent_emu = run_python_harness(&[
+        "-f", target_str,
+        "-c",
+        "agent", "emulate", "main",
+        "--steps", "10",
+    ]);
+    assert!(out_agent_emu.status.success(), "Agent emulate via harness failed: {:?}", out_agent_emu.status);
+    let v2: serde_json::Value = serde_json::from_slice(&out_agent_emu.stdout).expect("Failed to parse agent emulate JSON");
+    assert_eq!(v2["success"], true);
+    assert_eq!(v2["command"], "agent emulate");
+    assert!(v2["data"]["branches_encountered"].is_array());
+}
+

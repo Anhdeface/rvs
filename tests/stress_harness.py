@@ -216,15 +216,15 @@ def main():
         test_case("Adversarial: Non-existent file", ["-f", non_existent, "info"], expect_success=False, expect_error_code="FILE_NOT_FOUND")
         
         # Directory as target
-        test_case("Adversarial: Directory as target", ["-f", tmpdir, "info"], expect_success=False, expect_error_code="INVALID_BINARY")
+        test_case("Adversarial: Directory as target", ["-f", tmpdir, "info"], expect_success=False, expect_error_code="FILE_NOT_FOUND")
         
-        # Empty file (0 bytes)
+        # Empty file (0 bytes) - rejects with ZERO_BYTE_FILE (File Error, code 2)
         empty_file = os.path.join(tmpdir, "empty.bin")
         open(empty_file, "wb").close()
-        test_case("Adversarial: Empty file (0 bytes) - info", ["-f", empty_file, "info"], expect_success=True)
-        test_case("Adversarial: Empty file (0 bytes) - analyze functions", ["-f", empty_file, "analyze", "functions"], expect_success=True)
-        test_case("Adversarial: Empty file (0 bytes) - analyze graph", ["-f", empty_file, "analyze", "graph"], expect_success=True)
-        test_case("Adversarial: Empty file (0 bytes) - strings", ["-f", empty_file, "strings"], expect_success=True)
+        test_case("Adversarial: Empty file (0 bytes) - info", ["-f", empty_file, "info"], expect_success=False, expect_error_code="ZERO_BYTE_FILE")
+        test_case("Adversarial: Empty file (0 bytes) - analyze functions", ["-f", empty_file, "analyze", "functions"], expect_success=False, expect_error_code="ZERO_BYTE_FILE")
+        test_case("Adversarial: Empty file (0 bytes) - analyze graph", ["-f", empty_file, "analyze", "graph"], expect_success=False, expect_error_code="ZERO_BYTE_FILE")
+        test_case("Adversarial: Empty file (0 bytes) - strings", ["-f", empty_file, "strings"], expect_success=False, expect_error_code="ZERO_BYTE_FILE")
         
         # 1-byte file
         one_byte = os.path.join(tmpdir, "one_byte.bin")
@@ -316,7 +316,7 @@ def main():
                   
         # 3. Valid instruction patch with backup
         test_case("Patching: Valid instruction patch with --backup",
-                  ["-f", patch_target, "patch", "instruction", "--addr", "sym.main", "--assembly", "nop; nop", "--backup"],
+                  ["-f", patch_target, "patch", "instruction", "--addr", "sym.main", "--assembly", "nop", "--backup"],
                   expect_success=True,
                   custom_data_check=lambda d: (os.path.exists(patch_target + ".bak"), "Backup file was not created"))
                   

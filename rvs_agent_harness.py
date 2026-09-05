@@ -6,7 +6,7 @@ Provides:
 1. Complete Subprocess Environment Isolation (TERM=dumb, NO_COLOR=1, R2_NOPLUGINS=1, RADARE2_RCFILE=/dev/null)
 2. Process Watchdog with Timeout Management (Graceful SIGTERM -> SIGKILL)
 3. Token-Optimized Response Filtering & Compaction Engine (compact, summary, full modes)
-4. LLM Function Calling Schema Exporter (OpenAI, Anthropic, Gemini, MCP formats for 13 commands)
+4. LLM Function Calling Schema Exporter (OpenAI, Anthropic, Gemini, MCP formats for 16 commands including Dynamic RE)
 5. Native Model Context Protocol (MCP) Stdio JSON-RPC 2.0 Server
 6. Ergonomic Typed Python API (`RvsHarness` & `RvsAgentHarness`) with Normalized Error Envelopes
 7. Standardized 7-Level Exit Code Taxonomy & Actionable Error Suggestions
@@ -41,7 +41,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "1.0.0"
+SERVER_VERSION: str = "0.2.0"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -122,10 +122,12 @@ def find_rvs_binary(custom_path: Optional[Union[str, Path]] = None) -> Path:
     return script_dir / "target" / "debug" / "rvs"
 
 
-def sanitize_terminal_output(text: str) -> str:
+def sanitize_terminal_output(text: Union[str, bytes]) -> str:
     """Strips ANSI escape codes, terminal cursor controls, and unprintable characters."""
     if not text:
         return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
     # Strip ANSI sequences
     cleaned = ANSI_ESCAPE_RE.sub("", text)
     # Strip control characters except standard whitespace (\n, \r, \t)
@@ -254,7 +256,9 @@ def execute_rvs_subprocess(
                     stdout_raw, stderr_raw = "", ""
 
             duration = time.time() - start_time
-            return EXIT_TIMEOUT_ERROR, stdout_raw, stderr_raw, duration
+            stdout = sanitize_terminal_output(stdout_raw)
+            stderr = sanitize_terminal_output(stderr_raw)
+            return EXIT_TIMEOUT_ERROR, stdout, stderr, duration
 
         duration = time.time() - start_time
         stdout = sanitize_terminal_output(stdout_raw)
@@ -349,8 +353,16 @@ def prune_functions(
             "top": top_list,
         }
 
-    effective_limit = limit if limit is not None else 50
-    sliced = funcs[offset : offset + effective_limit]
+    try:
+        effective_limit = int(limit) if limit is not None else 50
+    except (ValueError, TypeError):
+        effective_limit = 50
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = funcs[effective_offset : effective_offset + effective_limit]
     compact_funcs = []
     for f in sliced:
         item: Dict[str, Any] = {
@@ -366,8 +378,8 @@ def prune_functions(
             item["instrs"] = f.get("num_instructions")
         compact_funcs.append(item)
 
-    is_truncated = (total > len(compact_funcs)) or offset > 0 or limit is not None
-    if not is_truncated and offset == 0:
+    is_truncated = (total > len(compact_funcs)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
         return {
             "total": total,
             "functions": compact_funcs,
@@ -376,16 +388,16 @@ def prune_functions(
     res: Dict[str, Any] = {
         "total": total,
         "displayed": len(compact_funcs),
-        "remaining": max(0, total - (offset + len(compact_funcs))),
-        "offset": offset,
+        "remaining": max(0, total - (effective_offset + len(compact_funcs))),
+        "offset": effective_offset,
         "limit": effective_limit,
-        "truncated": total > (offset + len(compact_funcs)),
-        "has_more": total > (offset + len(compact_funcs)),
+        "truncated": total > (effective_offset + len(compact_funcs)),
+        "has_more": total > (effective_offset + len(compact_funcs)),
         "functions": compact_funcs,
     }
-    if total > (offset + len(compact_funcs)):
+    if total > (effective_offset + len(compact_funcs)):
         res["continuation_hint"] = (
-            f"Use limit={effective_limit} offset={offset + len(compact_funcs)} to retrieve next slice."
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_funcs)} to retrieve next slice."
         )
     return res
 
@@ -415,8 +427,21 @@ def prune_blocks(
             "entry": entry_b.get("addr_hex") or format_hex_addr(entry_b.get("addr")),
         }
 
-    effective_limit = limit if limit is not None else 30
-    sliced = blocks[offset : offset + effective_limit]
+    try:
+        effective_limit = int(limit) if limit is not None else 30
+    except (ValueError, TypeError):
+        effective_limit = 30
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+    if max_instructions is not None:
+        try:
+            max_instructions = int(max_instructions)
+        except (ValueError, TypeError):
+            max_instructions = None
+
+    sliced = blocks[effective_offset : effective_offset + effective_limit]
     compact_blocks = []
 
     for b in sliced:
@@ -447,8 +472,8 @@ def prune_blocks(
 
         compact_blocks.append(b_dict)
 
-    is_truncated = (total > len(compact_blocks)) or offset > 0 or limit is not None
-    if not is_truncated and offset == 0:
+    is_truncated = (total > len(compact_blocks)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
         return {
             "function": fn_name,
             "addr": fn_addr,
@@ -461,16 +486,16 @@ def prune_blocks(
         "addr": fn_addr,
         "total": total,
         "displayed": len(compact_blocks),
-        "remaining": max(0, total - (offset + len(compact_blocks))),
-        "offset": offset,
+        "remaining": max(0, total - (effective_offset + len(compact_blocks))),
+        "offset": effective_offset,
         "limit": effective_limit,
-        "truncated": total > (offset + len(compact_blocks)),
-        "has_more": total > (offset + len(compact_blocks)),
+        "truncated": total > (effective_offset + len(compact_blocks)),
+        "has_more": total > (effective_offset + len(compact_blocks)),
         "blocks": compact_blocks,
     }
-    if total > (offset + len(compact_blocks)):
+    if total > (effective_offset + len(compact_blocks)):
         res["continuation_hint"] = (
-            f"Use limit={effective_limit} offset={offset + len(compact_blocks)} to retrieve next slice."
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_blocks)} to retrieve next slice."
         )
     return res
 
@@ -494,8 +519,16 @@ def prune_strings(
             "sample": [s.get("string") for s in raw_strings[:10]],
         }
 
-    effective_limit = limit if limit is not None else 50
-    sliced = raw_strings[offset : offset + effective_limit]
+    try:
+        effective_limit = int(limit) if limit is not None else 50
+    except (ValueError, TypeError):
+        effective_limit = 50
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = raw_strings[effective_offset : effective_offset + effective_limit]
     compact_strings = [
         {
             "addr": s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")) or s.get("addr"),
@@ -504,8 +537,8 @@ def prune_strings(
         for s in sliced
     ]
 
-    is_truncated = (total > len(compact_strings)) or offset > 0 or limit is not None
-    if not is_truncated and offset == 0:
+    is_truncated = (total > len(compact_strings)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
         return {
             "total": total,
             "strings": compact_strings,
@@ -514,16 +547,16 @@ def prune_strings(
     res: Dict[str, Any] = {
         "total": total,
         "displayed": len(compact_strings),
-        "remaining": max(0, total - (offset + len(compact_strings))),
-        "offset": offset,
+        "remaining": max(0, total - (effective_offset + len(compact_strings))),
+        "offset": effective_offset,
         "limit": effective_limit,
-        "truncated": total > (offset + len(compact_strings)),
-        "has_more": total > (offset + len(compact_strings)),
+        "truncated": total > (effective_offset + len(compact_strings)),
+        "has_more": total > (effective_offset + len(compact_strings)),
         "strings": compact_strings,
     }
-    if total > (offset + len(compact_strings)):
+    if total > (effective_offset + len(compact_strings)):
         res["continuation_hint"] = (
-            f"Use limit={effective_limit} offset={offset + len(compact_strings)} to retrieve next slice."
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_strings)} to retrieve next slice."
         )
     return res
 
@@ -547,8 +580,16 @@ def prune_symbols(
             "sample": [s.get("name") for s in raw_symbols[:10]],
         }
 
-    effective_limit = limit if limit is not None else 50
-    sliced = raw_symbols[offset : offset + effective_limit]
+    try:
+        effective_limit = int(limit) if limit is not None else 50
+    except (ValueError, TypeError):
+        effective_limit = 50
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = raw_symbols[effective_offset : effective_offset + effective_limit]
     compact_symbols = []
     for s in sliced:
         sym_dict: Dict[str, Any] = {
@@ -560,8 +601,8 @@ def prune_symbols(
             sym_dict["bind"] = s.get("bind")
         compact_symbols.append(sym_dict)
 
-    is_truncated = (total > len(compact_symbols)) or offset > 0 or limit is not None
-    if not is_truncated and offset == 0:
+    is_truncated = (total > len(compact_symbols)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
         return {
             "total": total,
             "symbols": compact_symbols,
@@ -570,16 +611,16 @@ def prune_symbols(
     res: Dict[str, Any] = {
         "total": total,
         "displayed": len(compact_symbols),
-        "remaining": max(0, total - (offset + len(compact_symbols))),
-        "offset": offset,
+        "remaining": max(0, total - (effective_offset + len(compact_symbols))),
+        "offset": effective_offset,
         "limit": effective_limit,
-        "truncated": total > (offset + len(compact_symbols)),
-        "has_more": total > (offset + len(compact_symbols)),
+        "truncated": total > (effective_offset + len(compact_symbols)),
+        "has_more": total > (effective_offset + len(compact_symbols)),
         "symbols": compact_symbols,
     }
-    if total > (offset + len(compact_symbols)):
+    if total > (effective_offset + len(compact_symbols)):
         res["continuation_hint"] = (
-            f"Use limit={effective_limit} offset={offset + len(compact_symbols)} to retrieve next slice."
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_symbols)} to retrieve next slice."
         )
     return res
 
@@ -627,7 +668,10 @@ def prune_xrefs(
                 "data_refs_count": len(data_refs),
             }
 
-        effective_limit = limit if limit is not None else 30
+        try:
+            effective_limit = int(limit) if limit is not None else 30
+        except (ValueError, TypeError):
+            effective_limit = 30
         return {
             "target": data.get("target"),
             "addr": data.get("target_addr_hex") or format_hex_addr(data.get("target_addr")),
@@ -647,8 +691,16 @@ def prune_xrefs(
             "direction": data.get("direction", "all"),
         }
 
-    effective_limit = limit if limit is not None else 30
-    sliced = raw_xrefs[offset : offset + effective_limit]
+    try:
+        effective_limit = int(limit) if limit is not None else 30
+    except (ValueError, TypeError):
+        effective_limit = 30
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = raw_xrefs[effective_offset : effective_offset + effective_limit]
     compact_xrefs = []
     for x in sliced:
         compact_xrefs.append({
@@ -660,8 +712,8 @@ def prune_xrefs(
             "op": x.get("opcode"),
         })
 
-    is_truncated = (total > len(compact_xrefs)) or offset > 0 or limit is not None
-    if not is_truncated and offset == 0:
+    is_truncated = (total > len(compact_xrefs)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
         return {
             "target": data.get("target"),
             "addr": data.get("target_addr_hex") or format_hex_addr(data.get("target_addr")),
@@ -674,16 +726,16 @@ def prune_xrefs(
         "addr": data.get("target_addr_hex") or format_hex_addr(data.get("target_addr")),
         "total": total,
         "displayed": len(compact_xrefs),
-        "remaining": max(0, total - (offset + len(compact_xrefs))),
-        "offset": offset,
+        "remaining": max(0, total - (effective_offset + len(compact_xrefs))),
+        "offset": effective_offset,
         "limit": effective_limit,
-        "truncated": total > (offset + len(compact_xrefs)),
-        "has_more": total > (offset + len(compact_xrefs)),
+        "truncated": total > (effective_offset + len(compact_xrefs)),
+        "has_more": total > (effective_offset + len(compact_xrefs)),
         "xrefs": compact_xrefs,
     }
-    if total > (offset + len(compact_xrefs)):
+    if total > (effective_offset + len(compact_xrefs)):
         res["continuation_hint"] = (
-            f"Use limit={effective_limit} offset={offset + len(compact_xrefs)} to retrieve next slice."
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_xrefs)} to retrieve next slice."
         )
     return res
 
@@ -872,6 +924,107 @@ def prune_patch_result(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]
     return data
 
 
+def prune_emulate(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
+    """Prune dynamic emulation response."""
+    if mode == "full":
+        return data
+
+    if mode == "summary":
+        res: Dict[str, Any] = {
+            "target": data.get("target") or data.get("function_name"),
+            "start": data.get("start_addr_hex") or data.get("start"),
+            "final": data.get("final_addr_hex") or data.get("final"),
+            "steps": data.get("steps_executed") or data.get("steps"),
+            "stop_reason": data.get("stop_reason") or data.get("stop"),
+        }
+        if data.get("return_value"):
+            res["return_value"] = data.get("return_value")
+        elif data.get("ret"):
+            res["return_value"] = data.get("ret")
+        if data.get("agent_summary"):
+            res["summary"] = data.get("agent_summary")
+        return res
+
+    # Compact mode: preserve register diff, return value, stop reason, omit full reg dump
+    res = {
+        "target": data.get("target") or data.get("function_name"),
+        "start": data.get("start_addr_hex") or data.get("start"),
+        "final": data.get("final_addr_hex") or data.get("final"),
+        "steps": data.get("steps_executed") or data.get("steps"),
+        "stop": data.get("stop_reason") or data.get("stop"),
+    }
+    if data.get("return_value"):
+        res["ret"] = data.get("return_value")
+    elif data.get("ret"):
+        res["ret"] = data.get("ret")
+
+    diff = data.get("register_diff") or data.get("diff") or data.get("key_registers_changed") or []
+    res["diff"] = diff
+
+    if data.get("branches_encountered"):
+        res["branches"] = data.get("branches_encountered")
+    if data.get("agent_summary"):
+        res["summary"] = data.get("agent_summary")
+    if data.get("memory_after"):
+        res["mem_after"] = data.get("memory_after")
+    return res
+
+
+def prune_trace(data: Dict[str, Any], mode: OutputMode, limit: Optional[int] = None) -> Dict[str, Any]:
+    """Prune instruction-level trace response."""
+    if mode == "full":
+        return data
+
+    steps = data.get("trace", [])
+    total = len(steps)
+    if mode == "summary":
+        return {
+            "target": data.get("target"),
+            "start": data.get("start_addr_hex") or data.get("start"),
+            "total_steps": total,
+            "first_step": steps[0] if steps else None,
+            "last_step": steps[-1] if steps else None,
+        }
+
+    try:
+        effective_limit = int(limit) if limit is not None else 30
+    except (ValueError, TypeError):
+        effective_limit = 30
+    compact_steps = []
+    for s in steps[:effective_limit]:
+        compact_steps.append({
+            "step": s.get("step"),
+            "addr": s.get("addr_hex") or s.get("addr"),
+            "asm": s.get("disasm") or s.get("asm"),
+            "diff": s.get("reg_changes") or s.get("diff") or [],
+        })
+
+    res: Dict[str, Any] = {
+        "target": data.get("target"),
+        "start": data.get("start_addr_hex") or data.get("start"),
+        "total_steps": total,
+        "displayed": len(compact_steps),
+        "trace": compact_steps,
+    }
+    if total > len(compact_steps):
+        res["truncated"] = True
+        res["remaining"] = total - len(compact_steps)
+    return res
+
+
+def prune_step(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
+    """Prune single-step emulation response."""
+    if mode == "full":
+        return data
+
+    return {
+        "curr": data.get("curr") or data.get("current_addr_hex") or data.get("current_addr"),
+        "next": data.get("next") or data.get("next_addr_hex") or data.get("next_addr"),
+        "instruction": data.get("instruction") or data.get("asm"),
+        "diff": data.get("diff") or data.get("reg_changes") or [],
+    }
+
+
 def transform_response(
     resp_envelope: Dict[str, Any],
     mode: OutputMode = "compact",
@@ -913,6 +1066,12 @@ def transform_response(
         transformed_data = prune_triage(raw_data, mode)
     elif "patch" in cmd:
         transformed_data = prune_patch_result(raw_data, mode)
+    elif "emulate" in cmd:
+        transformed_data = prune_emulate(raw_data, mode)
+    elif "trace" in cmd:
+        transformed_data = prune_trace(raw_data, mode, limit=limit)
+    elif "step" in cmd:
+        transformed_data = prune_step(raw_data, mode)
     else:
         transformed_data = raw_data
 
@@ -1271,6 +1430,102 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
         },
         "required": ["file", "plan"],
     },
+    {
+        "name": "rvs_dynamic_emulate",
+        "description": "Safely emulate binary execution via radare2 ESIL (Evaluable Strings Intermediate Language). Emulates function logic, steps until target address, traces register deltas, and inspects memory changes without OS execution permissions.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "target": {
+                "type": "string",
+                "description": "Function name (e.g. 'main', 'sym.check_key') or virtual memory address (e.g. '0x11e0').",
+            },
+            "steps": {
+                "type": "integer",
+                "description": "Maximum number of ESIL steps to emulate (defaults to 100).",
+            },
+            "until": {
+                "type": "string",
+                "description": "Stop emulation when instruction pointer reaches this virtual address (hex or symbol).",
+            },
+            "reg_set": {
+                "type": "array",
+                "description": "Preset CPU registers before emulation (e.g. ['rax=1', 'rdi=0x1000']).",
+                "items": {"type": "string"},
+            },
+            "read_mem": {
+                "type": "string",
+                "description": "Memory address to inspect before and after emulation.",
+            },
+            "mem_len": {
+                "type": "integer",
+                "description": "Number of memory bytes to inspect (default: 32).",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output with register diffs. Defaults to true.",
+            },
+        },
+        "required": ["file", "target"],
+    },
+    {
+        "name": "rvs_dynamic_trace",
+        "description": "Instruction-by-instruction dynamic execution trace recording opcodes and register deltas. Ideal for cryptanalytic loops, key checking, and decryptors.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "target": {
+                "type": "string",
+                "description": "Function name or start virtual address.",
+            },
+            "steps": {
+                "type": "integer",
+                "description": "Number of instruction steps to trace (default: 20, max: 100).",
+            },
+            "reg_set": {
+                "type": "array",
+                "description": "Preset CPU registers before trace (e.g. ['rax=0x42']).",
+                "items": {"type": "string"},
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact trace. Defaults to true.",
+            },
+        },
+        "required": ["file", "target"],
+    },
+    {
+        "name": "rvs_dynamic_step",
+        "description": "Single-step (or small N-step) execution advancing the instruction pointer and reporting register changes.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "target": {
+                "type": "string",
+                "description": "Function name or virtual address.",
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of instructions to step (default: 1).",
+            },
+            "reg_set": {
+                "type": "array",
+                "description": "Preset registers before step.",
+                "items": {"type": "string"},
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file", "target"],
+    },
 ]
 
 
@@ -1379,6 +1634,73 @@ def get_tool_schemas(format: SchemaFormat = "openai") -> Union[List[Dict[str, An
         )
 
 
+def coerce_bool_param(val: Any, default: bool, param_name: str) -> bool:
+    """Coerce boolean parameter from bool or string representation ('true'/'false'/'1'/'0')."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("true", "1", "yes", "t"):
+            return True
+        if v in ("false", "0", "no", "f", ""):
+            return False
+    raise ValueError(f"Invalid boolean value for parameter '{param_name}': {val!r}")
+
+
+def coerce_int_param(
+    val: Any,
+    default: Optional[int],
+    param_name: str,
+    allow_negative: bool = False,
+    min_val: Optional[int] = None,
+) -> Optional[int]:
+    """Coerce integer parameter from int or string representation. Validates sign."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        raise ValueError(f"Invalid integer value for parameter '{param_name}': boolean {val!r}")
+    parsed: int
+    if isinstance(val, int):
+        parsed = val
+    elif isinstance(val, float):
+        parsed = int(val)
+    elif isinstance(val, str):
+        s = val.strip()
+        try:
+            if s.startswith("0x") or s.startswith("0X"):
+                parsed = int(s, 16)
+            else:
+                parsed = int(s, 10)
+        except ValueError:
+            raise ValueError(f"Invalid integer value for parameter '{param_name}': {val!r}")
+    else:
+        raise ValueError(f"Invalid type for parameter '{param_name}': {type(val).__name__}")
+
+    if not allow_negative and parsed < 0:
+        raise ValueError(f"Parameter '{param_name}' cannot be negative: {parsed}")
+    if min_val is not None and parsed < min_val:
+        raise ValueError(f"Parameter '{param_name}' must be >= {min_val}: {parsed}")
+    return parsed
+
+
+def coerce_reg_set_param(val: Any) -> Optional[List[str]]:
+    """Coerce reg_set parameter: if string (e.g. 'rax=1'), wrap in list ['rax=1']."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        return [s]
+    if isinstance(val, (list, tuple)):
+        return [str(item) for item in val]
+    return [str(val)]
+
+
 # =============================================================================
 # Ergonomic Python API: RvsHarness & RvsAgentHarness (R2 & R3)
 # =============================================================================
@@ -1399,6 +1721,28 @@ class RvsHarness:
         self.rvs_bin = find_rvs_binary(custom_path=rvs_bin)
         self.default_timeout = default_timeout
         self.default_mode = default_mode
+        self._session_cache: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _normalize_target(target: Optional[Union[str, Path]]) -> str:
+        """Normalize binary path to absolute real path for unified session caching."""
+        if not target:
+            return ""
+        try:
+            return os.path.abspath(os.path.realpath(str(target)))
+        except Exception:
+            return str(target)
+
+    def get_session(self, target: Union[str, Path]) -> Dict[str, Any]:
+        """Retrieve cached analysis session properties for target binary."""
+        return self._session_cache.get(self._normalize_target(target), {})
+
+    def clear_session(self, target: Optional[Union[str, Path]] = None) -> None:
+        """Clear cached session data for a specific binary or all binaries."""
+        if target:
+            self._session_cache.pop(self._normalize_target(target), None)
+        else:
+            self._session_cache.clear()
 
     def run(
         self,
@@ -1425,6 +1769,16 @@ class RvsHarness:
                     target_str = cmd_args[i + 1]
                     break
 
+        norm_target = self._normalize_target(target_str) if target_str else ""
+
+        # Check session cache to accelerate repeated agent operations
+        if norm_target and norm_target in self._session_cache:
+            cache = self._session_cache[norm_target]
+            if "-a" not in cmd_args and "--arch" not in cmd_args and cache.get("arch"):
+                cmd_args.extend(["-a", cache["arch"]])
+            if "-b" not in cmd_args and "--bits" not in cmd_args and cache.get("bits"):
+                cmd_args.extend(["-b", str(cache["bits"])])
+
         code, stdout, stderr, duration = execute_rvs_subprocess(
             cmd_args, timeout=t, rvs_bin=self.rvs_bin
         )
@@ -1440,6 +1794,15 @@ class RvsHarness:
                 if isinstance(data, dict):
                     data["execution_time_seconds"] = round(duration, 3)
                     resp = data  # type: ignore
+                    # Populate session cache from successful discovery
+                    if norm_target and data.get("success") and isinstance(data.get("data"), dict):
+                        d = data["data"]
+                        if norm_target not in self._session_cache:
+                            self._session_cache[norm_target] = {}
+                        if d.get("arch"):
+                            self._session_cache[norm_target]["arch"] = d["arch"]
+                        if d.get("bits"):
+                            self._session_cache[norm_target]["bits"] = d["bits"]
             except json.JSONDecodeError:
                 pass
 
@@ -1788,6 +2151,96 @@ class RvsHarness:
         return self.run(args, timeout=timeout, mode="compact")
 
     # -------------------------------------------------------------------------
+    # Dynamic RE & ESIL Emulation Methods
+    # -------------------------------------------------------------------------
+
+    def dynamic_emulate(
+        self,
+        target: Union[str, Path],
+        function_or_addr: str,
+        steps: int = 100,
+        until: Optional[str] = None,
+        reg_set: Optional[List[str]] = None,
+        read_mem: Optional[str] = None,
+        mem_len: int = 32,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Safely emulate execution of a function or address range with radare2 ESIL."""
+        args = ["-f", str(target), "dynamic", "emulate", str(function_or_addr), "--steps", str(steps)]
+        if until:
+            args.extend(["--until", str(until)])
+        if reg_set:
+            regs = [reg_set] if isinstance(reg_set, str) else reg_set
+            for r in regs:
+                args.extend(["--reg", str(r)])
+        if read_mem:
+            args.extend(["--read-mem", str(read_mem), "--mem-len", str(mem_len)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(args, timeout=timeout, mode=mode)
+
+    def dynamic_trace(
+        self,
+        target: Union[str, Path],
+        function_or_addr: str,
+        steps: int = 20,
+        reg_set: Optional[Union[str, List[str]]] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Trace instruction-by-instruction execution with register deltas."""
+        args = ["-f", str(target), "dynamic", "trace", str(function_or_addr), "--steps", str(steps)]
+        if reg_set:
+            regs = [reg_set] if isinstance(reg_set, str) else reg_set
+            for r in regs:
+                args.extend(["--reg", str(r)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(args, timeout=timeout, mode=mode)
+
+    def dynamic_step(
+        self,
+        target: Union[str, Path],
+        function_or_addr: str,
+        count: int = 1,
+        reg_set: Optional[Union[str, List[str]]] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Single-step (or N steps) execution advancing instruction pointer."""
+        args = ["-f", str(target), "dynamic", "step", str(function_or_addr), "--count", str(count)]
+        if reg_set:
+            regs = [reg_set] if isinstance(reg_set, str) else reg_set
+            for r in regs:
+                args.extend(["--reg", str(r)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(args, timeout=timeout, mode=mode)
+
+    def agent_emulate(
+        self,
+        target: Union[str, Path],
+        function_or_addr: str,
+        steps: int = 100,
+        until: Optional[str] = None,
+        reg_set: Optional[Union[str, List[str]]] = None,
+        read_mem: Optional[str] = None,
+        mem_len: int = 32,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Autonomous AI agent emulation: evaluates decision gates and synthesizes natural summary."""
+        args = ["-f", str(target), "agent", "emulate", str(function_or_addr), "--steps", str(steps)]
+        if until:
+            args.extend(["--until", str(until)])
+        if reg_set:
+            regs = [reg_set] if isinstance(reg_set, str) else reg_set
+            for r in regs:
+                args.extend(["--reg", str(r)])
+        if read_mem:
+            args.extend(["--read-mem", str(read_mem), "--mem-len", str(mem_len)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(args, timeout=timeout, mode=mode)
+
+    # -------------------------------------------------------------------------
     # Schema & MCP Execution
     # -------------------------------------------------------------------------
 
@@ -1823,19 +2276,22 @@ class RvsHarness:
                 suggestion="Specify the path to the target binary in the 'file' argument.",
             )
 
-        compact = arguments.get("compact", True)
-
         try:
+            compact = coerce_bool_param(arguments.get("compact"), True, "compact")
+
             if tool_name == "rvs_info":
                 return self.info(file, compact=compact)
 
             elif tool_name == "rvs_functions":
+                detail = coerce_bool_param(arguments.get("detail"), False, "detail")
+                limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
+                offset = coerce_int_param(arguments.get("offset"), None, "offset", allow_negative=False)
                 return self.functions(
                     file,
                     filter=arguments.get("filter"),
-                    detail=arguments.get("detail", False),
-                    limit=arguments.get("limit"),
-                    offset=arguments.get("offset"),
+                    detail=detail,
+                    limit=limit,
+                    offset=offset,
                     compact=compact,
                 )
 
@@ -1844,17 +2300,22 @@ class RvsHarness:
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target' (function name or address)",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass target='main' or target='0x11e0'.",
                     )
+                disasm = coerce_bool_param(arguments.get("disasm"), True, "disasm")
+                max_instructions = coerce_int_param(
+                    arguments.get("max_instructions"), None, "max_instructions", allow_negative=False
+                )
                 return self.disasm(
                     file,
-                    function_or_addr=target,
-                    disasm=arguments.get("disasm", True),
-                    max_instructions=arguments.get("max_instructions"),
+                    function_or_addr=str(target),
+                    disasm=disasm,
+                    max_instructions=max_instructions,
                     compact=compact,
                 )
 
@@ -1863,61 +2324,70 @@ class RvsHarness:
                 if not function:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'function'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass function='main' or function address.",
                     )
-                return self.decompile(file, function=function, compact=compact)
+                return self.decompile(file, function=str(function), compact=compact)
 
             elif tool_name == "rvs_flow":
                 function = arguments.get("function")
                 if not function:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'function'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass function='main' or function address.",
                     )
-                return self.flow(file, function=function, compact=compact)
+                return self.flow(file, function=str(function), compact=compact)
 
             elif tool_name == "rvs_xrefs":
                 target = arguments.get("target")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass target symbol or address to xrefs query.",
                     )
+                limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
                 return self.xrefs(
                     file,
-                    symbol_or_addr=target,
+                    symbol_or_addr=str(target),
                     direction=arguments.get("direction", "all"),
                     kind=arguments.get("kind"),
-                    limit=arguments.get("limit"),
+                    limit=limit,
                     compact=compact,
                 )
 
             elif tool_name == "rvs_strings":
+                min_len = coerce_int_param(arguments.get("min_len"), 4, "min_len", allow_negative=False)
+                if min_len is None:
+                    min_len = 4
+                limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
                 return self.strings(
                     file,
-                    min_len=arguments.get("min_len", 4),
+                    min_len=min_len,
                     filter=arguments.get("filter"),
-                    limit=arguments.get("limit"),
+                    limit=limit,
                     compact=compact,
                 )
 
             elif tool_name == "rvs_symbols":
+                limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
                 return self.symbols(
                     file,
                     filter=arguments.get("filter"),
-                    limit=arguments.get("limit"),
+                    limit=limit,
                     compact=compact,
                 )
 
@@ -1926,17 +2396,20 @@ class RvsHarness:
                 if not addr:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'addr'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                nop_bytes = coerce_int_param(arguments.get("nop_bytes"), None, "nop_bytes", allow_negative=False)
+                backup = coerce_bool_param(arguments.get("backup"), True, "backup")
                 return self.patch_instruction(
                     file,
                     addr=addr,
                     assembly=arguments.get("assembly"),
-                    nop_bytes=arguments.get("nop_bytes"),
-                    backup=arguments.get("backup", True),
+                    nop_bytes=nop_bytes,
+                    backup=backup,
                 )
 
             elif tool_name == "rvs_patch_string":
@@ -1944,19 +2417,23 @@ class RvsHarness:
                 if new_str is None:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'new_string'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                pad_null = coerce_bool_param(arguments.get("pad_null"), True, "pad_null")
+                strict_length = coerce_bool_param(arguments.get("strict_length"), True, "strict_length")
+                backup = coerce_bool_param(arguments.get("backup"), True, "backup")
                 return self.patch_string(
                     file,
                     new_string=new_str,
                     addr=arguments.get("addr"),
                     old_string=arguments.get("old_string"),
-                    pad_null=arguments.get("pad_null", True),
-                    strict_length=arguments.get("strict_length", True),
-                    backup=arguments.get("backup", True),
+                    pad_null=pad_null,
+                    strict_length=strict_length,
+                    backup=backup,
                 )
 
             elif tool_name == "rvs_patch_bytes":
@@ -1965,16 +2442,18 @@ class RvsHarness:
                 if not addr or not hex_bytes:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'addr' or 'hex_bytes'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                backup = coerce_bool_param(arguments.get("backup"), True, "backup")
                 return self.patch_bytes(
                     file,
                     addr=addr,
                     hex_bytes=hex_bytes,
-                    backup=arguments.get("backup", True),
+                    backup=backup,
                 )
 
             elif tool_name == "rvs_agent_triage":
@@ -1985,31 +2464,122 @@ class RvsHarness:
                 if not plan:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=file,
+                        target_str=str(file),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'plan'",
+                        category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                dry_run = coerce_bool_param(arguments.get("dry_run"), False, "dry_run")
                 return self.patch_plan(
                     file,
                     plan=plan,
-                    dry_run=arguments.get("dry_run", False),
+                    dry_run=dry_run,
+                )
+
+            elif tool_name in ("rvs_dynamic_emulate", "dynamic_emulate", "rvs_emulate", "emulate", "rvs_agent_emulate", "agent_emulate"):
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target' (function or address)",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                        suggestion="Pass target='main' or target='0x11e0'.",
+                    )
+                steps = coerce_int_param(arguments.get("steps"), 100, "steps", allow_negative=False)
+                if steps is None:
+                    steps = 100
+                mem_len = coerce_int_param(arguments.get("mem_len"), 32, "mem_len", allow_negative=False)
+                if mem_len is None:
+                    mem_len = 32
+                reg_set = coerce_reg_set_param(arguments.get("reg_set"))
+                return self.dynamic_emulate(
+                    file,
+                    function_or_addr=str(target),
+                    steps=steps,
+                    until=arguments.get("until"),
+                    reg_set=reg_set,
+                    read_mem=arguments.get("read_mem"),
+                    mem_len=mem_len,
+                    compact=compact,
+                )
+
+            elif tool_name in ("rvs_dynamic_trace", "dynamic_trace", "rvs_trace", "trace", "rvs_agent_trace", "agent_trace"):
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target' (function or address)",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                        suggestion="Pass target='main' or target='0x11e0'.",
+                    )
+                steps = coerce_int_param(arguments.get("steps"), 20, "steps", allow_negative=False)
+                if steps is None:
+                    steps = 20
+                reg_set = coerce_reg_set_param(arguments.get("reg_set"))
+                return self.dynamic_trace(
+                    file,
+                    function_or_addr=str(target),
+                    steps=steps,
+                    reg_set=reg_set,
+                    compact=compact,
+                )
+
+            elif tool_name in ("rvs_dynamic_step", "dynamic_step", "rvs_step", "step"):
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target' (function or address)",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                        suggestion="Pass target='main' or target='0x11e0'.",
+                    )
+                count = coerce_int_param(arguments.get("count"), 1, "count", allow_negative=False)
+                if count is None:
+                    count = 1
+                reg_set = coerce_reg_set_param(arguments.get("reg_set"))
+                return self.dynamic_step(
+                    file,
+                    function_or_addr=str(target),
+                    count=count,
+                    reg_set=reg_set,
+                    compact=compact,
                 )
 
             else:
                 return make_error_envelope(
                     command_str=f"{tool_name}",
-                    target_str=file,
+                    target_str=str(file),
                     code="TOOL_NOT_FOUND",
                     message=f"Tool '{tool_name}' is not recognized.",
+                    category="INVALID_ARGUMENT",
                     exit_code=EXIT_INVALID_ARGUMENT,
                     suggestion="Use get_tool_schemas() or tools/list to see available tool definitions.",
                 )
 
+        except ValueError as e:
+            return make_error_envelope(
+                command_str=f"{tool_name}",
+                target_str=str(file) if file else "",
+                code="INVALID_ARGUMENT",
+                message=str(e),
+                category="INVALID_ARGUMENT",
+                exit_code=EXIT_INVALID_ARGUMENT,
+                suggestion="Check parameter types and provide valid arguments.",
+            )
         except Exception as e:
             return make_error_envelope(
                 command_str=f"{tool_name}",
-                target_str=file,
+                target_str=str(file) if file else "",
                 code="INTERNAL_ERROR",
                 message=str(e),
                 exit_code=EXIT_INTERNAL_ERROR,
@@ -2028,175 +2598,191 @@ class RvsHarness:
         in_stream = stdin_stream if stdin_stream is not None else sys.stdin
         out_stream = stdout_stream if stdout_stream is not None else sys.stdout
 
-        for line in in_stream:
-            line_str = line.strip()
-            if not line_str:
-                continue
-
+        def _send_response(payload: Dict[str, Any]) -> bool:
             try:
-                req = json.loads(line_str)
-            except json.JSONDecodeError:
-                err_response = {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "Parse error: Invalid JSON payload"},
-                }
-                out_stream.write(json.dumps(err_response) + "\n")
+                out_stream.write(json.dumps(payload) + "\n")
                 out_stream.flush()
-                continue
+                return True
+            except (BrokenPipeError, IOError, OSError):
+                return False
 
-            try:
-                if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
+        try:
+            for line in in_stream:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+
+                try:
+                    req = json.loads(line_str)
+                except json.JSONDecodeError:
                     err_response = {
                         "jsonrpc": "2.0",
-                        "id": req.get("id") if isinstance(req, dict) else None,
-                        "error": {"code": -32600, "message": "Invalid Request: Expected JSON-RPC 2.0 object"},
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error: Invalid JSON payload"},
                     }
-                    out_stream.write(json.dumps(err_response) + "\n")
-                    out_stream.flush()
+                    if not _send_response(err_response):
+                        break
                     continue
 
-                msg_id = req.get("id")
-                method = req.get("method")
-                params = req.get("params")
+                try:
+                    if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
+                        err_response = {
+                            "jsonrpc": "2.0",
+                            "id": req.get("id") if isinstance(req, dict) else None,
+                            "error": {"code": -32600, "message": "Invalid Request: Expected JSON-RPC 2.0 object"},
+                        }
+                        if not _send_response(err_response):
+                            break
+                        continue
 
-                # 1. Notification (no id)
-                if msg_id is None:
-                    # Handle client notification (e.g. notifications/initialized)
-                    continue
+                    msg_id = req.get("id")
+                    method = req.get("method")
+                    params = req.get("params")
 
-                if not isinstance(method, str):
-                    resp = {
+                    # 1. Notification (no id)
+                    if msg_id is None:
+                        # Handle client notification (e.g. notifications/initialized)
+                        continue
+
+                    if not isinstance(method, str):
+                        resp = {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "error": {
+                                "code": -32600,
+                                "message": "Invalid Request: 'method' must be a string",
+                            },
+                        }
+                    # 2. initialize
+                    elif method == "initialize":
+                        if params is not None and not isinstance(params, dict):
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "Invalid params: params must be an object",
+                                },
+                            }
+                        else:
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "result": {
+                                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                                    "capabilities": {
+                                        "tools": {"listChanged": False},
+                                    },
+                                    "serverInfo": {
+                                        "name": SERVER_NAME,
+                                        "version": SERVER_VERSION,
+                                    },
+                                },
+                            }
+
+                    # 3. ping
+                    elif method == "ping":
+                        if params is not None and not isinstance(params, dict):
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "Invalid params: params must be an object",
+                                },
+                            }
+                        else:
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "result": {},
+                            }
+
+                    # 4. tools/list
+                    elif method == "tools/list":
+                        if params is not None and not isinstance(params, dict):
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "Invalid params: params must be an object",
+                                },
+                            }
+                        else:
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "result": {
+                                    "tools": self.get_tool_schemas("mcp"),
+                                },
+                            }
+
+                    # 5. tools/call
+                    elif method == "tools/call":
+                        if not isinstance(params, dict):
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "Invalid params: params must be an object",
+                                },
+                            }
+                        else:
+                            tool_name = params.get("name", "")
+                            tool_args = params.get("arguments", {})
+                            tool_result = self.execute_tool(tool_name, tool_args)
+                            is_error = not tool_result.get("success", False)
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "result": {
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": json.dumps(tool_result),
+                                        }
+                                    ],
+                                    "isError": is_error,
+                                },
+                            }
+
+                    # 6. Unknown method
+                    else:
+                        resp = {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "error": {
+                                "code": -32601,
+                                "message": f"Method not found: '{method}'",
+                            },
+                        }
+
+                    if not _send_response(resp):
+                        break
+
+                except (BrokenPipeError, IOError, OSError):
+                    break
+                except Exception as e:
+                    try:
+                        sys.stderr.write(f"[MCP Server Error] {type(e).__name__}: {e}\n")
+                        sys.stderr.flush()
+                    except (BrokenPipeError, IOError, OSError):
+                        break
+                    req_id = req.get("id") if isinstance(req, dict) else None
+                    err_resp = {
                         "jsonrpc": "2.0",
-                        "id": msg_id,
+                        "id": req_id,
                         "error": {
-                            "code": -32600,
-                            "message": "Invalid Request: 'method' must be a string",
+                            "code": -32603,
+                            "message": f"Internal error: {str(e)}",
                         },
                     }
-                # 2. initialize
-                elif method == "initialize":
-                    if params is not None and not isinstance(params, dict):
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "error": {
-                                "code": -32602,
-                                "message": "Invalid params: params must be an object",
-                            },
-                        }
-                    else:
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "result": {
-                                "protocolVersion": MCP_PROTOCOL_VERSION,
-                                "capabilities": {
-                                    "tools": {"listChanged": False},
-                                },
-                                "serverInfo": {
-                                    "name": SERVER_NAME,
-                                    "version": SERVER_VERSION,
-                                },
-                            },
-                        }
-
-                # 3. ping
-                elif method == "ping":
-                    if params is not None and not isinstance(params, dict):
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "error": {
-                                "code": -32602,
-                                "message": "Invalid params: params must be an object",
-                            },
-                        }
-                    else:
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "result": {},
-                        }
-
-                # 4. tools/list
-                elif method == "tools/list":
-                    if params is not None and not isinstance(params, dict):
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "error": {
-                                "code": -32602,
-                                "message": "Invalid params: params must be an object",
-                            },
-                        }
-                    else:
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "result": {
-                                "tools": self.get_tool_schemas("mcp"),
-                            },
-                        }
-
-                # 5. tools/call
-                elif method == "tools/call":
-                    if not isinstance(params, dict):
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "error": {
-                                "code": -32602,
-                                "message": "Invalid params: params must be an object",
-                            },
-                        }
-                    else:
-                        tool_name = params.get("name", "")
-                        tool_args = params.get("arguments", {})
-                        tool_result = self.execute_tool(tool_name, tool_args)
-                        is_error = not tool_result.get("success", False)
-                        resp = {
-                            "jsonrpc": "2.0",
-                            "id": msg_id,
-                            "result": {
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": json.dumps(tool_result),
-                                    }
-                                ],
-                                "isError": is_error,
-                            },
-                        }
-
-                # 6. Unknown method
-                else:
-                    resp = {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "error": {
-                            "code": -32601,
-                            "message": f"Method not found: '{method}'",
-                        },
-                    }
-
-                out_stream.write(json.dumps(resp) + "\n")
-                out_stream.flush()
-
-            except Exception as e:
-                sys.stderr.write(f"[MCP Server Error] {type(e).__name__}: {e}\n")
-                sys.stderr.flush()
-                req_id = req.get("id") if isinstance(req, dict) else None
-                err_resp = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32603,
-                        "message": f"Internal error: {str(e)}",
-                    },
-                }
-                out_stream.write(json.dumps(err_resp) + "\n")
-                out_stream.flush()
+                    if not _send_response(err_resp):
+                        break
+        except (BrokenPipeError, IOError, OSError):
+            pass
 
 
 # =============================================================================

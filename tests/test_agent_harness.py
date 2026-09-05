@@ -42,6 +42,7 @@ from rvs_agent_harness import (
     RvsHarness,
     find_rvs_binary,
     get_tool_schemas,
+    sanitize_terminal_output,
     transform_response,
 )
 
@@ -470,11 +471,11 @@ class TestTokenReductionBenchmarks(TestRvsHarnessBase):
 # =============================================================================
 
 class TestToolCallingSchemas(TestRvsHarnessBase):
-    """Validates schema export across all 4 formats for all 13 commands."""
+    """Validates schema export across all 4 formats for all 16 commands."""
 
     def test_openai_schema_structure(self):
         schemas = get_tool_schemas("openai")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
             self.assertEqual(s.get("type"), "function")
             fn = s.get("function", {})
@@ -487,7 +488,7 @@ class TestToolCallingSchemas(TestRvsHarnessBase):
 
     def test_anthropic_schema_structure(self):
         schemas = get_tool_schemas("anthropic")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
             self.assertTrue(s.get("name", "").startswith("rvs_"))
             self.assertIn("description", s)
@@ -497,7 +498,7 @@ class TestToolCallingSchemas(TestRvsHarnessBase):
 
     def test_gemini_schema_structure(self):
         schemas = get_tool_schemas("gemini")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
             self.assertTrue(s.get("name", "").startswith("rvs_"))
             params = s.get("parameters", {})
@@ -508,7 +509,7 @@ class TestToolCallingSchemas(TestRvsHarnessBase):
 
     def test_mcp_schema_structure(self):
         schemas = get_tool_schemas("mcp")
-        self.assertEqual(len(schemas), 13)
+        self.assertEqual(len(schemas), 16)
         for s in schemas:
             self.assertTrue(s.get("name", "").startswith("rvs_"))
             schema = s.get("inputSchema", {})
@@ -568,7 +569,7 @@ class TestMcpServer(TestRvsHarnessBase):
         self.assertEqual(len(resps), 1)
         res = resps[0].get("result", {})
         tools = res.get("tools", [])
-        self.assertEqual(len(tools), 13)
+        self.assertEqual(len(tools), 16)
         tool_names = [t.get("name") for t in tools]
         self.assertIn("rvs_info", tool_names)
         self.assertIn("rvs_functions", tool_names)
@@ -818,7 +819,7 @@ class TestBackwardCompatibilityAndCli(TestRvsHarnessBase):
         )
         self.assertEqual(proc.returncode, 0)
         data = json.loads(proc.stdout)
-        self.assertEqual(len(data), 13)
+        self.assertEqual(len(data), 16)
 
     def test_cli_mode_compact(self):
         proc = subprocess.run(
@@ -865,6 +866,87 @@ class TestBackwardCompatibilityAndCli(TestRvsHarnessBase):
         fn_data = data.get("data", {})
         self.assertEqual(fn_data.get("displayed"), 4)
         self.assertEqual(fn_data.get("offset"), 2)
+
+
+# =============================================================================
+# 10. Requirement R3 Hardening: Broken Pipe, Coercion, Caching & Sanitization
+# =============================================================================
+
+class TestR3HardeningFeatures(TestRvsHarnessBase):
+    """Verifies R3 defensive hardening in rvs_agent_harness."""
+
+    def test_mcp_serve_broken_pipe_clean_exit(self):
+        """BrokenPipeError on stdout stream must terminate serve_mcp cleanly without crash or unhandled error."""
+        class BrokenStdout(io.StringIO):
+            def write(self, s):
+                raise BrokenPipeError("Broken pipe")
+            def flush(self):
+                raise BrokenPipeError("Broken pipe")
+
+        stdin = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"ping"}\n{"jsonrpc":"2.0","id":2,"method":"ping"}\n')
+        broken_out = BrokenStdout()
+        try:
+            self.harness.serve_mcp(stdin_stream=stdin, stdout_stream=broken_out)
+        except Exception as e:
+            self.fail(f"serve_mcp raised unexpected exception on broken pipe: {e}")
+
+    def test_parameter_coercion_string_booleans(self):
+        """String booleans ('true'/'false'/'1'/'0') must coerce correctly in execute_tool."""
+        resp_full = self.harness.execute_tool("rvs_info", {"file": str(self.crackme_path), "compact": "false"})
+        self.assertTrue(resp_full.get("success"))
+        self.assertNotEqual(resp_full.get("mode"), "compact")
+
+        resp_compact = self.harness.execute_tool("rvs_info", {"file": str(self.crackme_path), "compact": "true"})
+        self.assertTrue(resp_compact.get("success"))
+        self.assertEqual(resp_compact.get("mode"), "compact")
+
+    def test_parameter_coercion_string_integers(self):
+        """String integer digits must coerce to int for limits, offsets, steps, counts."""
+        resp_str = self.harness.execute_tool("rvs_strings", {"file": str(self.crackme_path), "limit": "5"})
+        self.assertTrue(resp_str.get("success"), f"rvs_strings failed: {resp_str}")
+        self.assertEqual(resp_str.get("data", {}).get("limit"), 5)
+
+        resp_fn = self.harness.execute_tool("rvs_functions", {"file": str(self.crackme_path), "limit": "3", "offset": "2"})
+        self.assertTrue(resp_fn.get("success"), f"rvs_functions failed: {resp_fn}")
+        self.assertEqual(resp_fn.get("data", {}).get("offset"), 2)
+
+    def test_parameter_coercion_negative_integers_rejected(self):
+        """Negative integers for steps, count, limit, offset must be rejected with INVALID_ARGUMENT."""
+        for param, val in [("steps", "-1"), ("steps", -5), ("limit", "-10"), ("offset", "-1"), ("count", "-2")]:
+            tool = "rvs_dynamic_emulate" if "steps" in param else ("rvs_dynamic_step" if "count" in param else "rvs_functions")
+            args = {"file": str(self.crackme_path), param: val}
+            if "target" not in args and tool in ("rvs_dynamic_emulate", "rvs_dynamic_step"):
+                args["target"] = "main"
+            resp = self.harness.execute_tool(tool, args)
+            self.assertFalse(resp.get("success"), f"Expected rejection for {param}={val}")
+            self.assertEqual(resp.get("error", {}).get("code"), "INVALID_ARGUMENT")
+            self.assertEqual(resp.get("error", {}).get("exit_code"), EXIT_INVALID_ARGUMENT)
+
+    def test_parameter_coercion_string_reg_set(self):
+        """reg_set passed as string 'rax=1' must coerce to ['rax=1'] without string iteration."""
+        resp = self.harness.execute_tool(
+            "rvs_dynamic_step",
+            {"file": str(self.crackme_path), "target": "main", "count": 1, "reg_set": "rax=1"}
+        )
+        self.assertTrue(resp.get("success"), f"dynamic_step failed with string reg_set: {resp}")
+
+    def test_session_caching_path_normalization(self):
+        """Session cache must resolve relative and absolute paths to the same normalized entry."""
+        rel_path = "tests/fixtures/crackme_case"
+        abs_path = os.path.abspath(rel_path)
+        self.harness.clear_session()
+        self.harness.info(rel_path)
+        s_rel = self.harness.get_session(rel_path)
+        s_abs = self.harness.get_session(abs_path)
+        self.assertTrue(len(s_rel) > 0, "Session cache was not populated")
+        self.assertEqual(s_rel, s_abs, "Relative and absolute paths did not resolve to same cache entry")
+
+    def test_terminal_sanitization_non_utf8_bytes(self):
+        """sanitize_terminal_output must safely decode bytes and strip ANSI/controls."""
+        raw_bytes = b"hello \x1b[31mworld\x1b[0m \xff\xfe\x00 test"
+        sanitized = sanitize_terminal_output(raw_bytes)
+        self.assertIn("hello world", sanitized)
+        self.assertNotIn("\x1b", sanitized)
 
 
 if __name__ == "__main__":
