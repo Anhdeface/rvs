@@ -1,6 +1,6 @@
 ---
 name: rvs-reverse-engineering
-description: Autonomous binary reverse engineering, ESIL dynamic emulation, execution tracing, control-flow gate analysis, and deterministic binary patching using rvs and its MCP agent harness.
+description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, and deterministic binary patching using rvs v0.3.0 and its 40+ tool MCP agent harness.
 compatibility: Antigravity CLI, Claude Code, Google Gemini CLI, GitHub Copilot CLI, Cursor
 version: 2.1.0
 ---
