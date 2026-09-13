@@ -5,6 +5,14 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use crate::response::AppError;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
 /// High-performance driver wrapping radare2 subprocess invocations.
 #[derive(Debug, Clone)]
 pub struct R2Driver {
@@ -322,6 +330,9 @@ fn execute_command_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), AppError> {
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = cmd.spawn().map_err(|e| {
         AppError::R2ExecutionError(format!("Failed to spawn radare2 process: {e}"))
     })?;
@@ -351,6 +362,10 @@ fn execute_command_with_timeout(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
+                    #[cfg(unix)]
+                    unsafe {
+                        kill(-(child.id() as i32), 9);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stdout_handle.join();
@@ -363,6 +378,10 @@ fn execute_command_with_timeout(
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
+                #[cfg(unix)]
+                unsafe {
+                    kill(-(child.id() as i32), 9);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stdout_handle.join();

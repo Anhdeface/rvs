@@ -1,9 +1,9 @@
 use clap::Parser;
 use std::process::ExitCode;
-use rvs::cli::{AgentCommands, AnalyzeCommands, Cli, Commands, DynamicCommands, GraphFormat, OutputFormat, PatchCommands};
+use rvs::cli::{AgentCommands, AnalyzeCommands, Cli, Commands, DebugCommands, DynamicCommands, FridaCommands, GraphFormat, OutputFormat, PatchCommands};
 use rvs::r2::R2Driver;
 use rvs::response::{ApiError, ApiResponse, AppError};
-use rvs::{agent, analysis, compact, patch};
+use rvs::{agent, analysis, compact, debug, frida, patch};
 
 fn make_compact_response<T: serde::Serialize>(
     command: impl Into<String>,
@@ -42,7 +42,43 @@ fn main() -> ExitCode {
         }
     };
 
-    let target_str = cli.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+    let target_str = match &cli.command {
+        Commands::Dynamic(DynamicCommands::Debug(dbg_cmd)) => match dbg_cmd {
+            DebugCommands::Spawn { file, .. } => file
+                .as_ref()
+                .map(|f| f.display().to_string())
+                .or_else(|| cli.file.as_ref().map(|f| f.display().to_string()))
+                .unwrap_or_default(),
+            DebugCommands::Attach { pid } => format!("pid:{pid}"),
+            DebugCommands::Continue { session_id, session, .. }
+            | DebugCommands::Step { session_id, session, .. }
+            | DebugCommands::Breakpoint { session_id, session, .. }
+            | DebugCommands::Registers { session_id, session, .. }
+            | DebugCommands::Memory { session_id, session, .. }
+            | DebugCommands::Kill { session_id, session } => {
+                session.as_deref().or(session_id.as_deref()).unwrap_or_default().to_string()
+            }
+            DebugCommands::ListSessions | DebugCommands::Daemon { .. } => "daemon".to_string(),
+        },
+        Commands::Frida(frida_cmd) => match frida_cmd {
+            FridaCommands::EnvCheck => "host".to_string(),
+            FridaCommands::Attach { target, .. } => target.clone(),
+            FridaCommands::Spawn { path, .. } => path.display().to_string(),
+            FridaCommands::Modules { target, .. }
+            | FridaCommands::Symbols { target, .. }
+            | FridaCommands::Classes { target, .. }
+            | FridaCommands::Hook { target, .. }
+            | FridaCommands::TraceRegs { target, .. }
+            | FridaCommands::HookReturn { target, .. }
+            | FridaCommands::HooksList { target, .. }
+            | FridaCommands::HookRemove { target, .. }
+            | FridaCommands::Script { target, .. }
+            | FridaCommands::Rpc { target, .. }
+            | FridaCommands::MemRead { target, .. }
+            | FridaCommands::MemWrite { target, .. } => target.clone(),
+        },
+        _ => cli.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default(),
+    };
     let pretty = cli.pretty;
 
     let command_name = match &cli.command {
@@ -58,6 +94,18 @@ fn main() -> ExitCode {
         Commands::Dynamic(DynamicCommands::Emulate { .. }) => "dynamic emulate",
         Commands::Dynamic(DynamicCommands::Trace { .. }) => "dynamic trace",
         Commands::Dynamic(DynamicCommands::Step { .. }) => "dynamic step",
+        Commands::Dynamic(DynamicCommands::Debug(dbg_cmd)) => match dbg_cmd {
+            DebugCommands::Spawn { .. } => "dynamic debug spawn",
+            DebugCommands::Attach { .. } => "dynamic debug attach",
+            DebugCommands::Continue { .. } => "dynamic debug continue",
+            DebugCommands::Step { .. } => "dynamic debug step",
+            DebugCommands::Breakpoint { .. } => "dynamic debug breakpoint",
+            DebugCommands::Registers { .. } => "dynamic debug registers",
+            DebugCommands::Memory { .. } => "dynamic debug memory",
+            DebugCommands::Kill { .. } => "dynamic debug kill",
+            DebugCommands::ListSessions => "dynamic debug list-sessions",
+            DebugCommands::Daemon { .. } => "dynamic debug daemon",
+        },
         Commands::Strings { .. } => "strings",
         Commands::Symbols { .. } => "symbols",
         Commands::Agent(AgentCommands::Triage) => "agent triage",
@@ -67,6 +115,23 @@ fn main() -> ExitCode {
         Commands::Agent(AgentCommands::PatchPlan { .. }) => "agent patch-plan",
         Commands::Agent(AgentCommands::Emulate { .. }) => "agent emulate",
         Commands::Agent(AgentCommands::Trace { .. }) => "agent trace",
+        Commands::Frida(frida_cmd) => match frida_cmd {
+            FridaCommands::EnvCheck => "frida env-check",
+            FridaCommands::Attach { .. } => "frida attach",
+            FridaCommands::Spawn { .. } => "frida spawn",
+            FridaCommands::Modules { .. } => "frida modules",
+            FridaCommands::Symbols { .. } => "frida symbols",
+            FridaCommands::Classes { .. } => "frida classes",
+            FridaCommands::Hook { .. } => "frida hook",
+            FridaCommands::TraceRegs { .. } => "frida trace-regs",
+            FridaCommands::HookReturn { .. } => "frida hook-return",
+            FridaCommands::HooksList { .. } => "frida hooks-list",
+            FridaCommands::HookRemove { .. } => "frida hook-remove",
+            FridaCommands::Script { .. } => "frida script",
+            FridaCommands::Rpc { .. } => "frida rpc",
+            FridaCommands::MemRead { .. } => "frida mem-read",
+            FridaCommands::MemWrite { .. } => "frida mem-write",
+        },
     };
 
     match execute_cli(&cli, command_name, &target_str) {
@@ -92,6 +157,12 @@ fn main() -> ExitCode {
 }
 
 fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String, AppError> {
+    if let Commands::Dynamic(DynamicCommands::Debug(dbg_cmd)) = &cli.command {
+        return debug::handle_debug_command(cli, dbg_cmd);
+    }
+    if let Commands::Frida(frida_cmd) = &cli.command {
+        return frida::handle_frida_command(cli, frida_cmd);
+    }
     let file_path = cli.file.as_ref().ok_or_else(|| {
         AppError::InvalidArgument("Target binary file path is required. Use -f or --file <PATH>.".to_string())
     })?;
@@ -154,7 +225,9 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             }
         }
 
-        Commands::Analyze(AnalyzeCommands::Functions { filter, detail }) => {
+        Commands::Analyze(AnalyzeCommands::Functions { filter, detail, format: cmd_format }) => {
+            let format = cmd_format.unwrap_or(format);
+            let compact_flag = cli.compact || format == OutputFormat::Agent;
             let data = analysis::analyze_functions(&driver, filter.as_deref(), *detail)?;
             match format {
                 OutputFormat::Agent => {
@@ -236,7 +309,9 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             }
         }
 
-        Commands::Analyze(AnalyzeCommands::Graph { target, graph_type }) => {
+        Commands::Analyze(AnalyzeCommands::Graph { target, graph_type, format: cmd_format }) => {
+            let format = cmd_format.unwrap_or(format);
+            let compact_flag = cli.compact || format == OutputFormat::Agent;
             let graph_format = GraphFormat::from(format);
             let data = analysis::analyze_graph(&driver, target.as_deref(), *graph_type, graph_format)?;
             match format {
@@ -297,7 +372,9 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             }
         }
 
-        Commands::Analyze(AnalyzeCommands::Xrefs { target, xref_type, kind }) => {
+        Commands::Analyze(AnalyzeCommands::Xrefs { target, xref_type, kind, format: cmd_format }) => {
+            let format = cmd_format.unwrap_or(format);
+            let compact_flag = cli.compact || format == OutputFormat::Agent;
             let data = analysis::analyze_xrefs(&driver, target, *xref_type, *kind)?;
             match format {
                 OutputFormat::Agent => {
@@ -832,6 +909,14 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                     }
                 }
             }
+        }
+
+        Commands::Dynamic(DynamicCommands::Debug(dbg_cmd)) => {
+            debug::handle_debug_command(cli, dbg_cmd)
+        }
+
+        Commands::Frida(frida_cmd) => {
+            frida::handle_frida_command(cli, frida_cmd)
         }
     }
 }

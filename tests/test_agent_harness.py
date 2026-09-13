@@ -475,7 +475,7 @@ class TestToolCallingSchemas(TestRvsHarnessBase):
 
     def test_openai_schema_structure(self):
         schemas = get_tool_schemas("openai")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
             self.assertEqual(s.get("type"), "function")
             fn = s.get("function", {})
@@ -483,38 +483,34 @@ class TestToolCallingSchemas(TestRvsHarnessBase):
             self.assertIn("description", fn)
             params = fn.get("parameters", {})
             self.assertEqual(params.get("type"), "object")
-            self.assertIn("file", params.get("required", []))
             self.assertIn("properties", params)
 
     def test_anthropic_schema_structure(self):
         schemas = get_tool_schemas("anthropic")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
             self.assertTrue(s.get("name", "").startswith("rvs_"))
             self.assertIn("description", s)
             schema = s.get("input_schema", {})
             self.assertEqual(schema.get("type"), "object")
-            self.assertIn("file", schema.get("required", []))
 
     def test_gemini_schema_structure(self):
         schemas = get_tool_schemas("gemini")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
             self.assertTrue(s.get("name", "").startswith("rvs_"))
             params = s.get("parameters", {})
             self.assertEqual(params.get("type"), "OBJECT")
             props = params.get("properties", {})
-            self.assertIn("file", props)
-            self.assertEqual(props["file"].get("type"), "STRING")
+            self.assertIsInstance(props, dict)
 
     def test_mcp_schema_structure(self):
         schemas = get_tool_schemas("mcp")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
             self.assertTrue(s.get("name", "").startswith("rvs_"))
             schema = s.get("inputSchema", {})
             self.assertEqual(schema.get("type"), "object")
-            self.assertIn("file", schema.get("required", []))
 
     def test_schema_unsupported_format_raises_error(self):
         with self.assertRaises(ValueError):
@@ -569,7 +565,7 @@ class TestMcpServer(TestRvsHarnessBase):
         self.assertEqual(len(resps), 1)
         res = resps[0].get("result", {})
         tools = res.get("tools", [])
-        self.assertEqual(len(tools), 16)
+        self.assertEqual(len(tools), len(CANONICAL_TOOLS))
         tool_names = [t.get("name") for t in tools]
         self.assertIn("rvs_info", tool_names)
         self.assertIn("rvs_functions", tool_names)
@@ -819,7 +815,7 @@ class TestBackwardCompatibilityAndCli(TestRvsHarnessBase):
         )
         self.assertEqual(proc.returncode, 0)
         data = json.loads(proc.stdout)
-        self.assertEqual(len(data), 16)
+        self.assertEqual(len(data), len(CANONICAL_TOOLS))
 
     def test_cli_mode_compact(self):
         proc = subprocess.run(

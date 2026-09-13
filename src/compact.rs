@@ -852,6 +852,81 @@ impl From<&InstructionInfo> for CompactInstruction {
     }
 }
 
+// ── Compact Frida Responses ────────────────────────
+
+/// Compact module representation for agent consumption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaModule {
+    pub name: String,
+    pub base: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaModulesResponse {
+    pub count: usize,
+    pub modules: Vec<CompactFridaModule>,
+}
+
+/// Compact symbol representation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaSymbol {
+    pub name: String,
+    pub addr: String,
+    #[serde(rename = "sz", skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub sym_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaSymbolsResponse {
+    pub count: usize,
+    pub symbols: Vec<CompactFridaSymbol>,
+}
+
+/// Compact class enumeration response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaClassesResponse {
+    pub total: usize,
+    pub classes: Vec<String>,
+}
+
+/// Compact dynamic hook response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaHookResponse {
+    pub id: String,
+    pub addr: String,
+    pub active: bool,
+}
+
+/// Compact live memory read response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaMemReadResponse {
+    pub addr: String,
+    pub hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ascii: Option<String>,
+}
+
+/// Compact live memory write response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaMemWriteResponse {
+    pub addr: String,
+    pub bytes: usize,
+    pub verified: bool,
+}
+
+/// Compact script execution response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactFridaScriptResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub res: Option<serde_json::Value>,
+}
+
 // ── Tests ──────────────────────────────────────────
 
 #[cfg(test)]

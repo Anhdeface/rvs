@@ -36,6 +36,9 @@ compile_target() {
 compile_target "${SCRIPT_DIR}/test_target.c" "test_target"
 compile_target "${SCRIPT_DIR}/auth_gate.c" "auth_gate"
 compile_target "${SCRIPT_DIR}/flow_calc.c" "flow_calc"
+compile_target "${SCRIPT_DIR}/crash_target.c" "crash_target"
+compile_target "${SCRIPT_DIR}/decryptor_target.c" "decryptor_target"
+compile_target "${SCRIPT_DIR}/antidebug_target.c" "antidebug_target"
 
 echo "Compilation complete. Fixtures created in ${SCRIPT_DIR}:"
 ls -la "${SCRIPT_DIR}"/*_elf64 "${SCRIPT_DIR}"/*_pie "${SCRIPT_DIR}"/*_clang 2>/dev/null || true

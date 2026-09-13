@@ -87,6 +87,47 @@ pub enum AppError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    #[error("Debug session '{0}' not found or has expired")]
+    DebugSessionNotFound(String),
+
+    #[error("Process not attached: {0}")]
+    ProcessNotAttached(String),
+
+    #[error("Breakpoint error at '{addr}': {reason}")]
+    BreakpointError {
+        addr: String,
+        reason: String,
+    },
+
+    #[error("Memory access error at '{addr}': {reason}")]
+    MemoryAccessError {
+        addr: String,
+        reason: String,
+    },
+
+    #[error("Debugger daemon error: {0}")]
+    DaemonError(String),
+
+    #[error("r2frida plugin is not installed in radare2: {0}")]
+    R2FridaNotInstalled(String),
+
+    #[error("Failed to attach to target '{target}': {reason}")]
+    FridaAttachFailed {
+        target: String,
+        reason: String,
+    },
+
+    #[error("Frida hook failed at '{addr}': {reason}")]
+    FridaHookFailed {
+        addr: String,
+        reason: String,
+    },
+
+    #[error("Frida script error: {reason}")]
+    FridaScriptError {
+        reason: String,
+    },
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -106,7 +147,8 @@ impl AppError {
     pub fn exit_code(&self) -> u8 {
         match self {
             AppError::InvalidArgument(_)
-            | AppError::PatchPlanError(_) => 1,
+            | AppError::PatchPlanError(_)
+            | AppError::DebugSessionNotFound(_) => 1,
 
             AppError::FileNotFound(_)
             | AppError::PermissionDenied(_)
@@ -117,7 +159,13 @@ impl AppError {
             | AppError::AddressOutOfBounds(_)
             | AppError::DecompilationFailed { .. }
             | AppError::FlowAnalysisFailed { .. }
-            | AppError::EmulationFailed { .. } => 3,
+            | AppError::EmulationFailed { .. }
+            | AppError::ProcessNotAttached(_)
+            | AppError::BreakpointError { .. }
+            | AppError::MemoryAccessError { .. }
+            | AppError::FridaAttachFailed { .. }
+            | AppError::FridaHookFailed { .. }
+            | AppError::FridaScriptError { .. } => 3,
 
             AppError::AssemblyFailed { .. }
             | AppError::InvalidHexString { .. }
@@ -135,7 +183,9 @@ impl AppError {
 
             AppError::R2ExecutionError(_)
             | AppError::Internal(_)
-            | AppError::JsonError(_) => 6,
+            | AppError::DaemonError(_)
+            | AppError::JsonError(_)
+            | AppError::R2FridaNotInstalled(_) => 6,
         }
     }
 
@@ -310,6 +360,42 @@ impl AppError {
                 .with_exit_code(code_u8)
                 .with_suggestion("An internal error occurred. Please file a bug report."),
 
+            AppError::DebugSessionNotFound(session_id) => ApiError::new(
+                "DEBUG_SESSION_NOT_FOUND",
+                format!("Debug session '{session_id}' not found or has expired"),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("List active sessions with 'rvs dynamic debug list-sessions' or spawn a new debug session."),
+
+            AppError::ProcessNotAttached(msg) => ApiError::new("PROCESS_NOT_ATTACHED", msg)
+                .with_category(cat)
+                .with_exit_code(code_u8)
+                .with_suggestion("Spawn a process with 'rvs dynamic debug spawn <file>' or attach with 'rvs dynamic debug attach <pid>'."),
+
+            AppError::BreakpointError { addr, reason } => ApiError::with_details(
+                "BREAKPOINT_ERROR",
+                format!("Breakpoint error at address '{addr}': {reason}"),
+                serde_json::json!({ "addr": addr, "reason": reason }),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("Ensure the breakpoint address is valid and falls within mapped executable memory."),
+
+            AppError::MemoryAccessError { addr, reason } => ApiError::with_details(
+                "MEMORY_ACCESS_ERROR",
+                format!("Memory access error at address '{addr}': {reason}"),
+                serde_json::json!({ "addr": addr, "reason": reason }),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("Inspect virtual memory maps with 'rvs dynamic debug memory maps' to verify permissions."),
+
+            AppError::DaemonError(msg) => ApiError::new("DAEMON_ERROR", msg)
+                .with_category(cat)
+                .with_exit_code(code_u8)
+                .with_suggestion("Verify the debug daemon socket permissions and restart the daemon."),
+
             AppError::IoError(e) => ApiError::new("IO_ERROR", e.to_string())
                 .with_category(cat)
                 .with_exit_code(code_u8)
@@ -319,6 +405,37 @@ impl AppError {
                 .with_category(cat)
                 .with_exit_code(code_u8)
                 .with_suggestion("Ensure the input JSON string is properly formatted and valid."),
+
+            AppError::R2FridaNotInstalled(msg) => ApiError::new("R2_FRIDA_NOT_INSTALLED", msg)
+                .with_category(cat)
+                .with_exit_code(code_u8)
+                .with_suggestion("Install r2frida via r2pm -ci r2frida or ensure io_frida.so is in plugin search path"),
+
+            AppError::FridaAttachFailed { target, reason } => ApiError::with_details(
+                "FRIDA_ATTACH_FAILED",
+                format!("Failed to attach to target '{target}': {reason}"),
+                serde_json::json!({ "target": target, "reason": reason }),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("Verify target process is running and accessible (check permissions / TracerPid)."),
+
+            AppError::FridaHookFailed { addr, reason } => ApiError::with_details(
+                "FRIDA_HOOK_FAILED",
+                format!("Frida hook failed at '{addr}': {reason}"),
+                serde_json::json!({ "addr": addr, "reason": reason }),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("Check that the target address is within a valid executable segment using 'rvs frida symbols'."),
+
+            AppError::FridaScriptError { reason } => ApiError::new(
+                "FRIDA_SCRIPT_ERROR",
+                format!("Frida script error: {reason}"),
+            )
+            .with_category(cat)
+            .with_exit_code(code_u8)
+            .with_suggestion("Verify JavaScript syntax and ensure variables conform to standard Frida API conventions."),
         }
     }
 }

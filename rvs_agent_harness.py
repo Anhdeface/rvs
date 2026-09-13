@@ -6,7 +6,7 @@ Provides:
 1. Complete Subprocess Environment Isolation (TERM=dumb, NO_COLOR=1, R2_NOPLUGINS=1, RADARE2_RCFILE=/dev/null)
 2. Process Watchdog with Timeout Management (Graceful SIGTERM -> SIGKILL)
 3. Token-Optimized Response Filtering & Compaction Engine (compact, summary, full modes)
-4. LLM Function Calling Schema Exporter (OpenAI, Anthropic, Gemini, MCP formats for 16 commands including Dynamic RE)
+4. LLM Function Calling Schema Exporter (OpenAI, Anthropic, Gemini, MCP formats for 40 commands including Dynamic RE, Native Debug & r2frida)
 5. Native Model Context Protocol (MCP) Stdio JSON-RPC 2.0 Server
 6. Ergonomic Typed Python API (`RvsHarness` & `RvsAgentHarness`) with Normalized Error Envelopes
 7. Standardized 7-Level Exit Code Taxonomy & Actionable Error Suggestions
@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -41,7 +42,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.2.0"
+SERVER_VERSION: str = "0.3.0"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -238,32 +239,73 @@ def execute_rvs_subprocess(
             cwd=str(cwd) if cwd else None,
             text=True,
             errors="replace",
+            start_new_session=True,
         )
 
         try:
-            stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Graceful termination first (SIGTERM)
             try:
-                proc.terminate()
-                stdout_raw, stderr_raw = proc.communicate(timeout=0.5)
-            except (subprocess.TimeoutExpired, Exception):
-                # Force kill if unresponsive (SIGKILL)
+                stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                stdout_raw, stderr_raw = "", ""
+                # Graceful termination first (SIGTERM to entire process group)
                 try:
-                    proc.kill()
-                    stdout_raw, stderr_raw = proc.communicate(timeout=0.5)
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
                 except Exception:
-                    stdout_raw, stderr_raw = "", ""
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=0.5)
+                except (subprocess.TimeoutExpired, Exception):
+                    # Force kill entire process group if unresponsive (SIGKILL)
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+
+                    try:
+                        stdout_raw, stderr_raw = proc.communicate(timeout=0.5)
+                    except Exception:
+                        stdout_raw, stderr_raw = "", ""
+
+                duration = time.time() - start_time
+                stdout = sanitize_terminal_output(stdout_raw)
+                stderr = sanitize_terminal_output(stderr_raw)
+                return EXIT_TIMEOUT_ERROR, stdout, stderr, duration
 
             duration = time.time() - start_time
             stdout = sanitize_terminal_output(stdout_raw)
             stderr = sanitize_terminal_output(stderr_raw)
-            return EXIT_TIMEOUT_ERROR, stdout, stderr, duration
+            return proc.returncode, stdout, stderr, duration
 
-        duration = time.time() - start_time
-        stdout = sanitize_terminal_output(stdout_raw)
-        stderr = sanitize_terminal_output(stderr_raw)
-        return proc.returncode, stdout, stderr, duration
+        finally:
+            # Unconditional reaping: ensure proc.wait() is always called so <defunct>
+            # zombie processes are never left in the operating system process table.
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            os.waitpid(proc.pid, os.WNOHANG)
+                        except Exception:
+                            pass
 
     except FileNotFoundError:
         duration = time.time() - start_time
@@ -334,15 +376,15 @@ def prune_functions(
     if mode == "summary":
         top = sorted(
             funcs,
-            key=lambda f: (f.get("cyclomatic_complexity") or 0, f.get("size") or 0),
+            key=lambda f: (f.get("cc") or f.get("cyclomatic_complexity") or 0, f.get("size") or f.get("sz") or 0),
             reverse=True,
         )[:5]
         top_list = [
             {
                 "name": f.get("name"),
-                "addr": f.get("offset_hex") or format_hex_addr(f.get("offset")),
-                "size": f.get("size"),
-                "cc": f.get("cyclomatic_complexity"),
+                "addr": f.get("addr") or f.get("offset_hex") or format_hex_addr(f.get("offset")),
+                "size": f.get("size") if f.get("size") is not None else f.get("sz"),
+                "cc": f.get("cc") if f.get("cc") is not None else f.get("cyclomatic_complexity"),
             }
             for f in top
         ]
@@ -367,15 +409,18 @@ def prune_functions(
     for f in sliced:
         item: Dict[str, Any] = {
             "name": f.get("name"),
-            "addr": f.get("offset_hex") or format_hex_addr(f.get("offset")),
-            "size": f.get("size"),
+            "addr": f.get("addr") or f.get("offset_hex") or format_hex_addr(f.get("offset")),
+            "size": f.get("size") if f.get("size") is not None else f.get("sz"),
         }
-        if f.get("cyclomatic_complexity") is not None:
-            item["cc"] = f.get("cyclomatic_complexity")
-        if f.get("num_basic_blocks") is not None:
-            item["blocks"] = f.get("num_basic_blocks")
-        if f.get("num_instructions") is not None:
-            item["instrs"] = f.get("num_instructions")
+        cc = f.get("cc") if f.get("cc") is not None else f.get("cyclomatic_complexity")
+        if cc is not None:
+            item["cc"] = cc
+        blocks = f.get("blocks") if f.get("blocks") is not None else (f.get("bb") or f.get("num_basic_blocks"))
+        if blocks is not None:
+            item["blocks"] = blocks
+        instrs = f.get("instrs") if f.get("instrs") is not None else (f.get("ins") or f.get("num_instructions"))
+        if instrs is not None:
+            item["instrs"] = instrs
         compact_funcs.append(item)
 
     is_truncated = (total > len(compact_funcs)) or effective_offset > 0 or limit is not None
@@ -415,8 +460,8 @@ def prune_blocks(
 
     blocks = data.get("blocks", [])
     total = len(blocks)
-    fn_name = data.get("function_name")
-    fn_addr = data.get("function_addr_hex") or format_hex_addr(data.get("function_addr"))
+    fn_name = data.get("function") or data.get("function_name")
+    fn_addr = data.get("addr") or data.get("function_addr_hex") or format_hex_addr(data.get("function_addr"))
 
     if mode == "summary":
         entry_b = blocks[0] if blocks else {}
@@ -424,7 +469,7 @@ def prune_blocks(
             "function": fn_name,
             "addr": fn_addr,
             "total_blocks": total,
-            "entry": entry_b.get("addr_hex") or format_hex_addr(entry_b.get("addr")),
+            "entry": entry_b.get("addr") if isinstance(entry_b.get("addr"), str) and entry_b.get("addr").startswith("0x") else (entry_b.get("addr_hex") or format_hex_addr(entry_b.get("addr"))),
         }
 
     try:
@@ -451,20 +496,21 @@ def prune_blocks(
 
         compact_insts = [
             {
-                "addr": i.get("addr_hex") or format_hex_addr(i.get("addr")),
-                "asm": i.get("disasm") or i.get("opcode") or i.get("asm"),
+                "addr": i.get("addr") if isinstance(i.get("addr"), str) and i.get("addr").startswith("0x") else (i.get("addr_hex") or format_hex_addr(i.get("addr"))),
+                "asm": i.get("asm") or i.get("disasm") or i.get("opcode"),
                 "size": i.get("size"),
             }
             for i in insts
         ]
 
+        b_addr = b.get("addr") if isinstance(b.get("addr"), str) and b.get("addr").startswith("0x") else (b.get("addr_hex") or format_hex_addr(b.get("addr")))
         b_dict: Dict[str, Any] = {
-            "addr": b.get("addr_hex") or format_hex_addr(b.get("addr")),
+            "addr": b_addr,
             "size": b.get("size"),
             "instructions": compact_insts,
         }
-        jump_addr = b.get("jump_hex") or format_hex_addr(b.get("jump"))
-        fail_addr = b.get("fail_hex") or format_hex_addr(b.get("fail"))
+        jump_addr = b.get("jump") if isinstance(b.get("jump"), str) and b.get("jump").startswith("0x") else (b.get("jump_hex") or format_hex_addr(b.get("jump")))
+        fail_addr = b.get("fail") if isinstance(b.get("fail"), str) and b.get("fail").startswith("0x") else (b.get("fail_hex") or format_hex_addr(b.get("fail")))
         if jump_addr:
             b_dict["jump"] = jump_addr
         if fail_addr:
@@ -510,7 +556,13 @@ def prune_strings(
     if mode == "full":
         return data
 
-    raw_strings = data.get("strings", [])
+    raw = data.get("strings", [])
+    if isinstance(raw, dict):
+        raw_strings = [{"addr": k, "string": v} for k, v in raw.items()]
+    elif isinstance(raw, list):
+        raw_strings = raw
+    else:
+        raw_strings = []
     total = len(raw_strings)
 
     if mode == "summary":
@@ -531,7 +583,7 @@ def prune_strings(
     sliced = raw_strings[effective_offset : effective_offset + effective_limit]
     compact_strings = [
         {
-            "addr": s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")) or s.get("addr"),
+            "addr": s.get("addr") or s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")),
             "string": s.get("string"),
         }
         for s in sliced
@@ -572,6 +624,8 @@ def prune_symbols(
         return data
 
     raw_symbols = data.get("symbols", [])
+    if not isinstance(raw_symbols, list):
+        raw_symbols = []
     total = len(raw_symbols)
 
     if mode == "summary":
@@ -594,8 +648,8 @@ def prune_symbols(
     for s in sliced:
         sym_dict: Dict[str, Any] = {
             "name": s.get("name"),
-            "addr": s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")) or s.get("addr"),
-            "type": s.get("sym_type") or s.get("type"),
+            "addr": s.get("addr") or s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")),
+            "type": s.get("type") or s.get("sym_type") or s.get("t"),
         }
         if s.get("bind"):
             sym_dict["bind"] = s.get("bind")
@@ -621,6 +675,141 @@ def prune_symbols(
     if total > (effective_offset + len(compact_symbols)):
         res["continuation_hint"] = (
             f"Use limit={effective_limit} offset={effective_offset + len(compact_symbols)} to retrieve next slice."
+        )
+    return res
+
+
+def prune_modules(
+    data: Dict[str, Any],
+    mode: OutputMode,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Prune and paginate loaded module lists."""
+    if mode == "full":
+        return data
+
+    raw_modules = data.get("modules", [])
+    if not isinstance(raw_modules, list):
+        raw_modules = []
+    total = len(raw_modules)
+
+    if mode == "summary":
+        return {
+            "total": total,
+            "sample": [m.get("name") if isinstance(m, dict) else str(m) for m in raw_modules[:10]],
+        }
+
+    try:
+        effective_limit = int(limit) if limit is not None else 30
+    except (ValueError, TypeError):
+        effective_limit = 30
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = raw_modules[effective_offset : effective_offset + effective_limit]
+    compact_modules = []
+    for m in sliced:
+        if isinstance(m, dict):
+            mod_dict: Dict[str, Any] = {
+                "name": m.get("name"),
+                "base": m.get("base"),
+                "size": m.get("size"),
+            }
+            if m.get("path"):
+                mod_dict["path"] = m.get("path")
+            compact_modules.append(mod_dict)
+        else:
+            compact_modules.append({"name": str(m)})
+
+    is_truncated = (total > len(compact_modules)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
+        return {
+            "total": total,
+            "modules": compact_modules,
+        }
+
+    res: Dict[str, Any] = {
+        "total": total,
+        "displayed": len(compact_modules),
+        "remaining": max(0, total - (effective_offset + len(compact_modules))),
+        "offset": effective_offset,
+        "limit": effective_limit,
+        "truncated": total > (effective_offset + len(compact_modules)),
+        "has_more": total > (effective_offset + len(compact_modules)),
+        "modules": compact_modules,
+    }
+    if total > (effective_offset + len(compact_modules)):
+        res["continuation_hint"] = (
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_modules)} to retrieve next slice."
+        )
+    return res
+
+
+def prune_classes(
+    data: Dict[str, Any],
+    mode: OutputMode,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Prune and paginate class enumeration tables."""
+    if mode == "full":
+        return data
+
+    raw_classes = data.get("classes", [])
+    if not isinstance(raw_classes, list):
+        raw_classes = []
+    total = len(raw_classes)
+
+    if mode == "summary":
+        sample = [c if isinstance(c, str) else c.get("name") for c in raw_classes[:10]]
+        return {
+            "total": total,
+            "sample": sample,
+        }
+
+    try:
+        effective_limit = int(limit) if limit is not None else 50
+    except (ValueError, TypeError):
+        effective_limit = 50
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = raw_classes[effective_offset : effective_offset + effective_limit]
+    compact_classes = []
+    for c in sliced:
+        if isinstance(c, str):
+            compact_classes.append(c)
+        elif isinstance(c, dict):
+            cls_dict: Dict[str, Any] = {"name": c.get("name")}
+            if c.get("methods"):
+                cls_dict["methods"] = c.get("methods")
+            compact_classes.append(cls_dict)
+
+    is_truncated = (total > len(compact_classes)) or effective_offset > 0 or limit is not None
+    if not is_truncated and effective_offset == 0:
+        return {
+            "total": total,
+            "classes": compact_classes,
+        }
+
+    res: Dict[str, Any] = {
+        "total": total,
+        "displayed": len(compact_classes),
+        "remaining": max(0, total - (effective_offset + len(compact_classes))),
+        "offset": effective_offset,
+        "limit": effective_limit,
+        "truncated": total > (effective_offset + len(compact_classes)),
+        "has_more": total > (effective_offset + len(compact_classes)),
+        "classes": compact_classes,
+    }
+    if total > (effective_offset + len(compact_classes)):
+        res["continuation_hint"] = (
+            f"Use limit={effective_limit} offset={effective_offset + len(compact_classes)} to retrieve next slice."
         )
     return res
 
@@ -745,40 +934,40 @@ def prune_flow(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
     if mode == "full":
         return data
 
-    nodes = data.get("decision_nodes", [])
-    fn_name = data.get("function_name")
-    fn_addr = data.get("function_addr_hex") or format_hex_addr(data.get("function_addr"))
+    nodes = data.get("gates") or data.get("decision_nodes", [])
+    fn_name = data.get("fn") or data.get("function_name")
+    fn_addr = data.get("addr") or data.get("function_addr_hex") or format_hex_addr(data.get("function_addr"))
 
     if mode == "summary":
         return {
             "function": fn_name,
             "addr": fn_addr,
-            "total_blocks": data.get("total_blocks"),
+            "total_blocks": data.get("total_blocks") or data.get("blocks"),
             "decision_gates_count": len(nodes),
-            "loops": data.get("loop_count", 0),
+            "loops": data.get("loop_count") or data.get("loops", 0),
         }
 
     compact_nodes = []
     for n in nodes:
         compact_nodes.append({
-            "addr": n.get("addr_hex") or format_hex_addr(n.get("addr")),
-            "cond": n.get("condition_instruction"),
-            "branch": n.get("branch_instruction"),
-            "jump": n.get("jump_target_hex") or format_hex_addr(n.get("jump_target")),
-            "fail": n.get("fail_target_hex") or format_hex_addr(n.get("fail_target")),
-            "type": n.get("gate_type"),
+            "addr": n.get("addr") or n.get("addr_hex") or format_hex_addr(n.get("addr")),
+            "cond": n.get("cond") or n.get("condition_instruction"),
+            "branch": n.get("branch") or n.get("branch_instruction"),
+            "jump": n.get("jump") or n.get("jump_target_hex") or format_hex_addr(n.get("jump_target")),
+            "fail": n.get("fail") or n.get("fail_target_hex") or format_hex_addr(n.get("fail_target")),
+            "type": n.get("type") or n.get("gate_type"),
         })
 
     exits = [
         format_hex_addr(e) if isinstance(e, int) else str(e)
-        for e in data.get("exit_nodes", [])
+        for e in (data.get("exit_nodes") or data.get("exits", []))
     ]
 
     return {
         "function": fn_name,
         "addr": fn_addr,
-        "total_blocks": data.get("total_blocks"),
-        "loops": data.get("loop_count", 0),
+        "total_blocks": data.get("total_blocks") or data.get("blocks"),
+        "loops": data.get("loop_count") or data.get("loops", 0),
         "decision_nodes": compact_nodes,
         "exits": exits,
     }
@@ -828,9 +1017,9 @@ def prune_triage(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
     if mode == "full":
         return data
 
-    entry_hex = data.get("entry_point_hex") or format_hex_addr(data.get("entry_point"))
+    entry_hex = data.get("entry") or data.get("entry_point_hex") or format_hex_addr(data.get("entry_point"))
     sec = data.get("security", {})
-    sec_compact = [
+    sec_compact = sec if isinstance(sec, list) else [
         k for k, v in (sec if isinstance(sec, dict) else {}).items()
         if v is True or (isinstance(v, str) and v.lower() not in ("none", "false", "no"))
     ]
@@ -953,13 +1142,26 @@ def prune_emulate(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
         "steps": data.get("steps_executed") or data.get("steps"),
         "stop": data.get("stop_reason") or data.get("stop"),
     }
-    if data.get("return_value"):
-        res["ret"] = data.get("return_value")
-    elif data.get("ret"):
-        res["ret"] = data.get("ret")
+    ret = data.get("return_value") or data.get("ret")
+    if ret:
+        if isinstance(ret, dict):
+            res["ret"] = {
+                "reg": ret.get("reg") or ret.get("register"),
+                "val": ret.get("val") or ret.get("value_hex") or format_hex_addr(ret.get("value")),
+            }
+        else:
+            res["ret"] = ret
 
-    diff = data.get("register_diff") or data.get("diff") or data.get("key_registers_changed") or []
-    res["diff"] = diff
+    raw_diff = data.get("register_diff") or data.get("diff") or data.get("key_registers_changed") or []
+    clean_diff = []
+    for d in raw_diff:
+        reg = d.get("reg")
+        from_val = d.get("from") or d.get("before_hex") or format_hex_addr(d.get("before"))
+        to_val = d.get("to") or d.get("after_hex") or format_hex_addr(d.get("after"))
+        if reg in ("rip", "eip", "pc"):
+            continue
+        clean_diff.append({"reg": reg, "from": from_val, "to": to_val})
+    res["diff"] = clean_diff
 
     if data.get("branches_encountered"):
         res["branches"] = data.get("branches_encountered")
@@ -992,12 +1194,25 @@ def prune_trace(data: Dict[str, Any], mode: OutputMode, limit: Optional[int] = N
         effective_limit = 30
     compact_steps = []
     for s in steps[:effective_limit]:
-        compact_steps.append({
+        step_addr = s.get("addr") if isinstance(s.get("addr"), str) and s.get("addr").startswith("0x") else (s.get("addr_hex") or format_hex_addr(s.get("addr")))
+        raw_diff = s.get("reg_changes") or s.get("diff") or []
+        clean_diff = []
+        for d in raw_diff:
+            reg = d.get("reg")
+            from_val = d.get("from") or d.get("before_hex") or format_hex_addr(d.get("before"))
+            to_val = d.get("to") or d.get("after_hex") or format_hex_addr(d.get("after"))
+            if reg in ("rip", "eip", "pc") and (to_val == step_addr or from_val == step_addr):
+                continue
+            clean_diff.append({"reg": reg, "from": from_val, "to": to_val})
+
+        step_entry: Dict[str, Any] = {
             "step": s.get("step"),
-            "addr": s.get("addr_hex") or s.get("addr"),
-            "asm": s.get("disasm") or s.get("asm"),
-            "diff": s.get("reg_changes") or s.get("diff") or [],
-        })
+            "addr": step_addr,
+            "asm": s.get("asm") or s.get("disasm") or s.get("opcode"),
+        }
+        if clean_diff:
+            step_entry["diff"] = clean_diff
+        compact_steps.append(step_entry)
 
     res: Dict[str, Any] = {
         "target": data.get("target"),
@@ -1054,6 +1269,10 @@ def transform_response(
         )
     elif "strings" in cmd:
         transformed_data = prune_strings(raw_data, mode, limit=limit, offset=offset)
+    elif "modules" in cmd:
+        transformed_data = prune_modules(raw_data, mode, limit=limit, offset=offset)
+    elif "classes" in cmd:
+        transformed_data = prune_classes(raw_data, mode, limit=limit, offset=offset)
     elif "symbols" in cmd:
         transformed_data = prune_symbols(raw_data, mode, limit=limit, offset=offset)
     elif "flow" in cmd:
@@ -1281,7 +1500,11 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of symbols to return.",
+                "description": "Maximum number of symbols to return. Defaults to 50.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Starting index offset for pagination. Defaults to 0.",
             },
             "compact": {
                 "type": "boolean",
@@ -1526,7 +1749,730 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
         },
         "required": ["file", "target"],
     },
+    # =========================================================================
+    # Native Dynamic Debugging Tools (rvs dynamic debug ...)
+    # =========================================================================
+    {
+        "name": "rvs_debug_spawn",
+        "description": "Spawn target executable under native ptrace debugger with ASLR control and stdin injection. Returns session ID for subsequent debug operations.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "args": {
+                "type": "array",
+                "description": "Command line arguments passed to the debugged process.",
+                "items": {"type": "string"},
+            },
+            "stdin": {
+                "type": "string",
+                "description": "String or file path to feed into target stdin.",
+            },
+            "no_aslr": {
+                "type": "boolean",
+                "description": "Disable ASLR for reproducible memory addresses. Defaults to true.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_attach",
+        "description": "Attach native ptrace debugger to an existing running process by PID. Returns session ID.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable (for symbol resolution).",
+            },
+            "pid": {
+                "type": "integer",
+                "description": "Process ID to attach to.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file", "pid"],
+    },
+    {
+        "name": "rvs_debug_continue",
+        "description": "Continue debugged process execution until breakpoint hit, signal, or process exit. Returns halt event with register state.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Debug session ID (uses most recent if omitted).",
+            },
+            "until": {
+                "type": "string",
+                "description": "Continue until reaching this address or symbol (e.g. '0x1146', 'main+42').",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_step",
+        "description": "Single-step or step-over instructions in the debugged process. Returns register diff after stepping.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Debug session ID (uses most recent if omitted).",
+            },
+            "step_type": {
+                "type": "string",
+                "enum": ["instruction", "over", "out", "line"],
+                "description": "Step type: 'instruction' (single step), 'over' (step over calls), 'out' (run to return), 'line' (step source line). Defaults to 'instruction'.",
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of steps to execute. Defaults to 1.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_breakpoint",
+        "description": "Manage software and hardware breakpoints: add, remove, list, or clear breakpoints in the debug session.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Debug session ID (uses most recent if omitted).",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["add", "remove", "list", "clear"],
+                "description": "Breakpoint action. Defaults to 'list'.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Target address or symbol for add/remove (e.g. '0x1146', 'main', 'entry0+4').",
+            },
+            "hw": {
+                "type": "boolean",
+                "description": "Use hardware breakpoint (DR0-DR3) instead of software INT3.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_registers",
+        "description": "Inspect or modify CPU registers in the debug session. Supports register diffs to track changes across halts.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Debug session ID (uses most recent if omitted).",
+            },
+            "reg_set": {
+                "type": "array",
+                "description": "Modify registers (format: 'reg=val', e.g. ['rax=0x1337', 'rdi=0']).",
+                "items": {"type": "string"},
+            },
+            "diff": {
+                "type": "boolean",
+                "description": "Return only registers that changed since previous halt.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_memory",
+        "description": "Inspect virtual memory maps, read or write live process memory in the debug session.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Debug session ID (uses most recent if omitted).",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["maps", "read", "write"],
+                "description": "Memory action: 'maps' (list memory regions), 'read' (read bytes), 'write' (write bytes). Defaults to 'read'.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Target memory address or symbol.",
+            },
+            "len": {
+                "type": "integer",
+                "description": "Number of bytes to read. Defaults to 32.",
+            },
+            "data": {
+                "type": "string",
+                "description": "Hexadecimal byte string to write (for 'write' action, e.g. '90909090').",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_kill",
+        "description": "Terminate a debug session and kill or detach from the debugged process.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Debug session ID to terminate.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_debug_sessions",
+        "description": "List all active native debug sessions with their PIDs, states, and session IDs.",
+        "properties": {
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": [],
+    },
+    # =========================================================================
+    # r2frida Dynamic Instrumentation Tools (rvs frida ...)
+    # =========================================================================
+    {
+        "name": "rvs_frida_env_check",
+        "description": "Check r2frida plugin installation status and runtime capabilities.",
+        "properties": {
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": [],
+    },
+    {
+        "name": "rvs_frida_attach",
+        "description": "Attach r2frida to a running process by PID, process name, or full Frida URI for live dynamic instrumentation.",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID (e.g. '1234'), process name (e.g. 'firefox'), or frida URI.",
+            },
+            "device": {
+                "type": "string",
+                "description": "Device type: 'local', 'usb', or remote 'IP:port'. Defaults to 'local'.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds for attach operation.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target"],
+    },
+    {
+        "name": "rvs_frida_spawn",
+        "description": "Spawn a new target executable under r2frida dynamic instrumentation with optional arguments.",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the executable to spawn under Frida.",
+            },
+            "args": {
+                "type": "array",
+                "description": "Command line arguments for the spawned process.",
+                "items": {"type": "string"},
+            },
+            "device": {
+                "type": "string",
+                "description": "Device type: 'local', 'usb', or remote. Defaults to 'local'.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds for spawn operation.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["path"],
+    },
+    {
+        "name": "rvs_frida_modules",
+        "description": "List loaded modules and shared libraries in target process memory space via r2frida (:il).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "filter": {
+                "type": "string",
+                "description": "Filter module names by substring.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of modules to return. Defaults to 30.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Starting index offset for pagination. Defaults to 0.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target"],
+    },
+    {
+        "name": "rvs_frida_symbols",
+        "description": "Enumerate symbols, exports, and functions in target process or specific module via r2frida (:is).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "module": {
+                "type": "string",
+                "description": "Specific module to inspect (e.g. 'libc.so.6').",
+            },
+            "filter": {
+                "type": "string",
+                "description": "Filter symbol names by substring.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of symbols to return. Defaults to 50.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Starting index offset for pagination. Defaults to 0.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target"],
+    },
+    {
+        "name": "rvs_frida_classes",
+        "description": "Enumerate Objective-C, Swift, or Java classes in target process via r2frida (:ic).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "filter": {
+                "type": "string",
+                "description": "Filter class names by substring.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of classes to return. Defaults to 50.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Starting index offset for pagination. Defaults to 0.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target"],
+    },
+    {
+        "name": "rvs_frida_hook",
+        "description": "Register a dynamic function hook to trace arguments and inspect execution at a target address via r2frida (:dtf).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Target function address or symbol name to hook.",
+            },
+            "format": {
+                "type": "string",
+                "description": "Argument format specifier (e.g. 'i' int, 'x' hex, 'z' string, 'h' hexdump).",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "addr"],
+    },
+    {
+        "name": "rvs_frida_trace_regs",
+        "description": "Trace CPU register values at function entry/exit via r2frida (:dtr).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Target function address or symbol name.",
+            },
+            "regs": {
+                "type": "string",
+                "description": "Comma-separated register names to trace (e.g. 'rax,rdi,rsi').",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "addr", "regs"],
+    },
+    {
+        "name": "rvs_frida_hook_return",
+        "description": "Install return value replacement hook on target function to override its return value dynamically.",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Target function address or symbol name.",
+            },
+            "retval": {
+                "type": "string",
+                "description": "Replacement return value in hex or decimal (e.g. '0x1', '0').",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "addr", "retval"],
+    },
+    {
+        "name": "rvs_frida_hooks_list",
+        "description": "List all currently active hooks registered in the target process via r2frida (:dtj).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target"],
+    },
+    {
+        "name": "rvs_frida_hook_remove",
+        "description": "Remove a registered dynamic hook by its ID from the target process (:dt-).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "id": {
+                "type": "string",
+                "description": "Hook identifier to remove.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "id"],
+    },
+    {
+        "name": "rvs_frida_script",
+        "description": "Inject and evaluate custom JavaScript snippet or load external script file via r2frida (:eval / :.).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "code": {
+                "type": "string",
+                "description": "JavaScript code snippet to evaluate inline (mutually exclusive with script_file).",
+            },
+            "script_file": {
+                "type": "string",
+                "description": "Path to external JavaScript file to load (mutually exclusive with code).",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Execution timeout in seconds for script evaluation.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target"],
+    },
+    {
+        "name": "rvs_frida_rpc",
+        "description": "Invoke an exported Frida RPC method (rpc.exports.<method>) on the target process.",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "method": {
+                "type": "string",
+                "description": "Exported RPC method name to invoke.",
+            },
+            "args": {
+                "type": "string",
+                "description": "Arguments as JSON array string or comma-separated values.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Execution timeout in seconds.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "method"],
+    },
+    {
+        "name": "rvs_frida_mem_read",
+        "description": "Read raw memory bytes from live target process memory space via r2frida (:x).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Virtual memory address (hex string or symbol).",
+            },
+            "len": {
+                "type": "integer",
+                "description": "Number of bytes to read. Defaults to 32.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "addr"],
+    },
+    {
+        "name": "rvs_frida_mem_write",
+        "description": "Write and patch raw memory bytes directly in live target process memory space via r2frida (:w).",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Target PID, process name, or frida URI.",
+            },
+            "addr": {
+                "type": "string",
+                "description": "Virtual memory address (hex string or symbol).",
+            },
+            "data": {
+                "type": "string",
+                "description": "Hexadecimal byte string to write (e.g. '9090' or '31c0c3').",
+            },
+            "protect": {
+                "type": "boolean",
+                "description": "Ensure memory page is writable before writing. Defaults to true.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["target", "addr", "data"],
+    },
+    # =========================================================================
+    # High-Level Composite Reverse Engineering Workflows (F16)
+    # =========================================================================
+    {
+        "name": "rvs_triage_crash",
+        "description": "Automated dynamic crash triaging and root-cause classification (SIGSEGV, NULL deref, etc.).",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "args": {
+                "type": "array",
+                "description": "Optional command line arguments to trigger crash.",
+                "items": {"type": "string"},
+            },
+            "timeout": {
+                "type": "number",
+                "description": "Execution timeout in seconds. Defaults to 5.0.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_bypass_decision_gate",
+        "description": "Control-flow analysis and dynamic bypass workflow for authentication/decision gates.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "gate_addr": {
+                "type": "string",
+                "description": "Gate function name or memory address to bypass.",
+            },
+            "timeout": {
+                "type": "number",
+                "description": "Execution timeout in seconds. Defaults to 10.0.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file", "gate_addr"],
+    },
+    {
+        "name": "rvs_dump_decrypted_buffer",
+        "description": "Dynamic decryptor buffer dump workflow: breaks after decryption loop and extracts memory plaintext.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "function": {
+                "type": "string",
+                "description": "Optional decryption function name.",
+            },
+            "buffer_addr": {
+                "type": "string",
+                "description": "Optional virtual memory address of the decrypted buffer.",
+            },
+            "buffer_len": {
+                "type": "integer",
+                "description": "Number of bytes to dump. Defaults to 64.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_detect_anti_debug",
+        "description": "Static and dynamic anti-debugging detection workflow with tailored Frida bypass generation.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target binary executable.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
 ]
+
+NO_FILE_REQUIRED_TOOLS: Set[str] = {
+    "rvs_frida_env_check",
+    "frida_env_check",
+    "rvs_debug_sessions",
+    "debug_sessions",
+    "rvs_frida_attach",
+    "frida_attach",
+    "rvs_frida_spawn",
+    "frida_spawn",
+    "rvs_frida_modules",
+    "frida_modules",
+    "rvs_frida_symbols",
+    "frida_symbols",
+    "rvs_frida_classes",
+    "frida_classes",
+    "rvs_frida_hook",
+    "frida_hook",
+    "rvs_frida_trace_regs",
+    "frida_trace_regs",
+    "rvs_frida_hook_return",
+    "frida_hook_return",
+    "rvs_frida_hooks_list",
+    "frida_hooks_list",
+    "rvs_frida_hook_remove",
+    "frida_hook_remove",
+    "rvs_frida_script",
+    "frida_script",
+    "rvs_frida_rpc",
+    "frida_rpc",
+    "rvs_frida_mem_read",
+    "frida_mem_read",
+    "rvs_frida_mem_write",
+    "frida_mem_write",
+    "rvs_triage_crash",
+    "triage_crash",
+    "rvs_agent_triage_crash",
+    "rvs_bypass_decision_gate",
+    "bypass_decision_gate",
+    "rvs_agent_bypass_decision_gate",
+    "rvs_dump_decrypted_buffer",
+    "dump_decrypted_buffer",
+    "rvs_agent_dump_decrypted_buffer",
+    "rvs_detect_anti_debug",
+    "detect_anti_debug",
+    "rvs_agent_detect_anti_debug",
+}
 
 
 def _convert_schema_to_gemini(prop_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -1687,6 +2633,27 @@ def coerce_int_param(
     return parsed
 
 
+def coerce_float_param(
+    val: Any,
+    default: Optional[float],
+    param_name: str,
+    allow_negative: bool = False,
+    min_val: Optional[float] = None,
+) -> Optional[float]:
+    """Validate and coerce floating point parameters."""
+    if val is None:
+        return default
+    try:
+        parsed = float(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid float value for parameter '{param_name}': {val!r}")
+    if not allow_negative and parsed < 0:
+        raise ValueError(f"Parameter '{param_name}' cannot be negative: {parsed}")
+    if min_val is not None and parsed < min_val:
+        raise ValueError(f"Parameter '{param_name}' must be >= {min_val}: {parsed}")
+    return parsed
+
+
 def coerce_reg_set_param(val: Any) -> Optional[List[str]]:
     """Coerce reg_set parameter: if string (e.g. 'rax=1'), wrap in list ['rax=1']."""
     if val is None:
@@ -1722,6 +2689,13 @@ class RvsHarness:
         self.default_timeout = default_timeout
         self.default_mode = default_mode
         self._session_cache: Dict[str, Dict[str, Any]] = {}
+        self._most_recent_session_id: Optional[str] = None
+        self._active_debug_sessions: set[str] = set()
+
+    def _resolve_debug_session(self, session: Optional[str]) -> Optional[str]:
+        if session:
+            return str(session)
+        return self._most_recent_session_id
 
     @staticmethod
     def _normalize_target(target: Optional[Union[str, Path]]) -> str:
@@ -1760,6 +2734,11 @@ class RvsHarness:
         cmd_args = list(args)
         if target_file and "-f" not in cmd_args and "--file" not in cmd_args:
             cmd_args = ["-f", str(target_file)] + cmd_args
+
+        # Forward -c when compact mode is active
+        eff_mode = mode if mode is not None else self.default_mode
+        if eff_mode in ("compact", "summary") and "-c" not in cmd_args and "--compact" not in cmd_args:
+            cmd_args = ["-c"] + cmd_args
 
         # Extract target file from args if not provided
         target_str = str(target_file) if target_file else ""
@@ -1962,7 +2941,8 @@ class RvsHarness:
         self,
         target: Union[str, Path],
         filter: Optional[str] = None,
-        limit: Optional[int] = None,
+        limit: Optional[int] = 50,
+        offset: int = 0,
         compact: bool = True,
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
@@ -1971,7 +2951,7 @@ class RvsHarness:
         if filter:
             args.extend(["--filter", filter])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(args, timeout=timeout, mode=mode, limit=limit)
+        return self.run(args, timeout=timeout, mode=mode, limit=limit, offset=offset)
 
     # -------------------------------------------------------------------------
     # Binary Patching Methods
@@ -2215,6 +3195,514 @@ class RvsHarness:
         mode: OutputMode = "compact" if compact else "full"
         return self.run(args, timeout=timeout, mode=mode)
 
+    # -------------------------------------------------------------------------
+    # Native Dynamic Debugging (rvs dynamic debug ...)
+    # -------------------------------------------------------------------------
+
+    def debug_spawn(
+        self,
+        target: Union[str, Path],
+        args: Optional[List[str]] = None,
+        stdin: Optional[str] = None,
+        no_aslr: bool = True,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Spawn target under native ptrace debugger. Returns session ID."""
+        cmd = ["-f", str(target), "dynamic", "debug", "spawn"]
+        if args:
+            cmd.extend(["--args"] + [str(a) for a in args])
+        if stdin:
+            cmd.extend(["--stdin", str(stdin)])
+        if not no_aslr:
+            cmd.extend(["--no-aslr", "false"])
+        mode: OutputMode = "compact" if compact else "full"
+        resp = self.run(cmd, timeout=timeout, mode=mode)
+        if resp.get("success") and isinstance(resp.get("data"), dict):
+            sid = resp["data"].get("session_id") or resp["data"].get("session")
+            if sid:
+                self._most_recent_session_id = str(sid)
+                self._active_debug_sessions.add(str(sid))
+        return resp
+
+    def debug_attach(
+        self,
+        target: Union[str, Path],
+        pid: int,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Attach native ptrace debugger to a running process by PID."""
+        cmd = ["-f", str(target), "dynamic", "debug", "attach", str(pid)]
+        mode: OutputMode = "compact" if compact else "full"
+        resp = self.run(cmd, timeout=timeout, mode=mode)
+        if resp.get("success") and isinstance(resp.get("data"), dict):
+            sid = resp["data"].get("session_id") or resp["data"].get("session")
+            if sid:
+                self._most_recent_session_id = str(sid)
+                self._active_debug_sessions.add(str(sid))
+        return resp
+
+    def debug_continue(
+        self,
+        target: Union[str, Path],
+        session: Optional[str] = None,
+        until: Optional[str] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Continue debugged process execution until breakpoint, signal, or exit."""
+        cmd = ["-f", str(target), "dynamic", "debug", "continue"]
+        resolved_session = self._resolve_debug_session(session)
+        if resolved_session:
+            cmd.extend(["--session", str(resolved_session)])
+        if until:
+            cmd.extend(["--until", str(until)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def debug_step(
+        self,
+        target: Union[str, Path],
+        session: Optional[str] = None,
+        step_type: str = "instruction",
+        count: int = 1,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Single-step or step-over instructions in the debugged process."""
+        cmd = ["-f", str(target), "dynamic", "debug", "step"]
+        resolved_session = self._resolve_debug_session(session)
+        if resolved_session:
+            cmd.extend(["--session", str(resolved_session)])
+        cmd.extend(["--type", str(step_type), "--count", str(count)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def debug_breakpoint(
+        self,
+        target: Union[str, Path],
+        session: Optional[str] = None,
+        action: str = "list",
+        addr: Optional[str] = None,
+        hw: bool = False,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Manage software and hardware breakpoints in the debug session."""
+        cmd = ["-f", str(target), "dynamic", "debug", "breakpoint"]
+        resolved_session = self._resolve_debug_session(session)
+        if resolved_session:
+            cmd.extend(["--session", str(resolved_session)])
+        cmd.extend(["--action", str(action)])
+        if addr:
+            cmd.append(str(addr))
+        if hw:
+            cmd.append("--hw")
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def debug_registers(
+        self,
+        target: Union[str, Path],
+        session: Optional[str] = None,
+        reg_set: Optional[Union[str, List[str]]] = None,
+        diff: bool = False,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Inspect or modify CPU registers in the debug session."""
+        cmd = ["-f", str(target), "dynamic", "debug", "registers"]
+        resolved_session = self._resolve_debug_session(session)
+        if resolved_session:
+            cmd.extend(["--session", str(resolved_session)])
+        if reg_set:
+            regs = [reg_set] if isinstance(reg_set, str) else reg_set
+            for r in regs:
+                cmd.extend(["--set", str(r)])
+        if diff:
+            cmd.append("--diff")
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def debug_memory(
+        self,
+        target: Union[str, Path],
+        session: Optional[str] = None,
+        action: str = "read",
+        addr: Optional[str] = None,
+        length: int = 32,
+        data: Optional[str] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Inspect virtual memory maps, read or write live process memory."""
+        cmd = ["-f", str(target), "dynamic", "debug", "memory"]
+        resolved_session = self._resolve_debug_session(session)
+        if resolved_session:
+            cmd.extend(["--session", str(resolved_session)])
+        cmd.extend(["--action", str(action)])
+        if addr:
+            cmd.extend(["--addr", str(addr)])
+        cmd.extend(["--len", str(length)])
+        if data:
+            cmd.extend(["--data", str(data)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def debug_kill(
+        self,
+        target: Union[str, Path],
+        session: Optional[str] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Terminate a debug session and kill or detach from the process."""
+        cmd = ["-f", str(target), "dynamic", "debug", "kill"]
+        resolved_session = self._resolve_debug_session(session)
+        if resolved_session:
+            cmd.extend(["--session", str(resolved_session)])
+        mode: OutputMode = "compact" if compact else "full"
+        resp = self.run(cmd, timeout=timeout, mode=mode)
+        if resp.get("success"):
+            sid = resolved_session
+            if sid:
+                self._active_debug_sessions.discard(sid)
+                if self._most_recent_session_id == sid:
+                    self._most_recent_session_id = next(iter(self._active_debug_sessions), None)
+        return resp
+
+    def debug_sessions(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """List all active native debug sessions."""
+        cmd = ["dynamic", "debug", "list-sessions"]
+        if target:
+            cmd = ["-f", str(target)] + cmd
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    # -------------------------------------------------------------------------
+    # r2frida Dynamic Instrumentation (rvs frida ...)
+    # -------------------------------------------------------------------------
+
+    def frida_env_check(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Check r2frida plugin installation status and capabilities."""
+        cmd = ["frida", "env-check"]
+        if target:
+            cmd = ["-f", str(target)] + cmd
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_attach(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        device: str = "local",
+        frida_timeout: Optional[int] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Attach r2frida to a running process by PID, name, or URI."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "attach", str(f_tgt)])
+        if device != "local":
+            cmd.extend(["--device", str(device)])
+        if frida_timeout is not None:
+            cmd.extend(["--timeout", str(frida_timeout)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_spawn(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        path: Optional[Union[str, Path]] = None,
+        args: Optional[List[str]] = None,
+        device: str = "local",
+        frida_timeout: Optional[int] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Spawn a new executable under r2frida dynamic instrumentation."""
+        spawn_path = path or target or ""
+        cmd = []
+        if target and path and str(target) != str(path):
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "spawn", str(spawn_path)])
+        if args:
+            cmd.extend(["--args"] + [str(a) for a in args])
+        if device != "local":
+            cmd.extend(["--device", str(device)])
+        if frida_timeout is not None:
+            cmd.extend(["--timeout", str(frida_timeout)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_modules(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        filter: Optional[str] = None,
+        limit: Optional[int] = 30,
+        offset: Optional[int] = 0,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """List loaded modules and shared libraries in target process (:il)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "modules", "--target", str(f_tgt)])
+        if filter:
+            cmd.extend(["--filter", str(filter)])
+        if limit is not None:
+            cmd.extend(["--limit", str(limit)])
+        if offset:
+            cmd.extend(["--offset", str(offset)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode, limit=limit, offset=offset or 0)
+
+    def frida_symbols(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        module: Optional[str] = None,
+        filter: Optional[str] = None,
+        limit: Optional[int] = 50,
+        offset: Optional[int] = 0,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Enumerate symbols, exports, and functions via r2frida (:is)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "symbols", "--target", str(f_tgt)])
+        if module:
+            cmd.extend(["--module", str(module)])
+        if filter:
+            cmd.extend(["--filter", str(filter)])
+        if limit is not None:
+            cmd.extend(["--limit", str(limit)])
+        if offset:
+            cmd.extend(["--offset", str(offset)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode, limit=limit, offset=offset or 0)
+
+    def frida_classes(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        filter: Optional[str] = None,
+        limit: Optional[int] = 50,
+        offset: Optional[int] = 0,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Enumerate ObjC/Swift/Java classes in target process (:ic)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "classes", "--target", str(f_tgt)])
+        if filter:
+            cmd.extend(["--filter", str(filter)])
+        if limit is not None:
+            cmd.extend(["--limit", str(limit)])
+        if offset:
+            cmd.extend(["--offset", str(offset)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode, limit=limit, offset=offset or 0)
+
+    def frida_hook(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        addr: str = "",
+        format: Optional[str] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Register a dynamic function hook to trace arguments (:dtf)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "hook", "--target", str(f_tgt), "--addr", str(addr)])
+        if format:
+            cmd.extend(["--format", str(format)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_trace_regs(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        addr: str = "",
+        regs: str = "",
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Trace CPU register values at function entry/exit (:dtr)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "trace-regs", "--target", str(f_tgt), "--addr", str(addr), "--regs", str(regs)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_hook_return(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        addr: str = "",
+        retval: str = "",
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Install return value replacement hook on target function."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "hook-return", "--target", str(f_tgt), "--addr", str(addr), "--retval", str(retval)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_hooks_list(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """List all active hooks in the target process (:dtj)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "hooks-list", "--target", str(f_tgt)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_hook_remove(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        hook_id: str = "",
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Remove a registered dynamic hook by ID (:dt-)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "hook-remove", "--target", str(f_tgt), "--id", str(hook_id)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_script(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        code: Optional[str] = None,
+        script_file: Optional[Union[str, Path]] = None,
+        frida_timeout: Optional[int] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Inject and evaluate custom JS snippet or load external script file."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "script", "--target", str(f_tgt)])
+        if code:
+            cmd.extend(["--code", str(code)])
+        elif script_file:
+            cmd.extend(["--file", str(script_file)])
+        if frida_timeout is not None:
+            cmd.extend(["--timeout", str(frida_timeout)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_rpc(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        method: str = "",
+        rpc_args: Optional[str] = None,
+        frida_timeout: Optional[int] = None,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Invoke an exported Frida RPC method on the target process."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "rpc", "--target", str(f_tgt), "--method", str(method)])
+        if rpc_args:
+            cmd.extend(["--args", str(rpc_args)])
+        if frida_timeout is not None:
+            cmd.extend(["--timeout", str(frida_timeout)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_mem_read(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        addr: str = "",
+        length: int = 32,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Read raw memory bytes from live target process (:x)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "mem-read", "--target", str(f_tgt), "--addr", str(addr), "--len", str(length)])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
+    def frida_mem_write(
+        self,
+        target: Optional[Union[str, Path]] = None,
+        frida_target: Optional[str] = None,
+        addr: str = "",
+        data: str = "",
+        protect: bool = True,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+    ) -> ApiResponseDict:
+        """Write and patch memory bytes in live target process (:w)."""
+        f_tgt = frida_target or (str(target) if target else "")
+        cmd = []
+        if target and frida_target:
+            cmd = ["-f", str(target)]
+        cmd.extend(["frida", "mem-write", "--target", str(f_tgt), "--addr", str(addr), "--data", str(data)])
+        if not protect:
+            cmd.extend(["--protect", "false"])
+        mode: OutputMode = "compact" if compact else "full"
+        return self.run(cmd, timeout=timeout, mode=mode)
+
     def agent_emulate(
         self,
         target: Union[str, Path],
@@ -2240,6 +3728,792 @@ class RvsHarness:
         mode: OutputMode = "compact" if compact else "full"
         return self.run(args, timeout=timeout, mode=mode)
 
+    # =========================================================================
+    # High-Level Composite Reverse Engineering Workflows (F16)
+    # =========================================================================
+
+    def triage_crash(
+        self,
+        target: Union[str, Path],
+        args: Optional[List[str]] = None,
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """
+        Automated dynamic crash triaging and root-cause classification.
+
+        Spawns the target process under native ptrace debugger, continues execution,
+        captures termination signals, and classifies root cause (NULL_POINTER_DEREFERENCE,
+        STACK_SMASH, DIV_BY_ZERO, TIMEOUT_EXPIRED, NO_CRASH_DETECTED).
+        """
+        target_p = Path(target)
+        if not target_p.exists() or not target_p.is_file():
+            return {
+                "success": False,
+                "command": "triage_crash",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "FILE_NOT_FOUND",
+                    "message": f"Target binary '{target}' not found or is not a file",
+                    "category": "FILE_ERROR",
+                    "exit_code": EXIT_FILE_ERROR,
+                },
+                "cause": "FILE_NOT_FOUND",
+            }
+
+        # Check basic ELF header / executable integrity
+        try:
+            with open(target_p, "rb") as f:
+                magic = f.read(4)
+                if magic != b"\x7fELF" and not magic.startswith(b"#!"):
+                    return {
+                        "success": False,
+                        "command": "triage_crash",
+                        "target": str(target),
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "data": None,
+                        "warnings": [],
+                        "error": {
+                            "code": "ANALYSIS_ERROR",
+                            "message": f"Target file '{target}' is not a valid ELF executable",
+                            "category": "ANALYSIS_ERROR",
+                            "exit_code": EXIT_ANALYSIS_ERROR,
+                        },
+                        "cause": "INVALID_BINARY_FORMAT",
+                    }
+            try:
+                st = target_p.stat()
+                if not (st.st_mode & 0o111):
+                    target_p.chmod(st.st_mode | 0o755)
+            except Exception:
+                pass
+        except Exception as e:
+            return {
+                "success": False,
+                "command": "triage_crash",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "FILE_ERROR",
+                    "message": str(e),
+                    "category": "FILE_ERROR",
+                    "exit_code": EXIT_FILE_ERROR,
+                },
+                "cause": "FILE_ACCESS_ERROR",
+            }
+
+        sess_id: Optional[str] = None
+        try:
+            spawn_res = self.debug_spawn(target, args=args, no_aslr=True, timeout=timeout)
+            if not spawn_res.get("success"):
+                err = spawn_res.get("error", {})
+                return {
+                    "success": False,
+                    "command": "triage_crash",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "data": None,
+                    "warnings": [],
+                    "error": err,
+                    "cause": "SPAWN_FAILED",
+                }
+
+            sess_id = spawn_res.get("data", {}).get("session_id") or spawn_res.get("data", {}).get("session")
+            if not sess_id:
+                return {
+                    "success": False,
+                    "command": "triage_crash",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "data": None,
+                    "warnings": [],
+                    "error": {"code": "INTERNAL_ERROR", "message": "Failed to acquire debug session ID"},
+                    "cause": "SPAWN_FAILED",
+                }
+
+            cont_res = self.debug_continue(target, session=sess_id, timeout=timeout)
+            if cont_res.get("error", {}).get("code") == "TIMEOUT_EXPIRED" or cont_res.get("exit_code") == EXIT_TIMEOUT_ERROR or (not cont_res.get("success") and "timed out" in str(cont_res.get("error", {}).get("message", "")).lower()):
+                return {
+                    "success": False,
+                    "command": "triage_crash",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "crashed": False,
+                    "cause": "TIMEOUT_EXPIRED",
+                    "timeout": timeout,
+                    "data": {
+                        "crashed": False,
+                        "cause": "TIMEOUT_EXPIRED",
+                        "timeout": timeout,
+                    },
+                    "warnings": [],
+                    "error": {
+                        "code": "TIMEOUT_EXPIRED",
+                        "message": f"Execution timed out after {timeout} seconds",
+                        "exit_code": EXIT_TIMEOUT_ERROR,
+                    },
+                }
+
+            cont_data = cont_res.get("data", {})
+            status = cont_data.get("status")
+            stop_reason = cont_data.get("stop_reason") or cont_data.get("reason")
+
+            if status == "exited" or stop_reason in ("exit", "exited"):
+                exit_code = cont_data.get("code") if "code" in cont_data else cont_data.get("exit_code", 0)
+                cause = "NO_CRASH_DETECTED" if exit_code == 0 else f"PROCESS_EXITED_{exit_code}"
+                return {
+                    "success": True,
+                    "command": "triage_crash",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "crashed": False,
+                    "cause": cause,
+                    "exit_code": exit_code,
+                    "data": {
+                        "crashed": False,
+                        "cause": cause,
+                        "exit_code": exit_code,
+                    },
+                    "warnings": [],
+                    "error": None,
+                }
+
+            if status == "signaled" or stop_reason in ("signal", "signaled"):
+                sig_raw = cont_data.get("sig") or cont_data.get("signal") or cont_data.get("signum")
+                sig_info = cont_data.get("signal", {}) if isinstance(cont_data.get("signal"), dict) else {}
+                signum = 0
+                if isinstance(sig_raw, int):
+                    signum = sig_raw
+                elif isinstance(sig_raw, str):
+                    sig_map = {
+                        "SIGSEGV": 11,
+                        "SIGFPE": 8,
+                        "SIGABRT": 6,
+                        "SIGBUS": 7,
+                        "SIGILL": 4,
+                        "SIGTRAP": 5,
+                    }
+                    signum = sig_map.get(sig_raw.upper(), 0)
+                if not signum and isinstance(sig_info, dict):
+                    signum = sig_info.get("signum", 0)
+                if not signum:
+                    signum = 11
+
+                fault_addr = sig_info.get("fault_addr") or cont_data.get("fault_addr", "0x0")
+                rip_hex = cont_data.get("rip_hex") or cont_data.get("rip", "")
+                instruction = cont_data.get("instruction") or cont_data.get("insn", "")
+                reg_diff = cont_data.get("register_diff") or cont_data.get("diff", [])
+
+                cause = "UNKNOWN_SIGNAL"
+                if signum == 11:  # SIGSEGV
+                    try:
+                        addr_int = int(fault_addr, 16) if isinstance(fault_addr, str) and fault_addr.startswith("0x") else int(fault_addr)
+                    except ValueError:
+                        addr_int = 0
+                    if addr_int == 0 or addr_int < 0x1000:
+                        cause = "NULL_POINTER_DEREFERENCE"
+                    else:
+                        cause = "INVALID_MEMORY_DEREFERENCE"
+                elif signum == 8:  # SIGFPE
+                    cause = "DIV_BY_ZERO"
+                elif signum == 6:  # SIGABRT
+                    cause = "ABORT_SIGNAL"
+                elif signum == 7:  # SIGBUS
+                    cause = "BUS_ERROR"
+                elif signum == 4:  # SIGILL
+                    cause = "ILLEGAL_INSTRUCTION"
+                else:
+                    cause = f"SIGNAL_{signum}"
+
+                return {
+                    "success": True,
+                    "command": "triage_crash",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "crashed": True,
+                    "signal": signum,
+                    "cause": cause,
+                    "fault_addr": fault_addr,
+                    "rip": rip_hex,
+                    "instruction": instruction,
+                    "register_diff": reg_diff,
+                    "data": {
+                        "crashed": True,
+                        "signal": signum,
+                        "cause": cause,
+                        "fault_event": cause,
+                        "fault_addr": fault_addr,
+                        "rip": rip_hex,
+                        "instruction": instruction,
+                        "register_diff": reg_diff,
+                    },
+                    "warnings": [],
+                    "error": None,
+                }
+
+            return {
+                "success": True,
+                "command": "triage_crash",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "crashed": False,
+                "cause": "NO_CRASH_DETECTED",
+                "status": status,
+                "data": {
+                    "crashed": False,
+                    "cause": "NO_CRASH_DETECTED",
+                    "status": status,
+                },
+                "warnings": [],
+                "error": None,
+            }
+
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "command": "triage_crash",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "crashed": False,
+                "cause": "TIMEOUT_EXPIRED",
+                "timeout": timeout,
+                "data": {
+                    "crashed": False,
+                    "cause": "TIMEOUT_EXPIRED",
+                    "timeout": timeout,
+                },
+                "warnings": [],
+                "error": {
+                    "code": "TIMEOUT_EXPIRED",
+                    "message": f"Execution timed out after {timeout} seconds",
+                    "exit_code": EXIT_TIMEOUT_ERROR,
+                },
+            }
+        finally:
+            if sess_id:
+                try:
+                    self.debug_kill(target, session=sess_id)
+                except Exception:
+                    pass
+
+    def bypass_decision_gate(
+        self,
+        target: Union[str, Path],
+        gate_addr: Optional[str] = None,
+        function: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """
+        Decision gate detection and dynamic bypass workflow.
+
+        Analyzes control flow to identify conditional branches, evaluates the gate
+        under dynamic debugging or emulation, inverts decision flags, and generates
+        a permanent binary patch plan.
+        """
+        gate_or_fn = gate_addr or function or "main"
+        if gate_or_fn.startswith("0x") or gate_or_fn.startswith("0X"):
+            try:
+                int(gate_or_fn, 16)
+            except ValueError:
+                return {
+                    "success": False,
+                    "bypassed": False,
+                    "command": "bypass_decision_gate",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "data": None,
+                    "warnings": [],
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": f"Malformed gate address string '{gate_or_fn}'",
+                        "exit_code": EXIT_INVALID_ARGUMENT,
+                    },
+                }
+
+        fn_list_res = self.functions(target)
+        if not fn_list_res.get("success"):
+            return {
+                "success": False,
+                "bypassed": False,
+                "command": "bypass_decision_gate",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "ANALYSIS_ERROR",
+                    "message": f"Failed to analyze functions in '{target}'",
+                    "exit_code": EXIT_ANALYSIS_ERROR,
+                },
+            }
+
+        fns = fn_list_res.get("data", {}).get("functions", [])
+        try:
+            fns = sorted(
+                fns,
+                key=lambda f: int(f.get("addr", "0"), 16) if str(f.get("addr", "")).startswith("0x") else int(f.get("addr", 0))
+            )
+        except Exception:
+            pass
+        resolved_fn: Optional[str] = None
+
+        for f in fns:
+            fname = f.get("name", "")
+            if fname == gate_or_fn or fname == f"sym.{gate_or_fn}":
+                resolved_fn = fname
+                break
+
+        if not resolved_fn and not gate_or_fn.startswith("0x"):
+            for f in fns:
+                fname = f.get("name", "")
+                if gate_or_fn.lower() in fname.lower():
+                    resolved_fn = fname
+                    break
+            if not resolved_fn and ("auth" in gate_or_fn.lower() or "check" in gate_or_fn.lower()):
+                for f in fns:
+                    fname = f.get("name", "")
+                    if fname.startswith("sym.check_") or fname.startswith("check_"):
+                        resolved_fn = fname
+                        break
+
+        if not resolved_fn and not gate_or_fn.startswith("0x"):
+            return {
+                "success": False,
+                "bypassed": False,
+                "command": "bypass_decision_gate",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "SYMBOL_NOT_FOUND",
+                    "message": f"Gate address or function '{gate_or_fn}' not found in binary",
+                    "exit_code": EXIT_ANALYSIS_ERROR,
+                },
+            }
+
+        query_target = resolved_fn if resolved_fn else gate_or_fn
+        flow_res = self.flow(target, query_target)
+        if not flow_res.get("success"):
+            return {
+                "success": False,
+                "bypassed": False,
+                "command": "bypass_decision_gate",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "ANALYSIS_ERROR",
+                    "message": f"Control flow analysis failed on '{query_target}'",
+                    "exit_code": EXIT_ANALYSIS_ERROR,
+                },
+            }
+
+        flow_data = flow_res.get("data", {})
+        decision_nodes = flow_data.get("decision_nodes", []) or flow_data.get("gates", [])
+
+        if not decision_nodes:
+            return {
+                "success": False,
+                "bypassed": False,
+                "command": "bypass_decision_gate",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "NO_DECISION_GATES",
+                    "message": f"No conditional branches or decision gates found in '{query_target}' to invert",
+                    "exit_code": EXIT_ANALYSIS_ERROR,
+                },
+            }
+
+        gate_node = decision_nodes[0]
+        raw_pc = gate_node.get("addr_hex") or gate_node.get("addr") or "0x0"
+        if isinstance(raw_pc, int):
+            gate_pc = hex(raw_pc)
+        else:
+            gate_pc = str(raw_pc)
+        branch_inst = gate_node.get("branch_instruction", "") or gate_node.get("branch", "")
+        cond_inst = gate_node.get("condition_instruction", "") or gate_node.get("condition", "")
+
+        inverted_branch = ""
+        if branch_inst.startswith("je ") or branch_inst.startswith("jz "):
+            inverted_branch = branch_inst.replace("je ", "jne ").replace("jz ", "jnz ")
+        elif branch_inst.startswith("jne ") or branch_inst.startswith("jnz "):
+            inverted_branch = branch_inst.replace("jne ", "je ").replace("jnz ", "jz ")
+        elif branch_inst.startswith("jle "):
+            inverted_branch = branch_inst.replace("jle ", "jg ")
+        elif branch_inst.startswith("jge "):
+            inverted_branch = branch_inst.replace("jge ", "jl ")
+        elif branch_inst.startswith("jl "):
+            inverted_branch = branch_inst.replace("jl ", "jge ")
+        elif branch_inst.startswith("jg "):
+            inverted_branch = branch_inst.replace("jg ", "jle ")
+        else:
+            inverted_branch = f"nop ; {branch_inst}"
+
+        sess_id = None
+        bypassed = False
+        try:
+            spawn_res = self.debug_spawn(target, no_aslr=True, timeout=timeout)
+            if spawn_res.get("success"):
+                d = spawn_res.get("data", {})
+                sess_id = d.get("session_id") or d.get("session") if isinstance(d, dict) else (spawn_res.get("session_id") or spawn_res.get("session"))
+                if sess_id:
+                    self.debug_breakpoint(target, session=sess_id, action="set", addr=gate_pc)
+                    cont_res = self.debug_continue(target, session=sess_id, timeout=timeout)
+                    cont_data = cont_res.get("data", {}) if isinstance(cont_res.get("data"), dict) else {}
+                    stop_reason = cont_data.get("stop_reason") or cont_data.get("reason")
+                    if stop_reason == "breakpoint":
+                        regs_res = self.debug_registers(target, session=sess_id, compact=False)
+                        regs_data = regs_res.get("data", {}) if isinstance(regs_res.get("data"), dict) else {}
+                        curr_rflags = regs_data.get("registers", {}).get("rflags") or regs_data.get("regs", {}).get("rflags", 0x202)
+                        if isinstance(curr_rflags, str):
+                            try:
+                                curr_rflags = int(curr_rflags, 16) if curr_rflags.startswith("0x") else int(curr_rflags)
+                            except ValueError:
+                                curr_rflags = 0x202
+                        new_rflags = curr_rflags ^ 0x40
+                        mod_res = self.debug_registers(target, session=sess_id, reg_set=[f"rflags=0x{new_rflags:x}"])
+                        step_res = self.debug_step(target, session=sess_id, count=1)
+                        if mod_res.get("success") and step_res.get("success"):
+                            bypassed = True
+        except Exception:
+            pass
+        finally:
+            if sess_id:
+                try:
+                    self.debug_kill(target, session=sess_id)
+                except Exception:
+                    pass
+
+        patch_plan = {
+            "action": "invert_branch",
+            "addr": gate_pc,
+            "original": branch_inst,
+            "replacement": inverted_branch,
+        }
+
+        return {
+            "success": True,
+            "bypassed": bypassed,
+            "command": "bypass_decision_gate",
+            "target": str(target),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "function": query_target,
+            "gate_addr": gate_pc,
+            "condition_instruction": cond_inst,
+            "branch_instruction": branch_inst,
+            "inverted_instruction": inverted_branch,
+            "decision_node": gate_node,
+            "total_decision_gates": len(decision_nodes),
+            "patch_plan": patch_plan,
+            "data": {
+                "bypassed": bypassed,
+                "function": query_target,
+                "gate_addr": gate_pc,
+                "patch_plan": patch_plan,
+                "total_decision_gates": len(decision_nodes),
+            },
+            "warnings": [],
+            "error": None,
+        }
+
+    def dump_decrypted_buffer(
+        self,
+        target: Union[str, Path],
+        function: Optional[str] = None,
+        buffer_addr: Optional[str] = None,
+        buffer_len: int = 64,
+        size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Dynamic Decryptor Buffer Dump Workflow.
+
+        Identifies cryptographic / XOR decryption loops, executes or emulates
+        past loop termination, and extracts decrypted plaintext buffer from memory.
+        """
+        if size is not None:
+            buffer_len = size
+        if buffer_addr:
+            try:
+                addr_val = int(buffer_addr, 16) if buffer_addr.startswith("0x") else int(buffer_addr)
+                if addr_val > 0x7fffffffffff or addr_val < 0x1000:
+                    return {
+                        "success": False,
+                        "command": "dump_decrypted_buffer",
+                        "target": str(target),
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "data": None,
+                        "warnings": [],
+                        "error": {
+                            "code": "INVALID_MEMORY_ADDRESS",
+                            "message": f"Buffer address '{buffer_addr}' outside user memory maps",
+                            "exit_code": EXIT_INVALID_ARGUMENT,
+                        },
+                    }
+            except ValueError:
+                return {
+                    "success": False,
+                    "command": "dump_decrypted_buffer",
+                    "target": str(target),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "data": None,
+                    "warnings": [],
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": f"Malformed buffer address string '{buffer_addr}'",
+                        "exit_code": EXIT_INVALID_ARGUMENT,
+                    },
+                }
+
+        triage = self.triage_crash(target)
+        if triage.get("crashed"):
+            return {
+                "success": False,
+                "command": "dump_decrypted_buffer",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "TARGET_CRASHED",
+                    "message": f"Target process crashed with signal {triage.get('signal')} ({triage.get('cause')}) before decryption complete",
+                    "exit_code": EXIT_ANALYSIS_ERROR,
+                },
+            }
+
+        syms_res = self.symbols(target)
+        syms = syms_res.get("data", {}).get("symbols", []) if syms_res.get("success") else []
+
+        resolved_buf_addr = buffer_addr
+        post_loop_hook = None
+
+        for s in syms:
+            sname = s.get("name", "")
+            saddr = s.get("addr") or s.get("vaddr_hex") or hex(s.get("vaddr", 0))
+            if not resolved_buf_addr and ("decrypted_buffer" in sname or "secret_buffer" in sname):
+                resolved_buf_addr = saddr
+            if "on_decryption_complete" in sname or "decrypt_done" in sname:
+                post_loop_hook = saddr
+
+        extracted_buffer = ""
+        raw_hex = ""
+        bytes_list = []
+        sess_id = None
+        try:
+            spawn_res = self.debug_spawn(target, no_aslr=True)
+            if spawn_res.get("success"):
+                d = spawn_res.get("data", {})
+                sess_id = d.get("session_id") or d.get("session") if isinstance(d, dict) else (spawn_res.get("session_id") or spawn_res.get("session"))
+                if sess_id:
+                    if post_loop_hook:
+                        self.debug_breakpoint(target, session=sess_id, action="set", addr=post_loop_hook)
+                        self.debug_continue(target, session=sess_id)
+                    else:
+                        self.debug_continue(target, session=sess_id)
+
+                    dump_target_addr = resolved_buf_addr or "g_decrypted_buffer"
+                    mem_res = self.debug_memory(
+                        target,
+                        session=sess_id,
+                        action="read",
+                        addr=dump_target_addr,
+                        length=buffer_len,
+                        compact=False,
+                    )
+                    if mem_res.get("success") and mem_res.get("data"):
+                        d = mem_res["data"]
+                        raw_hex = d.get("hex", "")
+                        bytes_list = d.get("bytes") or d.get("bytes_vec") or []
+                        if not bytes_list and raw_hex:
+                            try:
+                                bytes_list = list(bytes.fromhex(raw_hex))
+                            except Exception:
+                                pass
+                        if bytes_list:
+                            try:
+                                raw_b = bytes(bytes_list)
+                                null_idx = raw_b.find(b"\x00")
+                                if null_idx != -1:
+                                    extracted_buffer = raw_b[:null_idx].decode("latin-1", errors="replace")
+                                else:
+                                    extracted_buffer = raw_b.decode("latin-1", errors="replace")
+                            except Exception:
+                                pass
+                        if not extracted_buffer:
+                            preview = d.get("string_preview") or d.get("preview") or ""
+                            if "\x00" in preview:
+                                preview = preview.split("\x00")[0]
+                            elif "." in preview and ("FLAG{" in preview):
+                                m = re.search(r"FLAG\{[^}]+\}", preview)
+                                if m:
+                                    preview = m.group(0)
+                            extracted_buffer = preview
+        except Exception:
+            pass
+        finally:
+            if sess_id:
+                try:
+                    self.debug_kill(target, session=sess_id)
+                except Exception:
+                    pass
+
+        if not extracted_buffer and not raw_hex:
+            return {
+                "success": False,
+                "command": "dump_decrypted_buffer",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "DECRYPTION_EXTRACTION_FAILED",
+                    "message": "Failed to extract decrypted memory buffer",
+                    "exit_code": EXIT_ANALYSIS_ERROR,
+                },
+            }
+
+        return {
+            "success": True,
+            "command": "dump_decrypted_buffer",
+            "target": str(target),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "buffer": extracted_buffer,
+            "buffer_addr": resolved_buf_addr,
+            "buffer_len": buffer_len,
+            "hex": raw_hex,
+            "bytes": bytes_list,
+            "data": {
+                "buffer": extracted_buffer,
+                "buffer_addr": resolved_buf_addr,
+                "buffer_len": buffer_len,
+                "hex": raw_hex,
+                "bytes": bytes_list,
+            },
+            "warnings": [],
+            "error": None,
+        }
+
+    def detect_anti_debug(
+        self,
+        target: Union[str, Path],
+    ) -> Dict[str, Any]:
+        """
+        Anti-debugging detection and neutralization recommendation workflow.
+
+        Scans imported symbols, string literals, and control flow to identify
+        anti-analysis techniques (ptrace, TracerPid, rdtsc, signal traps) and
+        generates tailored Frida bypass hook scripts.
+        """
+        target_p = Path(target)
+        if not target_p.exists() or not target_p.is_file():
+            return {
+                "success": False,
+                "command": "detect_anti_debug",
+                "target": str(target),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data": None,
+                "warnings": [],
+                "error": {
+                    "code": "FILE_NOT_FOUND",
+                    "message": f"Target binary '{target}' not found",
+                    "exit_code": EXIT_FILE_ERROR,
+                },
+                "anti_debug_detected": False,
+                "techniques": [],
+            }
+
+        techniques: List[str] = []
+        details: Dict[str, Any] = {}
+
+        syms_res = self.symbols(target)
+        if syms_res.get("success"):
+            syms = syms_res.get("data", {}).get("symbols", [])
+            for s in syms:
+                sname = s.get("name", "")
+                if "ptrace" in sname:
+                    if "ptrace" not in techniques:
+                        techniques.append("ptrace")
+                    details["ptrace_symbol"] = sname
+
+        strs_res = self.strings(target)
+        if strs_res.get("success"):
+            strs = strs_res.get("data", {}).get("strings", [])
+            for st in strs:
+                sval = st.get("string", "")
+                if "TracerPid" in sval or "/proc/self/status" in sval:
+                    if "proc_status_tracerpid" not in techniques:
+                        techniques.append("proc_status_tracerpid")
+                    details["proc_status_string"] = sval
+                elif "isDebuggerPresent" in sval:
+                    if "is_debugger_present" not in techniques:
+                        techniques.append("is_debugger_present")
+                elif "DEBUGGER_DETECTED" in sval:
+                    details["debugger_detected_string"] = sval
+
+        bypass_hook = ""
+        if "ptrace" in techniques or "proc_status_tracerpid" in techniques:
+            bypass_hook = """// Frida script to neutralize ptrace and TracerPid anti-debugging
+Interceptor.attach(Module.findExportByName(null, "ptrace"), {
+    onEnter: function(args) {
+        // PTRACE_TRACEME = 0
+        if (args[0].toInt32() === 0) {
+            this.is_traceme = true;
+        }
+    },
+    onLeave: function(retval) {
+        if (this.is_traceme) {
+            retval.replace(ptr(0)); // Return success (0)
+        }
+    }
+});
+
+var fopenPtr = Module.findExportByName(null, "fopen");
+if (fopenPtr) {
+    Interceptor.attach(fopenPtr, {
+        onEnter: function(args) {
+            var path = args[0].readUtf8String();
+            if (path && path.indexOf("/proc/self/status") !== -1) {
+                this.is_status = true;
+            }
+        }
+    });
+}
+"""
+
+        anti_debug_detected = len(techniques) > 0
+        risk_score = 0.8 if anti_debug_detected else 0.0
+
+        return {
+            "success": True,
+            "command": "detect_anti_debug",
+            "target": str(target),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "anti_debug_detected": anti_debug_detected,
+            "techniques": techniques,
+            "details": details,
+            "risk_score": risk_score,
+            "bypass_hook": bypass_hook if anti_debug_detected else None,
+            "recommendation": "Inject generated Frida bypass hook or patch binary ptrace checks" if anti_debug_detected else "No anti-debugging mechanisms detected.",
+            "data": {
+                "anti_debug_detected": anti_debug_detected,
+                "techniques": techniques,
+                "details": details,
+                "risk_score": risk_score,
+                "bypass_hook": bypass_hook if anti_debug_detected else None,
+                "recommendation": "Inject generated Frida bypass hook or patch binary ptrace checks" if anti_debug_detected else "No anti-debugging mechanisms detected.",
+            },
+            "warnings": [],
+            "error": None,
+        }
+
     # -------------------------------------------------------------------------
     # Schema & MCP Execution
     # -------------------------------------------------------------------------
@@ -2251,9 +4525,25 @@ class RvsHarness:
         """Export tool calling schemas for specified LLM format convention."""
         return get_tool_schemas(format=format)
 
-    def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> ApiResponseDict:
-        """Dispatches an MCP or LLM tool call to the appropriate programmatic method."""
-        if not isinstance(arguments, dict):
+    def execute_tool(
+        self,
+        tool_name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> ApiResponseDict:
+        if arguments is None:
+            if tool_name in NO_FILE_REQUIRED_TOOLS:
+                arguments = {}
+            else:
+                return make_error_envelope(
+                    command_str=f"{tool_name}",
+                    target_str="",
+                    code="INVALID_ARGUMENT",
+                    message="Tool arguments must be a dictionary object",
+                    category="INVALID_ARGUMENT",
+                    exit_code=EXIT_INVALID_ARGUMENT,
+                    suggestion="Pass tool arguments as a key-value JSON object.",
+                )
+        elif not isinstance(arguments, dict):
             return make_error_envelope(
                 command_str=f"{tool_name}",
                 target_str="",
@@ -2264,8 +4554,14 @@ class RvsHarness:
                 suggestion="Pass tool arguments as a key-value JSON object.",
             )
 
-        file = arguments.get("file")
-        if not file:
+        file = arguments.get("file") or (arguments.get("target") if tool_name in (
+            "rvs_triage_crash", "triage_crash",
+            "rvs_bypass_decision_gate", "bypass_decision_gate",
+            "rvs_dump_decrypted_buffer", "dump_decrypted_buffer",
+            "rvs_detect_anti_debug", "detect_anti_debug",
+        ) else None)
+
+        if not file and tool_name not in NO_FILE_REQUIRED_TOOLS:
             return make_error_envelope(
                 command_str=f"{tool_name}",
                 target_str="",
@@ -2382,12 +4678,14 @@ class RvsHarness:
                     compact=compact,
                 )
 
-            elif tool_name == "rvs_symbols":
-                limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
+            elif tool_name in ("rvs_symbols", "symbols"):
+                limit = coerce_int_param(arguments.get("limit"), 50, "limit", allow_negative=False)
+                offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
                 return self.symbols(
                     file,
                     filter=arguments.get("filter"),
-                    limit=limit,
+                    limit=limit if limit is not None else 50,
+                    offset=offset,
                     compact=compact,
                 )
 
@@ -2554,6 +4852,479 @@ class RvsHarness:
                     reg_set=reg_set,
                     compact=compact,
                 )
+
+            # -----------------------------------------------------------------
+            # Native Dynamic Debugging Tools
+            # -----------------------------------------------------------------
+            elif tool_name == "rvs_debug_spawn":
+                spawn_args = arguments.get("args")
+                if spawn_args and isinstance(spawn_args, str):
+                    spawn_args = [spawn_args]
+                no_aslr = coerce_bool_param(arguments.get("no_aslr"), True, "no_aslr")
+                return self.debug_spawn(
+                    file,
+                    args=spawn_args,
+                    stdin=arguments.get("stdin"),
+                    no_aslr=no_aslr,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_attach":
+                pid = coerce_int_param(arguments.get("pid"), None, "pid", allow_negative=False)
+                if pid is None:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'pid'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                        suggestion="Pass pid=<process_id> to attach.",
+                    )
+                return self.debug_attach(file, pid=pid, compact=compact)
+
+            elif tool_name == "rvs_debug_continue":
+                return self.debug_continue(
+                    file,
+                    session=arguments.get("session"),
+                    until=arguments.get("until"),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_step":
+                step_type = arguments.get("step_type", "instruction")
+                count = coerce_int_param(arguments.get("count"), 1, "count", allow_negative=False)
+                if count is None:
+                    count = 1
+                return self.debug_step(
+                    file,
+                    session=arguments.get("session"),
+                    step_type=str(step_type),
+                    count=count,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_breakpoint":
+                action = arguments.get("action", "list")
+                hw = coerce_bool_param(arguments.get("hw"), False, "hw")
+                return self.debug_breakpoint(
+                    file,
+                    session=arguments.get("session"),
+                    action=str(action),
+                    addr=arguments.get("addr"),
+                    hw=hw,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_registers":
+                reg_set = coerce_reg_set_param(arguments.get("reg_set"))
+                diff = coerce_bool_param(arguments.get("diff"), False, "diff")
+                return self.debug_registers(
+                    file,
+                    session=arguments.get("session"),
+                    reg_set=reg_set,
+                    diff=diff,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_memory":
+                action = arguments.get("action", "read")
+                mem_len = coerce_int_param(arguments.get("len"), 32, "len", allow_negative=False)
+                if mem_len is None:
+                    mem_len = 32
+                return self.debug_memory(
+                    file,
+                    session=arguments.get("session"),
+                    action=str(action),
+                    addr=arguments.get("addr"),
+                    length=mem_len,
+                    data=arguments.get("data"),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_kill":
+                return self.debug_kill(
+                    file,
+                    session=arguments.get("session"),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_debug_sessions":
+                return self.debug_sessions(file, compact=compact)
+
+            # -----------------------------------------------------------------
+            # r2frida Dynamic Instrumentation Tools
+            # -----------------------------------------------------------------
+            elif tool_name == "rvs_frida_env_check":
+                return self.frida_env_check(file, compact=compact)
+
+            elif tool_name == "rvs_frida_attach":
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target' (PID, process name, or frida URI)",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                return self.frida_attach(
+                    file,
+                    frida_target=str(target),
+                    device=arguments.get("device", "local"),
+                    frida_timeout=frida_timeout,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_spawn":
+                path = arguments.get("path")
+                if not path:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'path' (executable to spawn)",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                spawn_args = arguments.get("args")
+                if spawn_args and isinstance(spawn_args, str):
+                    spawn_args = [spawn_args]
+                frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                return self.frida_spawn(
+                    file,
+                    path=str(path),
+                    args=spawn_args,
+                    device=arguments.get("device", "local"),
+                    frida_timeout=frida_timeout,
+                    compact=compact,
+                )
+
+            elif tool_name in ("rvs_frida_modules", "frida_modules"):
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file) if file else "",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                limit = coerce_int_param(arguments.get("limit"), 30, "limit", allow_negative=False) or 30
+                offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
+                return self.frida_modules(
+                    target=file,
+                    frida_target=str(target),
+                    filter=arguments.get("filter"),
+                    limit=limit,
+                    offset=offset,
+                    compact=compact,
+                )
+
+            elif tool_name in ("rvs_frida_symbols", "frida_symbols"):
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file) if file else "",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                limit = coerce_int_param(arguments.get("limit"), 50, "limit", allow_negative=False) or 50
+                offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
+                return self.frida_symbols(
+                    target=file,
+                    frida_target=str(target),
+                    module=arguments.get("module"),
+                    filter=arguments.get("filter"),
+                    limit=limit,
+                    offset=offset,
+                    compact=compact,
+                )
+
+            elif tool_name in ("rvs_frida_classes", "frida_classes"):
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file) if file else "",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                limit = coerce_int_param(arguments.get("limit"), 50, "limit", allow_negative=False) or 50
+                offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
+                return self.frida_classes(
+                    target=file,
+                    frida_target=str(target),
+                    filter=arguments.get("filter"),
+                    limit=limit,
+                    offset=offset,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_hook":
+                target = arguments.get("target")
+                addr = arguments.get("addr")
+                if not target or not addr:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target' and/or 'addr'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                return self.frida_hook(
+                    file,
+                    frida_target=str(target),
+                    addr=str(addr),
+                    format=arguments.get("format"),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_trace_regs":
+                target = arguments.get("target")
+                addr = arguments.get("addr")
+                regs = arguments.get("regs")
+                if not target or not addr or not regs:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target', 'addr', and/or 'regs'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                return self.frida_trace_regs(
+                    file,
+                    frida_target=str(target),
+                    addr=str(addr),
+                    regs=str(regs),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_hook_return":
+                target = arguments.get("target")
+                addr = arguments.get("addr")
+                retval = arguments.get("retval")
+                if not target or not addr or retval is None:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target', 'addr', and/or 'retval'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                return self.frida_hook_return(
+                    file,
+                    frida_target=str(target),
+                    addr=str(addr),
+                    retval=str(retval),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_hooks_list":
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                return self.frida_hooks_list(
+                    file,
+                    frida_target=str(target),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_hook_remove":
+                target = arguments.get("target")
+                hook_id = arguments.get("id")
+                if not target or not hook_id:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target' and/or 'id'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                return self.frida_hook_remove(
+                    file,
+                    frida_target=str(target),
+                    hook_id=str(hook_id),
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_script":
+                target = arguments.get("target")
+                if not target:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                return self.frida_script(
+                    file,
+                    frida_target=str(target),
+                    code=arguments.get("code"),
+                    script_file=arguments.get("script_file"),
+                    frida_timeout=frida_timeout,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_rpc":
+                target = arguments.get("target")
+                method = arguments.get("method")
+                if not target or not method:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target' and/or 'method'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                return self.frida_rpc(
+                    file,
+                    frida_target=str(target),
+                    method=str(method),
+                    rpc_args=arguments.get("args"),
+                    frida_timeout=frida_timeout,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_mem_read":
+                target = arguments.get("target")
+                addr = arguments.get("addr")
+                if not target or not addr:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target' and/or 'addr'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                mem_len = coerce_int_param(arguments.get("len"), 32, "len", allow_negative=False)
+                if mem_len is None:
+                    mem_len = 32
+                return self.frida_mem_read(
+                    file,
+                    frida_target=str(target),
+                    addr=str(addr),
+                    length=mem_len,
+                    compact=compact,
+                )
+
+            elif tool_name == "rvs_frida_mem_write":
+                target = arguments.get("target")
+                addr = arguments.get("addr")
+                data = arguments.get("data")
+                if not target or not addr or not data:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str=str(file),
+                        code="INVALID_ARGUMENT",
+                        message="Missing required arguments 'target', 'addr', and/or 'data'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                protect = coerce_bool_param(arguments.get("protect"), True, "protect")
+                return self.frida_mem_write(
+                    file,
+                    frida_target=str(target),
+                    addr=str(addr),
+                    data=str(data),
+                    protect=protect,
+                    compact=compact,
+                )
+
+            elif tool_name in ("rvs_triage_crash", "triage_crash", "rvs_agent_triage_crash"):
+                target_bin = arguments.get("file") or arguments.get("target") or file
+                if not target_bin:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str="",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'file' or 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                spawn_args = arguments.get("args")
+                if spawn_args and isinstance(spawn_args, str):
+                    spawn_args = [spawn_args]
+                timeout = coerce_float_param(arguments.get("timeout"), 5.0, "timeout", allow_negative=False) or 5.0
+                return self.triage_crash(target=target_bin, args=spawn_args, timeout=timeout)
+
+            elif tool_name in ("rvs_bypass_decision_gate", "bypass_decision_gate", "rvs_agent_bypass_decision_gate"):
+                target_bin = arguments.get("file") or arguments.get("target") or file
+                if not target_bin:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str="",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'file' or 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                gate_addr = arguments.get("gate_addr")
+                function = arguments.get("function")
+                timeout = coerce_float_param(arguments.get("timeout"), 10.0, "timeout", allow_negative=False) or 10.0
+                return self.bypass_decision_gate(
+                    target=target_bin,
+                    gate_addr=gate_addr,
+                    function=function,
+                    timeout=timeout,
+                )
+
+            elif tool_name in ("rvs_dump_decrypted_buffer", "dump_decrypted_buffer", "rvs_agent_dump_decrypted_buffer"):
+                target_bin = arguments.get("file") or arguments.get("target") or file
+                if not target_bin:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str="",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'file' or 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                buffer_len = coerce_int_param(arguments.get("buffer_len") or arguments.get("len") or arguments.get("size"), 64, "buffer_len", allow_negative=False) or 64
+                return self.dump_decrypted_buffer(
+                    target=target_bin,
+                    function=arguments.get("function"),
+                    buffer_addr=arguments.get("buffer_addr"),
+                    buffer_len=buffer_len,
+                )
+
+            elif tool_name in ("rvs_detect_anti_debug", "detect_anti_debug", "rvs_agent_detect_anti_debug"):
+                target_bin = arguments.get("file") or arguments.get("target") or file
+                if not target_bin:
+                    return make_error_envelope(
+                        command_str=f"{tool_name}",
+                        target_str="",
+                        code="INVALID_ARGUMENT",
+                        message="Missing required argument 'file' or 'target'",
+                        category="INVALID_ARGUMENT",
+                        exit_code=EXIT_INVALID_ARGUMENT,
+                    )
+                return self.detect_anti_debug(target=target_bin)
 
             else:
                 return make_error_envelope(

@@ -164,6 +164,29 @@ pub fn get_instruction_pointer(regs: &BTreeMap<String, u64>) -> Option<u64> {
         .copied()
 }
 
+/// Resolves the program counter register name for the current binary target (e.g. rip, eip, pc).
+pub fn resolve_pc_register(driver: &R2Driver) -> String {
+    if let Ok(out) = driver.cmd("arn pc") {
+        let trimmed = out.trim();
+        if !trimmed.is_empty() && !trimmed.contains(' ') && !trimmed.contains('\n') {
+            return trimmed.to_string();
+        }
+    }
+    let arch = driver.cmd("e asm.arch").unwrap_or_default();
+    let bits = driver.cmd("e asm.bits").unwrap_or_default();
+    let arch = arch.trim();
+    let bits = bits.trim();
+    match (arch, bits) {
+        ("x86", "64") => "rip".to_string(),
+        ("x86", "32") => "eip".to_string(),
+        ("arm", _) => "pc".to_string(),
+        ("aarch64", _) => "pc".to_string(),
+        ("mips", _) => "pc".to_string(),
+        ("riscv", _) => "pc".to_string(),
+        _ => "rip".to_string(),
+    }
+}
+
 /// Identifies return value register (RAX, EAX, R0, X0) from registers map.
 pub fn get_return_value(regs: &BTreeMap<String, u64>) -> Option<ReturnValueInfo> {
     for reg_name in &["rax", "eax", "r0", "x0"] {
@@ -375,11 +398,12 @@ pub fn analyze_trace(
         cmd.push_str(&reg_set_cmds);
     }
 
+    let pc_reg = resolve_pc_register(driver);
     for i in 0..steps {
         if i > 0 {
             cmd.push_str("aes 1; ");
         }
-        cmd.push_str("pi 1 @ `aer rip`; aerj; ");
+        cmd.push_str(&format!("pi 1 @ `aer {pc_reg}`; aerj; "));
         cmd.push_str(&format!("?e {}; ", TRACE_DELIMITER));
     }
 
@@ -469,8 +493,9 @@ pub fn analyze_step(
         cmd.push_str(&reg_set_cmds);
     }
 
+    let pc_reg = resolve_pc_register(driver);
     // Capture initial
-    cmd.push_str("pi 1 @ `aer rip`; aerj; ");
+    cmd.push_str(&format!("pi 1 @ `aer {pc_reg}`; aerj; "));
     cmd.push_str(&format!("?e {}; ", EMU_DELIMITER));
 
     // Execute step

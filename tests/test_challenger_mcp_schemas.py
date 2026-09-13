@@ -153,7 +153,7 @@ class TestMcpProtocolAndJsonRpc(TestChallengerBase):
         self.assertEqual(r3.get("jsonrpc"), "2.0")
         self.assertEqual(r3.get("id"), 3)
         tools = r3["result"].get("tools", [])
-        self.assertEqual(len(tools), 16)
+        self.assertEqual(len(tools), len(CANONICAL_TOOLS))
 
         # Resp 4: tools/call
         r4 = resps[3]
@@ -360,10 +360,25 @@ class TestUniversalToolSchemas(TestChallengerBase):
     EXPECTED_13_TOOLS = EXPECTED_16_TOOLS  # backward compatibility alias
 
     def test_01_canonical_tools_count_and_completeness(self):
-        """Verify CANONICAL_TOOLS contains all 16 expected tools with valid definitions."""
-        self.assertEqual(len(CANONICAL_TOOLS), 16)
+        """Verify CANONICAL_TOOLS contains all expected tools with valid definitions."""
+        self.assertEqual(len(CANONICAL_TOOLS), 44)
         tool_names = [t["name"] for t in CANONICAL_TOOLS]
-        self.assertEqual(tool_names, self.EXPECTED_16_TOOLS)
+        for expected_tool in self.EXPECTED_16_TOOLS:
+            self.assertIn(expected_tool, tool_names)
+
+        NO_FILE_REQUIRED = {
+            "rvs_debug_sessions",
+            "rvs_frida_env_check",
+            "rvs_frida_attach", "rvs_frida_spawn",
+            "rvs_frida_modules", "rvs_frida_symbols",
+            "rvs_frida_classes", "rvs_frida_hook",
+            "rvs_frida_trace_regs", "rvs_frida_hook_return",
+            "rvs_frida_hooks_list", "rvs_frida_hook_remove",
+            "rvs_frida_script", "rvs_frida_rpc",
+            "rvs_frida_mem_read", "rvs_frida_mem_write",
+            "rvs_triage_crash", "rvs_bypass_decision_gate",
+            "rvs_dump_decrypted_buffer", "rvs_detect_anti_debug",
+        }
 
         for t in CANONICAL_TOOLS:
             self.assertIn("name", t)
@@ -372,55 +387,50 @@ class TestUniversalToolSchemas(TestChallengerBase):
             self.assertIn("required", t)
             self.assertIsInstance(t["properties"], dict)
             self.assertIsInstance(t["required"], list)
-            self.assertIn("file", t["required"])
-            self.assertIn("file", t["properties"])
+            if t["name"] not in NO_FILE_REQUIRED:
+                self.assertIn("file", t["required"])
+                self.assertIn("file", t["properties"])
 
     def test_02_openai_schema_compliance(self):
         """Verify OpenAI function calling schema specifications."""
         schemas = get_tool_schemas("openai")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
             self.assertEqual(s.get("type"), "function")
             fn = s.get("function")
             self.assertIsInstance(fn, dict)
-            self.assertIn(fn.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(fn.get("description"), str)
             self.assertGreater(len(fn.get("description", "")), 10)
             params = fn.get("parameters")
             self.assertIsInstance(params, dict)
             self.assertEqual(params.get("type"), "object")
             self.assertIsInstance(params.get("properties"), dict)
-            self.assertIn("file", params.get("required", []))
             self.assertEqual(params.get("additionalProperties"), False)
 
     def test_03_anthropic_schema_compliance(self):
         """Verify Anthropic tool calling schema specifications."""
         schemas = get_tool_schemas("anthropic")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
-            self.assertIn(s.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(s.get("description"), str)
             self.assertGreater(len(s.get("description", "")), 10)
             input_schema = s.get("input_schema")
             self.assertIsInstance(input_schema, dict)
             self.assertEqual(input_schema.get("type"), "object")
             self.assertIsInstance(input_schema.get("properties"), dict)
-            self.assertIn("file", input_schema.get("required", []))
             self.assertEqual(input_schema.get("additionalProperties"), False)
 
     def test_04_gemini_schema_compliance(self):
         """Verify Gemini function declaration schema with uppercase types."""
         schemas = get_tool_schemas("gemini")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         valid_gemini_types = {"STRING", "INTEGER", "NUMBER", "BOOLEAN", "OBJECT", "ARRAY"}
         for s in schemas:
-            self.assertIn(s.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(s.get("description"), str)
             params = s.get("parameters")
             self.assertIsInstance(params, dict)
             self.assertEqual(params.get("type"), "OBJECT")
             props = params.get("properties", {})
-            self.assertIn("file", props)
             for prop_name, prop_val in props.items():
                 p_type = prop_val.get("type")
                 self.assertIn(p_type, valid_gemini_types, f"Invalid Gemini type {p_type} for {prop_name}")
@@ -431,15 +441,13 @@ class TestUniversalToolSchemas(TestChallengerBase):
     def test_05_mcp_schema_compliance(self):
         """Verify MCP tool schema specifications."""
         schemas = get_tool_schemas("mcp")
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), len(CANONICAL_TOOLS))
         for s in schemas:
-            self.assertIn(s.get("name"), self.EXPECTED_16_TOOLS)
             self.assertIsInstance(s.get("description"), str)
             schema = s.get("inputSchema")
             self.assertIsInstance(schema, dict)
             self.assertEqual(schema.get("type"), "object")
             self.assertIsInstance(schema.get("properties"), dict)
-            self.assertIn("file", schema.get("required", []))
 
     def test_06_tool_schema_json_serializability(self):
         """Verify all exported schemas are strictly valid JSON without functions/custom objects."""
@@ -447,7 +455,7 @@ class TestUniversalToolSchemas(TestChallengerBase):
             schemas = get_tool_schemas(fmt)  # type: ignore
             dumped = json.dumps(schemas)
             loaded = json.loads(dumped)
-            self.assertEqual(len(loaded), 16)
+            self.assertEqual(len(loaded), len(CANONICAL_TOOLS))
 
 
 # =============================================================================
