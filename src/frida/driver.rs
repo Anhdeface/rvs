@@ -28,8 +28,18 @@ impl FridaDriver {
     /// Returns R2FridaNotInstalled if the r2frida plugin is missing.
     pub fn new(target_uri: impl Into<String>, quiet: bool) -> Result<Self, AppError> {
         let uri = target_uri.into();
-        if uri.trim().is_empty() {
+        let trimmed = uri.trim();
+        if trimmed.is_empty() {
             return Err(AppError::InvalidArgument("Target URI or PID cannot be empty".to_string()));
+        }
+
+        if let Some(stripped) = trimmed.strip_prefix("frida://") {
+            let remainder = stripped.trim_matches('/');
+            if remainder.is_empty() {
+                return Err(AppError::R2FridaNotInstalled(
+                    "Frida URI must specify a target (e.g. 'frida://1234' or 'frida://attach/local//<proc>')".to_string(),
+                ));
+            }
         }
 
         if !is_r2frida_available() {
@@ -61,8 +71,7 @@ impl FridaDriver {
             .arg("-e").arg("scr.prompt=0")
             .arg("-e").arg("scr.utf8=0")
             .arg("-e").arg("cfg.fortunes=0")
-            .arg("-e").arg("cfg.plugins=true") // CRITICAL: Plugin loading enabled!
-            .arg("-e").arg("log.level=0");
+            .arg("-e").arg("cfg.plugins=true"); // CRITICAL: Plugin loading enabled!
 
         cmd.env("TERM", "dumb")
             .env("NO_COLOR", "1")
@@ -129,7 +138,13 @@ impl FridaDriver {
             });
         }
 
-        Ok(stdout)
+        let output = if stdout.trim().is_empty() && !stderr.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
+
+        Ok(output)
     }
 
     /// Executes a Frida command and deserializes the JSON output.
@@ -211,4 +226,25 @@ fn execute_subprocess_with_timeout(
     let stderr_bytes = stderr_handle.join().unwrap_or_default();
 
     Ok((status, stdout_bytes, stderr_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_frida_driver_new_empty_target_fails() {
+        let err = FridaDriver::new("", false).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArgument(_)));
+        let err2 = FridaDriver::new("   ", false).unwrap_err();
+        assert!(matches!(err2, AppError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn test_frida_driver_new_bare_frida_uri_fails() {
+        let err = FridaDriver::new("frida://", false).unwrap_err();
+        assert!(matches!(err, AppError::R2FridaNotInstalled(_)));
+        let err2 = FridaDriver::new("frida:///", false).unwrap_err();
+        assert!(matches!(err2, AppError::R2FridaNotInstalled(_)));
+    }
 }

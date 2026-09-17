@@ -591,5 +591,176 @@ class TestPythonApiStress(TestChallengerBase):
         self.assertEqual(orig_bytes, temp_bin.read_bytes())
 
 
+# =============================================================================
+# PART 4: Frida MCP Tools Call Alignment, Aliases & Argument Preservation
+# =============================================================================
+
+class TestMcpFridaToolsCallAlignment(TestChallengerBase):
+    """Verify MCP tools/call alignment, parameter aliases, and argument preservation for Frida tools."""
+
+    def test_01_frida_spawn_via_mcp_with_path_and_target(self):
+        """Verify rvs_frida_spawn executes via execute_tool with path or target alias."""
+        # 1. With canonical 'path'
+        res1 = self.harness.execute_tool(
+            "rvs_frida_spawn",
+            {"path": str(self.crackme_path), "compact": True},
+        )
+        self.assertTrue(res1.get("success"), f"spawn with path failed: {res1}")
+        self.assertEqual(res1.get("command"), "frida spawn")
+        self.assertTrue(res1.get("data", {}).get("connected"))
+
+        # 2. With alias 'target'
+        res2 = self.harness.execute_tool(
+            "rvs_frida_spawn",
+            {"target": str(self.crackme_path), "compact": True},
+        )
+        self.assertTrue(res2.get("success"), f"spawn with target alias failed: {res2}")
+        self.assertEqual(res2.get("command"), "frida spawn")
+
+    def test_02_frida_spawn_preserves_args_without_swallowing_options(self):
+        """Verify rvs_frida_spawn places --timeout and --device before --args."""
+        res = self.harness.execute_tool(
+            "rvs_frida_spawn",
+            {
+                "path": str(self.crackme_path),
+                "args": ["hello", "world"],
+                "timeout": 5,
+                "compact": True,
+            },
+        )
+        self.assertTrue(res.get("success"), f"spawn with args failed: {res}")
+        target_uri = res.get("data", {}).get("target_uri", "")
+        # Ensure --timeout is NOT swallowed into target_uri arguments
+        self.assertNotIn("--timeout", target_uri)
+        self.assertIn("hello world", target_uri)
+
+    def test_03_frida_attach_target_and_pid_aliases(self):
+        """Verify rvs_frida_attach accepts target, pid, and rejects bare frida:// immediately."""
+        # 1. Bare frida:// URI returns INVALID_ARGUMENT without hanging
+        res_bare = self.harness.execute_tool(
+            "rvs_frida_attach",
+            {"target": "frida://"},
+        )
+        self.assertFalse(res_bare.get("success"))
+        self.assertIn(res_bare.get("error", {}).get("code"), ["INVALID_ARGUMENT", "R2_FRIDA_NOT_INSTALLED"])
+        self.assertIn(res_bare.get("error", {}).get("exit_code"), [EXIT_INVALID_ARGUMENT, 6])
+
+        # 2. pid alias resolves to target
+        res_pid = self.harness.execute_tool(
+            "rvs_frida_attach",
+            {"pid": "9999999"},
+        )
+        # Process does not exist, so it should return an attach failure or analysis error, NOT missing target
+        self.assertFalse(res_pid.get("success"))
+        self.assertNotEqual(
+            res_pid.get("error", {}).get("message"),
+            "Missing required argument 'target' (PID, process name, or frida URI)",
+        )
+
+    def test_04_frida_hook_aliases(self):
+        """Verify rvs_frida_hook accepts function/symbol aliases and fmt for format."""
+        # Missing required args
+        res_missing = self.harness.execute_tool(
+            "rvs_frida_hook",
+            {"target": "dummy_proc"},
+        )
+        self.assertFalse(res_missing.get("success"))
+        self.assertEqual(res_missing.get("error", {}).get("code"), "INVALID_ARGUMENT")
+
+    def test_05_frida_trace_regs_list_normalization(self):
+        """Verify rvs_frida_trace_regs normalizes list of registers to comma-separated string."""
+        res = self.harness.execute_tool(
+            "rvs_frida_trace_regs",
+            {
+                "target": "9999999",
+                "addr": "0x401000",
+                "regs": ["rax", "rdi"],
+            },
+        )
+        # Should fail with attach error, not invalid register name '['rax''
+        self.assertFalse(res.get("success"))
+        err_msg = res.get("error", {}).get("message", "")
+        self.assertNotIn("Invalid register name '['rax''", err_msg)
+
+    def test_06_frida_hook_return_retval_aliases(self):
+        """Verify rvs_frida_hook_return accepts value, return_value, and ret aliases."""
+        for alias in ("retval", "value", "return_value", "ret"):
+            res = self.harness.execute_tool(
+                "rvs_frida_hook_return",
+                {
+                    "target": "9999999",
+                    "addr": "0x401000",
+                    alias: "0x1",
+                },
+            )
+            self.assertFalse(res.get("success"))
+            err_msg = res.get("error", {}).get("message", "")
+            self.assertNotIn("Missing required arguments 'target', 'addr', and/or 'retval'", err_msg)
+
+    def test_07_frida_mem_read_and_write_aliases(self):
+        """Verify rvs_frida_mem_read accepts length and rvs_frida_mem_write accepts bytes/hex_bytes."""
+        res_read = self.harness.execute_tool(
+            "rvs_frida_mem_read",
+            {"target": "9999999", "addr": "0x401000", "length": 64},
+        )
+        self.assertFalse(res_read.get("success"))
+        self.assertNotIn("Missing required", res_read.get("error", {}).get("message", ""))
+
+        res_write = self.harness.execute_tool(
+            "rvs_frida_mem_write",
+            {"target": "9999999", "addr": "0x401000", "bytes": "9090"},
+        )
+        self.assertFalse(res_write.get("success"))
+        self.assertNotIn("Missing required", res_write.get("error", {}).get("message", ""))
+
+    def test_08_frida_error_envelope_target_string_fidelity(self):
+        """Verify that error envelopes for Frida tools do not have target: 'None'."""
+        res = self.harness.execute_tool("rvs_frida_spawn", {})
+        self.assertFalse(res.get("success"))
+        self.assertNotEqual(res.get("target"), "None")
+        self.assertEqual(res.get("target"), "")
+
+    def test_09_frida_attach_ambient_file_isolation(self):
+        """Verify rvs_frida_attach never injects -f when ambient file or file alias is provided."""
+        recorded = []
+        orig_run = self.harness.run
+        try:
+            self.harness.run = lambda cmd, *args, **kwargs: recorded.append(cmd) or {"success": True, "command": "frida attach", "data": {}}
+
+            # Scenario A: Ambient active file alongside explicit target
+            self.harness.execute_tool(
+                "rvs_frida_attach",
+                {"target": "1234", "file": str(self.crackme_path)},
+            )
+            self.assertNotIn("-f", recorded[-1], f"Expected no -f in attach cmd, got {recorded[-1]}")
+            self.assertEqual(recorded[-1], ["frida", "attach", "1234"])
+
+            # Scenario B: 'file' parameter used as alias for target
+            self.harness.execute_tool(
+                "rvs_frida_attach",
+                {"file": "5678"},
+            )
+            self.assertNotIn("-f", recorded[-1], f"Expected no -f in attach cmd with file alias, got {recorded[-1]}")
+            self.assertEqual(recorded[-1], ["frida", "attach", "5678"])
+        finally:
+            self.harness.run = orig_run
+
+    def test_10_frida_spawn_ambient_file_isolation(self):
+        """Verify rvs_frida_spawn never injects -f when ambient file is present."""
+        recorded = []
+        orig_run = self.harness.run
+        try:
+            self.harness.run = lambda cmd, *args, **kwargs: recorded.append(cmd) or {"success": True, "command": "frida spawn", "data": {}}
+
+            self.harness.execute_tool(
+                "rvs_frida_spawn",
+                {"path": str(self.crackme_path), "file": "/ambient/path/to/binary"},
+            )
+            self.assertNotIn("-f", recorded[-1], f"Expected no -f in spawn cmd, got {recorded[-1]}")
+            self.assertEqual(recorded[-1], ["frida", "spawn", str(self.crackme_path)])
+        finally:
+            self.harness.run = orig_run
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

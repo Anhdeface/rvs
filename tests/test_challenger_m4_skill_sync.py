@@ -17,13 +17,17 @@ import ast
 import hashlib
 import json
 import re
+import sys
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_DIR) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR))
+
 import rvs_agent_harness as h
 
-WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 LOCAL_SKILL_PATH = WORKSPACE_DIR / "SKILL.md"
 GLOBAL_SKILL_PATH = Path("/home/quanh/.gemini/config/skills/rvs/SKILL.md")
 

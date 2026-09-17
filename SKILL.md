@@ -1,6 +1,6 @@
 ---
 name: rvs-reverse-engineering
-description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, and deterministic binary patching using rvs v0.3.0 and its 40+ tool MCP agent harness.
+description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, and deterministic binary patching using rvs v0.3.1 and its 40+ tool MCP agent harness.
 compatibility: Antigravity CLI, Claude Code, Google Gemini CLI, GitHub Copilot CLI, Cursor
 version: 2.1.0
 ---
@@ -44,6 +44,55 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
 5. **Atomic Patching & Safe Recovery**:
    - Binary modifications automatically create timestamped `.bak` backups.
    - Multi-step patch plans support `dry_run=True` simulation to verify instruction encoding and byte offsets before modifying disk.
+6. **Native Dynamic Tooling Over Custom Scripting**:
+   - **MANDATORY DIRECTIVE**: Agents MUST NEVER author, compile, or execute standalone Python scripts (e.g. scripts invoking `import frida`, `ctypes`, or raw `subprocess`) or custom shell scripts.
+   - All runtime inspection, dynamic hooking, register evaluation, and gate bypasses MUST be executed through native `rvs` MCP tools:
+     - Argument inspection: `rvs_frida_hook`
+     - Register tracing: `rvs_frida_trace_regs`
+     - Return value overriding: `rvs_frida_hook_return`
+     - Autonomous gate bypass: `rvs_bypass_decision_gate`
+     - Plaintext buffer extraction: `rvs_dump_decrypted_buffer`
+     - Anti-debug detection: `rvs_detect_anti_debug`
+
+---
+
+## 🧭 Dynamic Analysis & Instrumentation Decision Tree
+
+Agents should select tools according to this operational decision logic:
+
+```
+                              [Target Objective / Challenge]
+                                            │
+   ┌────────────────────────┬───────────────┴───────────────┬────────────────────────┐
+   ▼                        ▼                               ▼                        ▼
+[Auth / Decision Gate]  [Inspect Function Args]       [Decryptor / Buffer]    [Anti-Debugging Check]
+   │                        │                               │                        │
+   ├─ Composite 1-Shot?     └─> rvs_frida_hook(...,         ├─ Dynamic buffer dump?  └─> rvs_detect_anti_debug(...)
+   │  └─> rvs_bypass_           addr="...", format="z")     │  └─> rvs_dump_decrypted_     ├─ Returns techniques
+   │      decision_gate(..)                                 │      buffer(...)             │  (ptrace, TracerPid)
+   │                                                        │                              └─ Neutralize via:
+   ├─ Runtime override?     [Inspect Registers]             └─ Safe CPU emulation?            rvs_frida_hook_return
+   │  └─> rvs_frida_hook_   └─> rvs_frida_trace_regs(...,      └─> rvs_dynamic_emulate(...)   or rvs_frida_script
+   │      return(...,           addr="...", regs="...")
+   │      retval="0x1")
+   │
+   ├─ Step-by-step debug?
+   │  └─> rvs_debug_spawn / breakpoint / registers
+   │
+   └─ Permanent patch?
+      └─> rvs_patch_instruction(...)
+```
+
+| Operational Objective | Prescribed Native Tool | When to Select |
+|---|---|---|
+| **One-Shot Gate Bypass** | `rvs_bypass_decision_gate` | Default choice when gate function or branch address is known; automatically analyzes CFG, tests bypass, and produces patch plan. |
+| **Runtime Return Override** | `rvs_frida_hook_return` | When bypassing checks live in-memory without modifying the on-disk binary (e.g., forcing `retval="0x1"`). |
+| **Argument Interception** | `rvs_frida_hook` | When inspecting arguments passed to validation/encryption functions (`format="z"` for strings, `format="x"` for hex pointers, `format="i"` for ints). |
+| **Register Tracing** | `rvs_frida_trace_regs` | When monitoring CPU registers at function boundaries without launching full interactive ptrace session. |
+| **Decrypted Buffer Dump** | `rvs_dump_decrypted_buffer` | Extracting in-memory plaintext buffers immediately following decryption routine execution. |
+| **Anti-Debug Neutralization**| `rvs_detect_anti_debug` | Detecting `ptrace(PTRACE_TRACEME)` and `/proc/self/status` TracerPid checks and acquiring tailored bypass hooks. |
+| **Deep Interactive Stepping**| `rvs_debug_*` | When granular instruction-by-instruction stepping, memory inspection, or hardware breakpoints are required. |
+| **Permanent Binary Patch** | `rvs_patch_instruction` / `rvs_agent_patch_plan` | Applying permanent on-disk opcode modifications with backup preservation. |
 
 ---
 
@@ -111,11 +160,12 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
 
 ### Phase 5: Live Runtime Instrumentation via Frida (`r2frida`) & Composite Workflows
 1. **Environment Verification**: Call `rvs_frida_env_check()` to verify Frida core and r2frida plugin readiness.
-2. **Process Attachment**: Call `rvs_frida_attach(target="<pid_or_name>")` or `rvs_frida_spawn(path="<binary_path>")`. Note: Frida tools require `target`, NOT a mandatory `file` parameter!
+2. **Process Attachment**: Call `rvs_frida_attach(target="<pid_or_name>")` or `rvs_frida_spawn(path="<binary_path>")`. Note: Frida tools require `target` (or `path` for spawn), NOT a mandatory `file` parameter!
 3. **Inspection & Interception**:
    - Enumerate modules: `rvs_frida_modules(target=..., limit=30)`.
    - Enumerate symbols: `rvs_frida_symbols(target=..., module="libc.so.6", filter="open", limit=50)`.
-   - Intercept calls: `rvs_frida_hook(target=..., addr="0x401200", format="x")`.
+   - Intercept calls: `rvs_frida_hook(target=..., addr="0x401200", format="x")`. Format specifiers: `'z'` (string pointer), `'x'` (hex pointer), `'i'` (integer), `'h'` (hexdump).
+   - Trace registers: `rvs_frida_trace_regs(target=..., addr="0x401200", regs="rax,rdi,rsi")`.
    - Dynamic return override: `rvs_frida_hook_return(target=..., addr="sym.check_license", retval="0x1")`.
    - Script injection: `rvs_frida_script(target=..., code="Interceptor.attach(...)")`.
 4. **Autonomous Composite Workflows**:
@@ -123,6 +173,7 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
    - `rvs_bypass_decision_gate(file=..., gate_addr="...")`: Identifies branch instructions, calculates opposite branch opcode, and tests gate bypass.
    - `rvs_dump_decrypted_buffer(file=...)`: Breaks after decryption loops and extracts plaintext buffers directly from live process memory.
    - `rvs_detect_anti_debug(file=...)`: Detects `ptrace(PTRACE_TRACEME)`, `/proc/self/status` `TracerPid` checks, and generates tailored Frida bypass scripts.
+5. **No Standalone Custom Scripts**: Under no circumstances should agents create standalone Python or shell scripts. Always use the native Frida and composite tools above.
 
 ### Phase 6: Binary Patching & Verification
 1. **Dry-Run Validation**: Validate patches with `rvs_agent_patch_plan(file=..., plan={...}, dry_run=True)`.
@@ -649,7 +700,11 @@ rvs_debug_kill(file="auth_gate", session=sess)
 # Either invert instruction:
 rvs_patch_instruction(file="auth_gate", addr="0x40117a", assembly="je 0x401183")
 # Or use the composite one-shot bypass workflow:
-# rvs_bypass_decision_gate(file="auth_gate", gate_addr="sym.check_auth")
+rvs_bypass_decision_gate(file="auth_gate", gate_addr="sym.check_auth")
+
+# Fast Path Alternative: Live Frida Hook Return (No debugger session needed!)
+rvs_frida_spawn(path="auth_gate", args=["invalid_password"])
+rvs_frida_hook_return(target="auth_gate", addr="sym.check_auth", retval="0x1")
 ```
 
 ---
@@ -732,6 +787,25 @@ crash_report = rvs_triage_crash(file="crash_target", args=["trigger_crash"])
 
 ---
 
+### Recipe 5: Live Function Hooking & Argument Tracing via Native Frida Tools
+**Goal**: Intercept runtime function arguments, trace registers, and dynamically force function success without modifying on-disk bytes.
+
+```python
+# 1. Spawn executable under Frida dynamic instrumentation
+rvs_frida_spawn(path="license_checker")
+
+# 2. Hook function and trace string arguments (format="z")
+rvs_frida_hook(target="license_checker", addr="sym.validate_key", format="z")
+
+# 3. Trace CPU registers at function entry and exit
+rvs_frida_trace_regs(target="license_checker", addr="sym.validate_key", regs="rax,rdi,rsi")
+
+# 4. Dynamically force validation success live in memory
+rvs_frida_hook_return(target="license_checker", addr="sym.validate_key", retval="0x1")
+```
+
+---
+
 ## 🎯 Verification Checklist for Agents
 
 Before completing any reverse engineering assignment:
@@ -739,3 +813,4 @@ Before completing any reverse engineering assignment:
 2. **Session Cleanup**: Ensure all debug sessions created with `rvs_debug_spawn` / `rvs_debug_attach` are terminated via `rvs_debug_kill`. Check with `rvs_debug_sessions()` (must show 0 active sessions).
 3. **Backup Verification**: Ensure `.bak` files are created whenever modifying binaries.
 4. **Token Budgeting**: Always pass `compact=True` (or omit to accept default `True`). Limit symbol and string queries.
+5. **Native Tool Prescription**: Verify that no standalone Python or custom shell scripts were created. Confirm all dynamic hooking, register evaluation, and gate bypass operations utilized native `rvs_frida_*` or composite `rvs_*` tools.

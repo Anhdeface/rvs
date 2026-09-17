@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -42,7 +43,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.0"
+SERVER_VERSION: str = "0.3.1"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -3412,6 +3413,12 @@ class RvsHarness:
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
         """Attach r2frida to a running process by PID, name, or URI."""
+        if frida_timeout is None and timeout is not None:
+            frida_timeout = int(timeout)
+        effective_timeout = timeout
+        if frida_timeout is not None and effective_timeout is None:
+            effective_timeout = float(frida_timeout) + 5.0
+
         f_tgt = frida_target or (str(target) if target else "")
         cmd = []
         if target and frida_target:
@@ -3422,7 +3429,7 @@ class RvsHarness:
         if frida_timeout is not None:
             cmd.extend(["--timeout", str(frida_timeout)])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=timeout, mode=mode)
+        return self.run(cmd, timeout=effective_timeout, mode=mode)
 
     def frida_spawn(
         self,
@@ -3435,19 +3442,25 @@ class RvsHarness:
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
         """Spawn a new executable under r2frida dynamic instrumentation."""
+        if frida_timeout is None and timeout is not None:
+            frida_timeout = int(timeout)
+        effective_timeout = timeout
+        if frida_timeout is not None and effective_timeout is None:
+            effective_timeout = float(frida_timeout) + 5.0
+
         spawn_path = path or target or ""
         cmd = []
         if target and path and str(target) != str(path):
             cmd = ["-f", str(target)]
         cmd.extend(["frida", "spawn", str(spawn_path)])
-        if args:
-            cmd.extend(["--args"] + [str(a) for a in args])
         if device != "local":
             cmd.extend(["--device", str(device)])
         if frida_timeout is not None:
             cmd.extend(["--timeout", str(frida_timeout)])
+        if args:
+            cmd.extend(["--args"] + [str(a) for a in args])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=timeout, mode=mode)
+        return self.run(cmd, timeout=effective_timeout, mode=mode)
 
     def frida_modules(
         self,
@@ -3627,6 +3640,12 @@ class RvsHarness:
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
         """Inject and evaluate custom JS snippet or load external script file."""
+        if frida_timeout is None and timeout is not None:
+            frida_timeout = int(timeout)
+        effective_timeout = timeout
+        if frida_timeout is not None and effective_timeout is None:
+            effective_timeout = float(frida_timeout) + 5.0
+
         f_tgt = frida_target or (str(target) if target else "")
         cmd = []
         if target and frida_target:
@@ -3639,7 +3658,7 @@ class RvsHarness:
         if frida_timeout is not None:
             cmd.extend(["--timeout", str(frida_timeout)])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=timeout, mode=mode)
+        return self.run(cmd, timeout=effective_timeout, mode=mode)
 
     def frida_rpc(
         self,
@@ -3652,6 +3671,12 @@ class RvsHarness:
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
         """Invoke an exported Frida RPC method on the target process."""
+        if frida_timeout is None and timeout is not None:
+            frida_timeout = int(timeout)
+        effective_timeout = timeout
+        if frida_timeout is not None and effective_timeout is None:
+            effective_timeout = float(frida_timeout) + 5.0
+
         f_tgt = frida_target or (str(target) if target else "")
         cmd = []
         if target and frida_target:
@@ -3662,7 +3687,7 @@ class RvsHarness:
         if frida_timeout is not None:
             cmd.extend(["--timeout", str(frida_timeout)])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=timeout, mode=mode)
+        return self.run(cmd, timeout=effective_timeout, mode=mode)
 
     def frida_mem_read(
         self,
@@ -4956,34 +4981,36 @@ if (fopenPtr) {
             # r2frida Dynamic Instrumentation Tools
             # -----------------------------------------------------------------
             elif tool_name == "rvs_frida_env_check":
-                return self.frida_env_check(file, compact=compact)
+                return self.frida_env_check(None, compact=compact)
 
             elif tool_name == "rvs_frida_attach":
-                target = arguments.get("target")
+                target = arguments.get("target") or arguments.get("pid") or arguments.get("path") or arguments.get("file")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target' (PID, process name, or frida URI)",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
                 frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                subproc_timeout = float(frida_timeout) + 5.0 if frida_timeout is not None else None
                 return self.frida_attach(
-                    file,
+                    None,
                     frida_target=str(target),
                     device=arguments.get("device", "local"),
                     frida_timeout=frida_timeout,
                     compact=compact,
+                    timeout=subproc_timeout,
                 )
 
             elif tool_name == "rvs_frida_spawn":
-                path = arguments.get("path")
+                path = arguments.get("path") or arguments.get("target") or arguments.get("file")
                 if not path:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'path' (executable to spawn)",
                         category="INVALID_ARGUMENT",
@@ -4991,23 +5018,27 @@ if (fopenPtr) {
                     )
                 spawn_args = arguments.get("args")
                 if spawn_args and isinstance(spawn_args, str):
-                    spawn_args = [spawn_args]
+                    try:
+                        spawn_args = shlex.split(spawn_args)
+                    except Exception:
+                        spawn_args = [spawn_args]
                 frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                subproc_timeout = float(frida_timeout) + 5.0 if frida_timeout is not None else None
                 return self.frida_spawn(
-                    file,
                     path=str(path),
                     args=spawn_args,
                     device=arguments.get("device", "local"),
                     frida_timeout=frida_timeout,
                     compact=compact,
+                    timeout=subproc_timeout,
                 )
 
             elif tool_name in ("rvs_frida_modules", "frida_modules"):
-                target = arguments.get("target")
+                target = arguments.get("target") or arguments.get("path") or arguments.get("file") or arguments.get("pid")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file) if file else "",
+                        target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target'",
                         category="INVALID_ARGUMENT",
@@ -5016,7 +5047,7 @@ if (fopenPtr) {
                 limit = coerce_int_param(arguments.get("limit"), 30, "limit", allow_negative=False) or 30
                 offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
                 return self.frida_modules(
-                    target=file,
+                    target=None,
                     frida_target=str(target),
                     filter=arguments.get("filter"),
                     limit=limit,
@@ -5025,11 +5056,11 @@ if (fopenPtr) {
                 )
 
             elif tool_name in ("rvs_frida_symbols", "frida_symbols"):
-                target = arguments.get("target")
+                target = arguments.get("target") or arguments.get("path") or arguments.get("file") or arguments.get("pid")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file) if file else "",
+                        target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target'",
                         category="INVALID_ARGUMENT",
@@ -5037,10 +5068,11 @@ if (fopenPtr) {
                     )
                 limit = coerce_int_param(arguments.get("limit"), 50, "limit", allow_negative=False) or 50
                 offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
+                module = arguments.get("module") or arguments.get("lib") or arguments.get("library")
                 return self.frida_symbols(
-                    target=file,
+                    target=None,
                     frida_target=str(target),
-                    module=arguments.get("module"),
+                    module=module,
                     filter=arguments.get("filter"),
                     limit=limit,
                     offset=offset,
@@ -5048,11 +5080,11 @@ if (fopenPtr) {
                 )
 
             elif tool_name in ("rvs_frida_classes", "frida_classes"):
-                target = arguments.get("target")
+                target = arguments.get("target") or arguments.get("path") or arguments.get("file") or arguments.get("pid")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file) if file else "",
+                        target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target'",
                         category="INVALID_ARGUMENT",
@@ -5061,7 +5093,7 @@ if (fopenPtr) {
                 limit = coerce_int_param(arguments.get("limit"), 50, "limit", allow_negative=False) or 50
                 offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
                 return self.frida_classes(
-                    target=file,
+                    target=None,
                     frida_target=str(target),
                     filter=arguments.get("filter"),
                     limit=limit,
@@ -5070,40 +5102,43 @@ if (fopenPtr) {
                 )
 
             elif tool_name == "rvs_frida_hook":
-                target = arguments.get("target")
-                addr = arguments.get("addr")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                addr = arguments.get("addr") or arguments.get("function") or arguments.get("symbol") or arguments.get("target_addr")
+                fmt = arguments.get("format") or arguments.get("fmt")
                 if not target or not addr:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target' and/or 'addr'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
                 return self.frida_hook(
-                    file,
+                    None,
                     frida_target=str(target),
                     addr=str(addr),
-                    format=arguments.get("format"),
+                    format=fmt,
                     compact=compact,
                 )
 
             elif tool_name == "rvs_frida_trace_regs":
-                target = arguments.get("target")
-                addr = arguments.get("addr")
-                regs = arguments.get("regs")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                addr = arguments.get("addr") or arguments.get("function") or arguments.get("symbol")
+                regs = arguments.get("regs") or arguments.get("registers")
                 if not target or not addr or not regs:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target', 'addr', and/or 'regs'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                if isinstance(regs, (list, tuple)):
+                    regs = ",".join(str(r) for r in regs)
                 return self.frida_trace_regs(
-                    file,
+                    None,
                     frida_target=str(target),
                     addr=str(addr),
                     regs=str(regs),
@@ -5111,20 +5146,24 @@ if (fopenPtr) {
                 )
 
             elif tool_name == "rvs_frida_hook_return":
-                target = arguments.get("target")
-                addr = arguments.get("addr")
-                retval = arguments.get("retval")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                addr = arguments.get("addr") or arguments.get("function") or arguments.get("symbol")
+                retval = arguments.get("retval") if arguments.get("retval") is not None else (
+                    arguments.get("value") if arguments.get("value") is not None else (
+                        arguments.get("return_value") if arguments.get("return_value") is not None else arguments.get("ret")
+                    )
+                )
                 if not target or not addr or retval is None:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target', 'addr', and/or 'retval'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
                 return self.frida_hook_return(
-                    file,
+                    None,
                     frida_target=str(target),
                     addr=str(addr),
                     retval=str(retval),
@@ -5132,101 +5171,116 @@ if (fopenPtr) {
                 )
 
             elif tool_name == "rvs_frida_hooks_list":
-                target = arguments.get("target")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
                 return self.frida_hooks_list(
-                    file,
+                    None,
                     frida_target=str(target),
                     compact=compact,
                 )
 
             elif tool_name == "rvs_frida_hook_remove":
-                target = arguments.get("target")
-                hook_id = arguments.get("id")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                hook_id = arguments.get("id") or arguments.get("hook_id")
                 if not target or not hook_id:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target' and/or 'id'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
                 return self.frida_hook_remove(
-                    file,
+                    None,
                     frida_target=str(target),
                     hook_id=str(hook_id),
                     compact=compact,
                 )
 
             elif tool_name == "rvs_frida_script":
-                target = arguments.get("target")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required argument 'target'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                script_file = arguments.get("script_file") or arguments.get("script") or (
+                    arguments.get("file") if arguments.get("file") != target else None
+                )
                 frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                subproc_timeout = float(frida_timeout) + 5.0 if frida_timeout is not None else None
                 return self.frida_script(
-                    file,
+                    None,
                     frida_target=str(target),
                     code=arguments.get("code"),
-                    script_file=arguments.get("script_file"),
+                    script_file=script_file,
                     frida_timeout=frida_timeout,
                     compact=compact,
+                    timeout=subproc_timeout,
                 )
 
             elif tool_name == "rvs_frida_rpc":
-                target = arguments.get("target")
-                method = arguments.get("method")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                method = arguments.get("method") or arguments.get("name") or arguments.get("rpc_method")
                 if not target or not method:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target' and/or 'method'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
+                rpc_args = arguments.get("args") or arguments.get("rpc_args") or arguments.get("params")
+                if isinstance(rpc_args, (list, dict)):
+                    rpc_args = json.dumps(rpc_args)
                 frida_timeout = coerce_int_param(arguments.get("timeout"), None, "timeout", allow_negative=False)
+                subproc_timeout = float(frida_timeout) + 5.0 if frida_timeout is not None else None
                 return self.frida_rpc(
-                    file,
+                    None,
                     frida_target=str(target),
                     method=str(method),
-                    rpc_args=arguments.get("args"),
+                    rpc_args=rpc_args,
                     frida_timeout=frida_timeout,
                     compact=compact,
+                    timeout=subproc_timeout,
                 )
 
             elif tool_name == "rvs_frida_mem_read":
-                target = arguments.get("target")
-                addr = arguments.get("addr")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                addr = arguments.get("addr") or arguments.get("address")
                 if not target or not addr:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target' and/or 'addr'",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
-                mem_len = coerce_int_param(arguments.get("len"), 32, "len", allow_negative=False)
+                mem_len = coerce_int_param(
+                    arguments.get("len") or arguments.get("length") or arguments.get("size"),
+                    32,
+                    "len",
+                    allow_negative=False,
+                )
                 if mem_len is None:
                     mem_len = 32
                 return self.frida_mem_read(
-                    file,
+                    None,
                     frida_target=str(target),
                     addr=str(addr),
                     length=mem_len,
@@ -5234,13 +5288,13 @@ if (fopenPtr) {
                 )
 
             elif tool_name == "rvs_frida_mem_write":
-                target = arguments.get("target")
-                addr = arguments.get("addr")
-                data = arguments.get("data")
+                target = arguments.get("target") or arguments.get("file") or arguments.get("path") or arguments.get("pid")
+                addr = arguments.get("addr") or arguments.get("address")
+                data = arguments.get("data") or arguments.get("bytes") or arguments.get("hex_bytes") or arguments.get("hex")
                 if not target or not addr or not data:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
-                        target_str=str(file),
+                        target_str=str(target or file or ""),
                         code="INVALID_ARGUMENT",
                         message="Missing required arguments 'target', 'addr', and/or 'data'",
                         category="INVALID_ARGUMENT",
@@ -5248,7 +5302,7 @@ if (fopenPtr) {
                     )
                 protect = coerce_bool_param(arguments.get("protect"), True, "protect")
                 return self.frida_mem_write(
-                    file,
+                    None,
                     frida_target=str(target),
                     addr=str(addr),
                     data=str(data),

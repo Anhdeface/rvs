@@ -1,6 +1,6 @@
 # rvs: High-Performance Binary Analysis, Dynamic RE, Debugging & Runtime Instrumentation Engine
 
-[![Version](https://img.shields.io/badge/version-v0.3.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v0.3.1-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 [![MCP](https://img.shields.io/badge/protocol-MCP_Compliant-purple.svg)](https://modelcontextprotocol.io/)
@@ -86,7 +86,7 @@ The engine eliminates the critical failure modes encountered when interfacing LL
   - `src/agent/`: Autonomous composite workflows (`triage`, `flow`, `decompile`, `patch_plan`).
   - `src/patch/`: Deterministic assembly, string, and raw hex patching with automated `.bak` backup generation.
   - `src/compact.rs`: Serialization models transforming verbose telemetry into token-optimized payloads.
-  - `src/error.rs`, `src/response.rs`: Standardized error models and API envelopes (`CURRENT_FORMAT_VERSION = "0.3.0"`).
+  - `src/error.rs`, `src/response.rs`: Standardized error models and API envelopes (`CURRENT_FORMAT_VERSION = "0.3.1"`).
 
 - **Python Agent Harness (`rvs_agent_harness.py`)**:
   - Native Model Context Protocol (MCP) JSON-RPC 2.0 stdio server exposing 40 canonical tools.

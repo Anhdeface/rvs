@@ -102,8 +102,8 @@ class TestM2It3ConcurrencyAndWatchdogStress(unittest.TestCase):
             (["frida", "trace-regs", "-t", "0", "-A", "0x401000", "--regs", "bad@reg!name"], [1]),
             # Trace-regs non-ascii (exit 1)
             (["frida", "trace-regs", "-t", "0", "-A", "0x401000", "--regs", "rax,🦀"], [1]),
-            # Trace-regs valid register names syntax (passes preflight, exits 6 without io_frida)
-            (["frida", "trace-regs", "-t", "0", "-A", "0x401000", "--regs", "rax,rbx,rcx,rsp"], [6]),
+            # Trace-regs valid register names syntax (passes preflight, exits 0 if installed, 6 without io_frida)
+            (["frida", "trace-regs", "-t", "0", "-A", "0x401000", "--regs", "rax,rbx,rcx,rsp"], [0, 6]),
             # Mem-read out of bounds (exit 3)
             (["frida", "mem-read", "-t", "0", "-A", "0xffffffffffffffff", "--len", "16"], [3]),
             # Mem-read invalid len (exit 1)
@@ -163,10 +163,11 @@ class TestM2It3ConcurrencyAndWatchdogStress(unittest.TestCase):
 
         self.assertEqual(len(results), 320)
         for rc, data in results:
-            # Valid syntax reg_X_Y,rax -> passes preflight -> returns 6 (R2_FRIDA_NOT_INSTALLED)
-            self.assertEqual(rc, 6)
-            self.assertFalse(data["success"])
-            self.assertEqual(data["error"]["code"], "R2_FRIDA_NOT_INSTALLED")
+            # Valid syntax reg_X_Y,rax -> passes preflight -> returns 0 (if installed) or 6 (R2_FRIDA_NOT_INSTALLED)
+            self.assertIn(rc, [0, 6])
+            if rc == 6:
+                self.assertFalse(data["success"])
+                self.assertEqual(data["error"]["code"], "R2_FRIDA_NOT_INSTALLED")
 
     def test_03_concurrent_watchdog_timeouts_under_hanging_processes(self):
         """
@@ -244,10 +245,10 @@ exec sleep 20
             # Valid JS script file
             script_p = Path(temp_dir) / f"script_{i}.js"
             script_p.write_text(f"console.log('concurrent script {i}');")
-            # Passes script preflight -> fails with exit 6 (no io_frida)
-            tasks.append((["frida", "script", "-t", "0", "--file", str(script_p)], 6, "R2_FRIDA_NOT_INSTALLED"))
+            # Passes script preflight -> succeeds (0) or fails with exit 6 (no io_frida)
+            tasks.append((["frida", "script", "-t", "0", "--file", str(script_p)], [0, 6], ["R2_FRIDA_NOT_INSTALLED", None]))
 
-        def run_file_task(item: Tuple[List[str], int, str]) -> Tuple[int, Dict[str, Any], int, str]:
+        def run_file_task(item: Tuple[List[str], Any, Any]) -> Tuple[int, Dict[str, Any], Any, Any]:
             cmd, expected_rc, expected_code = item
             rc, data, stdout, stderr = run_rvs_cmd(cmd)
             return rc, data, expected_rc, expected_code
@@ -257,19 +258,24 @@ exec sleep 20
 
         self.assertEqual(len(results), 60)
         for rc, data, expected_rc, expected_code in results:
-            self.assertEqual(rc, expected_rc, f"Expected rc={expected_rc}, got {rc}. Data: {data}")
-            self.assertEqual(data["error"]["code"], expected_code)
+            if isinstance(expected_rc, (list, tuple, set)):
+                self.assertIn(rc, expected_rc, f"Expected rc in {expected_rc}, got {rc}. Data: {data}")
+            else:
+                self.assertEqual(rc, expected_rc, f"Expected rc={expected_rc}, got {rc}. Data: {data}")
+            if expected_code and isinstance(expected_code, str):
+                self.assertEqual(data["error"]["code"], expected_code)
 
     def test_05_extreme_register_list_adversarial_boundary(self):
         """
         Test boundary of register list:
-        1. 128 valid registers (maximum allowed) -> passes preflight (rc=6)
+        1. 128 valid registers (maximum allowed) -> passes preflight (rc=0 or 6)
         2. 129 valid registers (exceeds maximum allowed 128) -> returns exit 1 (INVALID_ARGUMENT)
         """
         regs_128 = ",".join([f"r{i}" for i in range(128)])
         rc_128, data_128, _, _ = run_rvs_cmd(["frida", "trace-regs", "-t", "0", "-A", "0x401000", "--regs", regs_128])
-        self.assertEqual(rc_128, 6, f"128 registers should pass preflight, got rc={rc_128}")
-        self.assertEqual(data_128["error"]["code"], "R2_FRIDA_NOT_INSTALLED")
+        self.assertIn(rc_128, [0, 6], f"128 registers should pass preflight, got rc={rc_128}")
+        if rc_128 == 6:
+            self.assertEqual(data_128["error"]["code"], "R2_FRIDA_NOT_INSTALLED")
 
         regs_129 = ",".join([f"r{i}" for i in range(129)])
         rc_129, data_129, _, _ = run_rvs_cmd(["frida", "trace-regs", "-t", "0", "-A", "0x401000", "--regs", regs_129])

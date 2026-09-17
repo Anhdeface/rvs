@@ -24,12 +24,19 @@ impl FridaTarget {
 
         // Scheme validation
         if trimmed.contains("://") {
-            if !trimmed.starts_with("frida://") {
+            if let Some(stripped) = trimmed.strip_prefix("frida://") {
+                let remainder = stripped.trim_matches('/');
+                if remainder.is_empty() {
+                    return Err(AppError::R2FridaNotInstalled(
+                        "Frida URI must specify a target (e.g. 'frida://1234' or 'frida://attach/local//<proc>')".to_string(),
+                    ));
+                }
+                return Ok(FridaTarget::Uri(trimmed.to_string()));
+            } else {
                 return Err(AppError::InvalidArgument(format!(
                     "Invalid URI scheme in '{trimmed}'. Only 'frida://' URIs are supported."
                 )));
             }
-            return Ok(FridaTarget::Uri(trimmed.to_string()));
         }
 
         // Check for negative number (e.g. -1)
@@ -42,7 +49,7 @@ impl FridaTarget {
         // Check for purely numeric string
         let num_str = trimmed.strip_prefix('+').unwrap_or(trimmed);
         if !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit()) {
-            match trimmed.parse::<u32>() {
+            match num_str.parse::<u32>() {
                 Ok(pid) => return Ok(FridaTarget::Pid(pid)),
                 Err(_) => {
                     return Err(AppError::InvalidArgument(format!(
@@ -124,7 +131,17 @@ impl FridaTarget {
                 if args.is_empty() {
                     format!("frida://spawn/local///{path_str}")
                 } else {
-                    let joined_args = args.join(" ");
+                    let formatted_args: Vec<String> = args
+                        .iter()
+                        .map(|a| {
+                            if a.is_empty() || a.chars().any(char::is_whitespace) || a.contains('"') {
+                                format!("\"{}\"", a.replace('"', "\\\""))
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
+                    let joined_args = formatted_args.join(" ");
                     format!("frida://spawn/local///{path_str} {joined_args}")
                 }
             }
@@ -249,5 +266,47 @@ mod tests {
             }
             _ => panic!("Expected FridaTarget::Spawn"),
         }
+    }
+
+    #[test]
+    fn test_parse_attach_bare_frida_uri_fails() {
+        let err = FridaTarget::parse_attach("frida://").unwrap_err();
+        assert!(matches!(err, AppError::R2FridaNotInstalled(_)));
+        let err2 = FridaTarget::parse_attach("frida:///").unwrap_err();
+        assert!(matches!(err2, AppError::R2FridaNotInstalled(_)));
+    }
+
+    #[test]
+    fn test_parse_attach_positive_pid() {
+        let target = FridaTarget::parse_attach("+1234").unwrap();
+        assert_eq!(target, FridaTarget::Pid(1234));
+    }
+
+    #[test]
+    fn test_to_uri_spawn_quotes_args_with_spaces() {
+        let target = FridaTarget::Spawn {
+            path: PathBuf::from("/bin/ls"),
+            args: vec!["--param".to_string(), "hello world".to_string(), "simple".to_string()],
+        };
+        assert_eq!(target.to_uri(), "frida://spawn/local////bin/ls --param \"hello world\" simple");
+    }
+
+    #[test]
+    fn test_to_uri_spawn_quotes_empty_and_whitespace_args() {
+        let target = FridaTarget::Spawn {
+            path: PathBuf::from("/bin/ls"),
+            args: vec![
+                "".to_string(),
+                "hello world".to_string(),
+                "tab\targ".to_string(),
+                "newline\narg".to_string(),
+                "quote\"arg".to_string(),
+                "simple".to_string(),
+            ],
+        };
+        assert_eq!(
+            target.to_uri(),
+            "frida://spawn/local////bin/ls \"\" \"hello world\" \"tab\targ\" \"newline\narg\" \"quote\\\"arg\" simple"
+        );
     }
 }
