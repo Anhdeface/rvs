@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
@@ -1312,6 +1313,80 @@ def transform_response(
 
 
 # =============================================================================
+# Neutral Orchestrator Lazy Resolvers & Helpers
+# =============================================================================
+
+def _get_neutral_orchestrator_cls() -> Any:
+    """Lazy loader for NeutralBinaryOrchestrator to prevent circular imports."""
+    from neutral_orchestrator.orchestrator import NeutralBinaryOrchestrator
+    return NeutralBinaryOrchestrator
+
+
+def _get_target_classifier() -> Any:
+    """Lazy loader for TargetClassifier to prevent circular imports."""
+    from neutral_orchestrator.target_ingestion import TargetClassifier
+    return TargetClassifier
+
+
+_ORCHESTRATION_CONTEXT = threading.local()
+
+
+def _is_apk_target(target: Optional[Union[str, Path]]) -> bool:
+    """Detects whether target path corresponds to an APK package or container."""
+    if not target:
+        return False
+    t_str = str(target).lower()
+    if t_str.endswith(".apk"):
+        return True
+    if os.path.exists(target):
+        try:
+            tc = _get_target_classifier()
+            return bool(tc.is_apk(target))
+        except Exception as e:
+            try:
+                from neutral_orchestrator.target_ingestion import MalformedPackageError
+                if isinstance(e, MalformedPackageError):
+                    return True
+            except ImportError:
+                pass
+    return False
+
+
+def _is_dex_target(target: Optional[Union[str, Path]]) -> bool:
+    """Detects whether target path corresponds to a Dalvik DEX binary."""
+    if not target:
+        return False
+    t_str = str(target).lower()
+    if t_str.endswith(".dex"):
+        return True
+    if os.path.exists(target):
+        try:
+            tc = _get_target_classifier()
+            return bool(tc.is_dex(target))
+        except Exception:
+            pass
+    return False
+
+
+def _neutralize_data_recursive(payload: Any, mapper: Any) -> Any:
+    """Recursively applies mapper.neutralize to all string values and keys."""
+    if isinstance(payload, str):
+        return mapper.neutralize(payload)
+    elif isinstance(payload, dict):
+        return {
+            (mapper.neutralize(k) if isinstance(k, str) else k): _neutralize_data_recursive(v, mapper)
+            for k, v in payload.items()
+        }
+    elif isinstance(payload, list):
+        return [_neutralize_data_recursive(item, mapper) for item in payload]
+    elif isinstance(payload, tuple):
+        return tuple(_neutralize_data_recursive(item, mapper) for item in payload)
+    elif isinstance(payload, set):
+        return {_neutralize_data_recursive(item, mapper) for item in payload}
+    return payload
+
+
+# =============================================================================
 # Canonical Tool Catalog & Schema Exporter (R2)
 # =============================================================================
 
@@ -1327,6 +1402,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
             },
         },
         "required": ["file"],
@@ -1359,6 +1447,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
             },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
+            },
         },
         "required": ["file"],
     },
@@ -1386,6 +1487,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
             },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
+            },
         },
         "required": ["file", "target"],
     },
@@ -1405,6 +1519,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
             },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
+            },
         },
         "required": ["file", "function"],
     },
@@ -1423,6 +1550,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
             },
         },
         "required": ["file", "function"],
@@ -1457,6 +1597,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
             },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
+            },
         },
         "required": ["file", "target"],
     },
@@ -1484,6 +1637,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
             },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
+            },
         },
         "required": ["file"],
     },
@@ -1510,6 +1676,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
             },
         },
         "required": ["file"],
@@ -1610,6 +1789,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+            "abi": {
+                "type": "string",
+                "description": "Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.",
+            },
+            "neutral": {
+                "type": "boolean",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+            },
+            "component_type": {
+                "type": "string",
+                "enum": ["elf_so", "dex"],
+                "description": "Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.",
             },
         },
         "required": ["file"],
@@ -2692,6 +2884,11 @@ class RvsHarness:
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._most_recent_session_id: Optional[str] = None
         self._active_debug_sessions: set[str] = set()
+        self._in_orchestration: bool = False
+
+    def _is_in_orchestration(self) -> bool:
+        """Returns True if this harness instance is currently operating under orchestrator control."""
+        return getattr(self, "_in_orchestration", False) or getattr(_ORCHESTRATION_CONTEXT, "active", False)
 
     def _resolve_debug_session(self, session: Optional[str]) -> Optional[str]:
         if session:
@@ -2821,8 +3018,27 @@ class RvsHarness:
         target: Union[str, Path],
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Inspect binary metadata, architecture, format, and security mitigations."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_info",
+                    {
+                        "file": str(target),
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         mode: OutputMode = "compact" if compact else "full"
         return self.run(["-f", str(target), "info"], timeout=timeout, mode=mode)
 
@@ -2835,8 +3051,31 @@ class RvsHarness:
         offset: Optional[int] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Enumerate functions with addresses, sizes, signatures, and cyclomatic complexity."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_functions",
+                    {
+                        "file": str(target),
+                        "filter": filter,
+                        "detail": detail,
+                        "limit": limit,
+                        "offset": offset,
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         args = ["-f", str(target), "analyze", "functions"]
         if filter:
             args.extend(["--filter", filter])
@@ -2855,8 +3094,30 @@ class RvsHarness:
         max_instructions: Optional[int] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Disassemble basic blocks and instructions for target function or address."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_disasm",
+                    {
+                        "file": str(target),
+                        "target": str(function_or_addr),
+                        "disasm": disasm,
+                        "max_instructions": max_instructions,
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         args = ["-f", str(target), "analyze", "blocks", str(function_or_addr)]
         if not disasm:
             args.append("--disasm=false")
@@ -2876,8 +3137,28 @@ class RvsHarness:
         function: str,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Generate pseudo-C decompilation, call graph, and referenced strings."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_decompile",
+                    {
+                        "file": str(target),
+                        "function": str(function),
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         mode: OutputMode = "compact" if compact else "full"
         return self.run(
             ["-f", str(target), "--format", "json", "agent", "decompile", str(function)],
@@ -2891,8 +3172,28 @@ class RvsHarness:
         function: str,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Analyze control-flow branch gates, conditional checks, and loop back-edges."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_flow",
+                    {
+                        "file": str(target),
+                        "function": str(function),
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         mode: OutputMode = "compact" if compact else "full"
         return self.run(
             ["-f", str(target), "--format", "json", "agent", "flow", str(function)],
@@ -2909,8 +3210,31 @@ class RvsHarness:
         limit: Optional[int] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Extract cross-references to and/or from a symbol or address."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_xrefs",
+                    {
+                        "file": str(target),
+                        "target": str(symbol_or_addr),
+                        "direction": direction,
+                        "kind": kind,
+                        "limit": limit,
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         args = ["-f", str(target), "analyze", "xrefs", str(symbol_or_addr), "--type", direction]
         if kind:
             args.extend(["--kind", kind])
@@ -2925,8 +3249,30 @@ class RvsHarness:
         limit: Optional[int] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Scan binary data sections for ASCII/UTF-8 strings."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_strings",
+                    {
+                        "file": str(target),
+                        "min_len": min_len,
+                        "filter": filter,
+                        "limit": limit,
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         args = ["-f", str(target), "strings", "--min-len", str(min_len)]
         mode: OutputMode = "compact" if compact else "full"
         resp = self.run(args, timeout=timeout, mode=mode, limit=limit)
@@ -2946,8 +3292,30 @@ class RvsHarness:
         offset: int = 0,
         compact: bool = True,
         timeout: Optional[float] = None,
+        abi: Optional[str] = None,
+        neutral: bool = False,
+        component_type: Optional[str] = None,
+        _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """List binary symbols, PLT imports, and virtual addresses."""
+        in_orch = _from_orchestrator or self._is_in_orchestration()
+        if not in_orch:
+            is_apk = _is_apk_target(target)
+            is_dex = _is_dex_target(target)
+            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+                return self.execute_tool(
+                    "rvs_symbols",
+                    {
+                        "file": str(target),
+                        "filter": filter,
+                        "limit": limit,
+                        "offset": offset,
+                        "compact": compact,
+                        "abi": abi,
+                        "neutral": neutral,
+                        "component_type": component_type,
+                    },
+                )
         args = ["-f", str(target), "symbols"]
         if filter:
             args.extend(["--filter", filter])
@@ -4599,6 +4967,242 @@ if (fopenPtr) {
 
         try:
             compact = coerce_bool_param(arguments.get("compact"), True, "compact")
+            abi = arguments.get("abi")
+            if isinstance(abi, str):
+                abi = abi.strip().lower()
+            neutral = coerce_bool_param(arguments.get("neutral"), False, "neutral")
+            component_type = arguments.get("component_type")
+            if isinstance(component_type, str):
+                component_type = component_type.strip().lower()
+
+            is_apk = _is_apk_target(file)
+            is_dex = _is_dex_target(file)
+
+            needs_orchestration = (is_apk or is_dex or neutral or abi is not None or component_type is not None)
+
+            ORCHESTRATED_TOOLS = {
+                "rvs_info": "info",
+                "rvs_functions": "functions",
+                "rvs_disasm": "disasm",
+                "rvs_decompile": "decompile",
+                "rvs_flow": "flow",
+                "rvs_xrefs": "xrefs",
+                "rvs_strings": "strings",
+                "rvs_symbols": "symbols",
+            }
+
+            if tool_name in ORCHESTRATED_TOOLS and needs_orchestration:
+                cmd = ORCHESTRATED_TOOLS[tool_name]
+                query_kwargs: Dict[str, Any] = {
+                    "compact": compact,
+                    "abi": abi,
+                    "component_type": component_type,
+                }
+
+                if tool_name == "rvs_info":
+                    pass
+
+                elif tool_name == "rvs_functions":
+                    detail = coerce_bool_param(arguments.get("detail"), False, "detail")
+                    limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
+                    offset = coerce_int_param(arguments.get("offset"), None, "offset", allow_negative=False)
+                    query_kwargs.update({
+                        "filter": arguments.get("filter"),
+                        "detail": detail,
+                        "limit": limit,
+                        "offset": offset,
+                    })
+
+                elif tool_name == "rvs_disasm":
+                    target = arguments.get("target") or arguments.get("function_or_addr")
+                    if not target:
+                        return make_error_envelope(
+                            command_str=f"{tool_name}",
+                            target_str=str(file),
+                            code="INVALID_ARGUMENT",
+                            message="Missing required argument 'target' (function name or address)",
+                            category="INVALID_ARGUMENT",
+                            exit_code=EXIT_INVALID_ARGUMENT,
+                            suggestion="Pass target='main' or target='0x11e0'.",
+                        )
+                    disasm = coerce_bool_param(arguments.get("disasm"), True, "disasm")
+                    max_instructions = coerce_int_param(
+                        arguments.get("max_instructions"), None, "max_instructions", allow_negative=False
+                    )
+                    query_kwargs.update({
+                        "function_or_addr": str(target),
+                        "disasm": disasm,
+                        "max_instructions": max_instructions,
+                    })
+
+                elif tool_name == "rvs_decompile":
+                    function = arguments.get("function") or arguments.get("function_or_addr") or arguments.get("target")
+                    if not function:
+                        return make_error_envelope(
+                            command_str=f"{tool_name}",
+                            target_str=str(file),
+                            code="INVALID_ARGUMENT",
+                            message="Missing required argument 'function'",
+                            category="INVALID_ARGUMENT",
+                            exit_code=EXIT_INVALID_ARGUMENT,
+                            suggestion="Pass function='main' or function address.",
+                        )
+                    query_kwargs.update({
+                        "function": str(function),
+                        "function_or_addr": str(function),
+                    })
+
+                elif tool_name == "rvs_flow":
+                    function = arguments.get("function") or arguments.get("function_or_addr") or arguments.get("target")
+                    if not function:
+                        return make_error_envelope(
+                            command_str=f"{tool_name}",
+                            target_str=str(file),
+                            code="INVALID_ARGUMENT",
+                            message="Missing required argument 'function'",
+                            category="INVALID_ARGUMENT",
+                            exit_code=EXIT_INVALID_ARGUMENT,
+                            suggestion="Pass function='main' or function address.",
+                        )
+                    query_kwargs.update({
+                        "function": str(function),
+                        "function_or_addr": str(function),
+                    })
+
+                elif tool_name == "rvs_xrefs":
+                    target = arguments.get("target") or arguments.get("symbol_or_addr")
+                    if not target:
+                        return make_error_envelope(
+                            command_str=f"{tool_name}",
+                            target_str=str(file),
+                            code="INVALID_ARGUMENT",
+                            message="Missing required argument 'target'",
+                            category="INVALID_ARGUMENT",
+                            exit_code=EXIT_INVALID_ARGUMENT,
+                            suggestion="Pass target symbol or address to xrefs query.",
+                        )
+                    limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
+                    query_kwargs.update({
+                        "symbol_or_addr": str(target),
+                        "function_or_addr": str(target),
+                        "direction": arguments.get("direction", "all"),
+                        "kind": arguments.get("kind"),
+                        "limit": limit,
+                    })
+
+                elif tool_name == "rvs_strings":
+                    min_len = coerce_int_param(arguments.get("min_len"), 4, "min_len", allow_negative=False)
+                    if min_len is None:
+                        min_len = 4
+                    limit = coerce_int_param(arguments.get("limit"), None, "limit", allow_negative=False)
+                    query_kwargs.update({
+                        "min_len": min_len,
+                        "filter": arguments.get("filter"),
+                        "limit": limit,
+                    })
+
+                elif tool_name in ("rvs_symbols", "symbols"):
+                    limit = coerce_int_param(arguments.get("limit"), 50, "limit", allow_negative=False)
+                    offset = coerce_int_param(arguments.get("offset"), 0, "offset", allow_negative=False) or 0
+                    query_kwargs.update({
+                        "filter": arguments.get("filter"),
+                        "limit": limit if limit is not None else 50,
+                        "offset": offset,
+                    })
+
+                NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
+                prev_in_orch = getattr(self, "_in_orchestration", False)
+                prev_ctx = getattr(_ORCHESTRATION_CONTEXT, "active", False)
+                self._in_orchestration = True
+                _ORCHESTRATION_CONTEXT.active = True
+                try:
+                    with NeutralBinaryOrchestrator(file, default_abi=abi or "x86_64", harness=self) as orch:
+                        raw_env = orch.query(cmd, **query_kwargs)
+                        if neutral and raw_env.get("success"):
+                            from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
+                            mapper = orch.token_mapper
+                            data_obj = raw_env.get("data")
+                            if isinstance(data_obj, dict):
+                                fn_target = str(query_kwargs.get("function_or_addr") or query_kwargs.get("function") or "")
+                                if fn_target and not fn_target.startswith("0x"):
+                                    cat = classify_token(fn_target)
+                                    if cat != TokenCategory.GENERAL:
+                                        mapper.sanitize_symbol(fn_target, category=cat)
+                                for fn in data_obj.get("functions", []):
+                                    if isinstance(fn, dict) and fn.get("name"):
+                                        cat = classify_token(fn["name"])
+                                        if cat != TokenCategory.GENERAL:
+                                            mapper.sanitize_symbol(fn["name"], category=cat)
+                                for sym in data_obj.get("symbols", []):
+                                    if isinstance(sym, dict) and sym.get("name"):
+                                        cat = classify_token(sym["name"])
+                                        if cat != TokenCategory.GENERAL:
+                                            mapper.sanitize_symbol(sym["name"], category=cat)
+                                for st in data_obj.get("strings", []):
+                                    if isinstance(st, dict) and st.get("string"):
+                                        cat = classify_token(st["string"])
+                                        if cat != TokenCategory.GENERAL:
+                                            mapper.sanitize_string(st["string"], category=cat)
+                                for inst in data_obj.get("instructions", []):
+                                    if isinstance(inst, dict):
+                                        op_str = inst.get("operands", "")
+                                        for part in re.findall(r"sym\.([a-zA-Z0-9_]+)", op_str):
+                                            cat = classify_token(part)
+                                            if cat != TokenCategory.GENERAL:
+                                                mapper.sanitize_symbol(part, category=cat)
+
+                            raw_env["data"] = _neutralize_data_recursive(raw_env.get("data", {}), mapper)
+                            raw_env["codebook"] = mapper.export_codebook()
+                        elif not neutral:
+                            raw_env.pop("codebook", None)
+
+                        if "execution_time_seconds" not in raw_env:
+                            raw_env["execution_time_seconds"] = raw_env.get("telemetry", {}).get("execution_time_seconds", 0.0)
+                        if "warnings" not in raw_env:
+                            raw_env["warnings"] = []
+                        if "mode" not in raw_env:
+                            raw_env["mode"] = "compact" if compact else "full"
+                        return raw_env
+                finally:
+                    self._in_orchestration = prev_in_orch
+                    _ORCHESTRATION_CONTEXT.active = prev_ctx
+
+            elif tool_name == "rvs_agent_triage" and needs_orchestration:
+                NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
+                prev_in_orch = getattr(self, "_in_orchestration", False)
+                prev_ctx = getattr(_ORCHESTRATION_CONTEXT, "active", False)
+                self._in_orchestration = True
+                _ORCHESTRATION_CONTEXT.active = True
+                try:
+                    with NeutralBinaryOrchestrator(file, default_abi=abi or "x86_64", harness=self) as orch:
+                        comp = orch.unified_target.get_component(abi=abi or "x86_64", comp_type=component_type or "elf_so") if orch.unified_target else None
+                        if comp is None and orch.unified_target and orch.unified_target.components:
+                            comp = orch.unified_target.components[0]
+                        active_path = comp.path if comp else file
+                        res = self.triage(active_path, compact=compact)
+                        if neutral and res.get("success"):
+                            from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
+                            mapper = orch.token_mapper
+                            data_obj = res.get("data")
+                            if isinstance(data_obj, dict):
+                                for fn in data_obj.get("functions", []):
+                                    if isinstance(fn, dict) and fn.get("name"):
+                                        cat = classify_token(fn["name"])
+                                        if cat != TokenCategory.GENERAL:
+                                            mapper.sanitize_symbol(fn["name"], category=cat)
+                            res["data"] = _neutralize_data_recursive(res.get("data", {}), mapper)
+                            res["codebook"] = mapper.export_codebook()
+                            res["telemetry"] = {
+                                "execution_time_seconds": res.get("execution_time_seconds", 0.0),
+                                "target_type": orch.target_type.value,
+                                "active_component": comp.archive_relpath if comp else None,
+                            }
+                        elif not neutral:
+                            res.pop("codebook", None)
+                        return res
+                finally:
+                    self._in_orchestration = prev_in_orch
+                    _ORCHESTRATION_CONTEXT.active = prev_ctx
 
             if tool_name == "rvs_info":
                 return self.info(file, compact=compact)
@@ -5662,6 +6266,12 @@ def main() -> None:
     explicit_mode: Optional[OutputMode] = None
     limit_val: Optional[int] = None
     offset_val: int = 0
+    abi_val: Optional[str] = None
+    neutral_flag: bool = False
+    comp_type_val: Optional[str] = None
+    filter_val: Optional[str] = None
+    min_len_val: Optional[int] = None
+    detail_val: bool = False
     cleaned_args: List[str] = []
 
     idx = 0
@@ -5719,6 +6329,49 @@ def main() -> None:
             except ValueError:
                 pass
             idx += 1
+        elif arg == "--abi" and idx + 1 < len(args):
+            abi_val = args[idx + 1]
+            idx += 2
+        elif arg.startswith("--abi="):
+            abi_val = arg.split("=", 1)[1]
+            idx += 1
+        elif arg == "--neutral":
+            neutral_flag = True
+            idx += 1
+        elif arg.startswith("--neutral="):
+            v = arg.split("=", 1)[1].lower()
+            neutral_flag = v in ("true", "1", "yes", "t")
+            idx += 1
+        elif arg == "--no-neutral":
+            neutral_flag = False
+            idx += 1
+        elif arg in ("--component-type", "--comp-type") and idx + 1 < len(args):
+            comp_type_val = args[idx + 1]
+            idx += 2
+        elif arg.startswith("--component-type=") or arg.startswith("--comp-type="):
+            comp_type_val = arg.split("=", 1)[1]
+            idx += 1
+        elif arg == "--filter" and idx + 1 < len(args):
+            filter_val = args[idx + 1]
+            idx += 2
+        elif arg.startswith("--filter="):
+            filter_val = arg.split("=", 1)[1]
+            idx += 1
+        elif arg == "--min-len" and idx + 1 < len(args):
+            try:
+                min_len_val = int(args[idx + 1])
+            except ValueError:
+                pass
+            idx += 2
+        elif arg.startswith("--min-len="):
+            try:
+                min_len_val = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+            idx += 1
+        elif arg == "--detail":
+            detail_val = True
+            idx += 1
         else:
             cleaned_args.append(arg)
             idx += 1
@@ -5731,6 +6384,97 @@ def main() -> None:
         if a in ("-f", "--file") and i + 1 < len(cleaned_args):
             target_str = cleaned_args[i + 1]
             break
+        elif a.startswith("-f="):
+            target_str = a.split("=", 1)[1]
+            break
+        elif a.startswith("--file="):
+            target_str = a.split("=", 1)[1]
+            break
+
+    is_apk = _is_apk_target(target_str)
+    is_dex = _is_dex_target(target_str)
+
+    needs_orchestration = (is_apk or is_dex or neutral_flag or abi_val is not None or comp_type_val is not None)
+
+    if needs_orchestration:
+        # Extract command tokens from cleaned_args
+        cmd_tokens: List[str] = []
+        skip_next = False
+        for i, a in enumerate(cleaned_args):
+            if skip_next:
+                skip_next = False
+                continue
+            if a in ("-f", "--file"):
+                skip_next = True
+                continue
+            if a.startswith("-f=") or a.startswith("--file="):
+                continue
+            if a in ("-c", "--compact"):
+                continue
+            if a == "--format":
+                skip_next = True
+                continue
+            if a.startswith("--format="):
+                continue
+            cmd_tokens.append(a)
+
+        tool_name = "rvs_info"
+        tool_args: Dict[str, Any] = {
+            "file": target_str,
+            "compact": (explicit_mode != "full"),
+        }
+        if abi_val:
+            tool_args["abi"] = abi_val
+        if neutral_flag:
+            tool_args["neutral"] = neutral_flag
+        if comp_type_val:
+            tool_args["component_type"] = comp_type_val
+        if limit_val is not None:
+            tool_args["limit"] = limit_val
+        if offset_val > 0:
+            tool_args["offset"] = offset_val
+        if filter_val:
+            tool_args["filter"] = filter_val
+        if min_len_val is not None:
+            tool_args["min_len"] = min_len_val
+        if detail_val:
+            tool_args["detail"] = detail_val
+
+        if not cmd_tokens or cmd_tokens[0] == "info":
+            tool_name = "rvs_info"
+        elif cmd_tokens[0] == "functions" or (cmd_tokens[0] == "analyze" and len(cmd_tokens) > 1 and cmd_tokens[1] == "functions"):
+            tool_name = "rvs_functions"
+        elif cmd_tokens[0] in ("disasm", "blocks") or (cmd_tokens[0] == "analyze" and len(cmd_tokens) > 1 and cmd_tokens[1] == "blocks"):
+            tool_name = "rvs_disasm"
+            target_fn = cmd_tokens[-1] if len(cmd_tokens) > 1 and cmd_tokens[-1] not in ("disasm", "blocks", "analyze") else None
+            if target_fn:
+                tool_args["target"] = target_fn
+        elif cmd_tokens[0] == "decompile" or (cmd_tokens[0] == "agent" and len(cmd_tokens) > 1 and cmd_tokens[1] == "decompile"):
+            tool_name = "rvs_decompile"
+            target_fn = cmd_tokens[-1] if len(cmd_tokens) > 1 and cmd_tokens[-1] not in ("decompile", "agent") else None
+            if target_fn:
+                tool_args["function"] = target_fn
+        elif cmd_tokens[0] == "flow" or (cmd_tokens[0] == "agent" and len(cmd_tokens) > 1 and cmd_tokens[1] == "flow"):
+            tool_name = "rvs_flow"
+            target_fn = cmd_tokens[-1] if len(cmd_tokens) > 1 and cmd_tokens[-1] not in ("flow", "agent") else None
+            if target_fn:
+                tool_args["function"] = target_fn
+        elif cmd_tokens[0] == "xrefs" or (cmd_tokens[0] == "analyze" and len(cmd_tokens) > 1 and cmd_tokens[1] == "xrefs"):
+            tool_name = "rvs_xrefs"
+            target_sym = cmd_tokens[-1] if len(cmd_tokens) > 1 and cmd_tokens[-1] not in ("xrefs", "analyze") else None
+            if target_sym:
+                tool_args["target"] = target_sym
+        elif cmd_tokens[0] == "strings":
+            tool_name = "rvs_strings"
+        elif cmd_tokens[0] == "symbols":
+            tool_name = "rvs_symbols"
+        elif cmd_tokens[0] == "triage" or (cmd_tokens[0] == "agent" and len(cmd_tokens) > 1 and cmd_tokens[1] == "triage"):
+            tool_name = "rvs_agent_triage"
+
+        harness = RvsHarness(rvs_bin=rvs_bin, default_timeout=timeout)
+        resp = harness.execute_tool(tool_name, tool_args)
+        print(json.dumps(resp))
+        sys.exit(EXIT_SUCCESS if resp.get("success") else (resp.get("error", {}).get("exit_code") or EXIT_ANALYSIS_ERROR))
 
     code, stdout, stderr, duration = execute_rvs_subprocess(
         cleaned_args,

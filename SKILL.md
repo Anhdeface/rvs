@@ -228,6 +228,9 @@ Inspect binary file metadata, architecture, bitness, endianness, OS, entry point
 **Parameters:**
 - `file` (`string`, **required**): Path to the target binary executable.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_functions`
 List analyzed functions in the binary with memory offsets, sizes, signatures, and cyclomatic complexity.
@@ -239,6 +242,9 @@ List analyzed functions in the binary with memory offsets, sizes, signatures, an
 - `limit` (`integer`, optional): Maximum number of functions to return (for token budget management).
 - `offset` (`integer`, optional): Pagination offset index into the function list.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_disasm`
 Extract basic blocks and disassembled machine instructions for a specific function or address, including jump/fail control flow targets.
@@ -249,6 +255,9 @@ Extract basic blocks and disassembled machine instructions for a specific functi
 - `disasm` (`boolean`, optional): Include disassembled instructions inside each basic block. Defaults to true.
 - `max_instructions` (`integer`, optional): Maximum number of instructions to disassemble (truncation limit).
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_decompile`
 Generate high-level pseudo-C decompilation for a function, along with call graph targets, referenced strings, and structural metrics.
@@ -257,6 +266,9 @@ Generate high-level pseudo-C decompilation for a function, along with call graph
 - `file` (`string`, **required**): Path to the target binary executable.
 - `function` (`string`, **required**): Target function name (e.g. 'main') or virtual address (e.g. '0x11e0').
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_flow`
 Analyze control flow decision gates, condition/branch instructions (e.g. jz, jne, cmp), jump/fail targets, and loop back-edges for a function.
@@ -265,6 +277,9 @@ Analyze control flow decision gates, condition/branch instructions (e.g. jz, jne
 - `file` (`string`, **required**): Path to the target binary executable.
 - `function` (`string`, **required**): Target function name or virtual memory address.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_xrefs`
 Extract cross-references (callers, callees, code references, data references, string references) to and/or from a symbol or address.
@@ -276,6 +291,9 @@ Extract cross-references (callers, callees, code references, data references, st
 - `kind` (`string`, optional): Optional filter by reference kind. (allowed: `['call', 'code', 'data', 'string', 'read', 'write']`)
 - `limit` (`integer`, optional): Maximum number of cross-references to return.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_strings`
 Extract ASCII and UTF-8 strings from binary data and text sections with virtual memory addresses.
@@ -286,6 +304,9 @@ Extract ASCII and UTF-8 strings from binary data and text sections with virtual 
 - `filter` (`string`, optional): Optional substring filter to match specific strings (e.g. 'flag', 'pass', 'key').
 - `limit` (`integer`, optional): Maximum number of strings to return.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_symbols`
 List binary symbols, PLT imports, exported symbols, bindings, and virtual addresses.
@@ -296,6 +317,9 @@ List binary symbols, PLT imports, exported symbols, bindings, and virtual addres
 - `limit` (`integer`, optional): Maximum number of symbols to return. Defaults to 50.
 - `offset` (`integer`, optional): Starting index offset for pagination. Defaults to 0.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_agent_triage`
 Perform full autonomous binary reconnaissance: security mitigations, top complex functions, interesting strings, and actionable RE next steps.
@@ -303,6 +327,9 @@ Perform full autonomous binary reconnaissance: security mitigations, top complex
 **Parameters:**
 - `file` (`string`, **required**): Path to the binary file to triage.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+- `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 ---
 
