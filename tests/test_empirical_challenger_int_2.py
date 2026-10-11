@@ -105,6 +105,11 @@ class BaseChallengerFixture(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        for d in glob.glob("/tmp/rvs_target_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
         cls.temp_dir_obj = tempfile.TemporaryDirectory(prefix="rvs_challenger2_")
         cls.temp_dir = Path(cls.temp_dir_obj.name)
         cls.apk_path = cls.temp_dir / "challenger_multi.apk"
@@ -120,6 +125,11 @@ class BaseChallengerFixture(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir_obj.cleanup()
+        for d in glob.glob("/tmp/rvs_target_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -501,6 +511,20 @@ class TestEmpiricalSchemaValidationAndSkillSync(unittest.TestCase):
 
 class TestEmpiricalMemoryAndFdLeakStability(BaseChallengerFixture):
     """Stress Test 4: Memory and file descriptor leak checks."""
+
+    def setUp(self) -> None:
+        for d in glob.glob("/tmp/rvs_target_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+    def tearDown(self) -> None:
+        for d in glob.glob("/tmp/rvs_target_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
     def test_fd_leak_repeated_apk_queries(self) -> None:
         """Assert file descriptors remain strictly stable across 50 repeated queries on APK."""

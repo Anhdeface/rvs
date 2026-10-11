@@ -226,9 +226,19 @@ class TestHighThroughputQueryingAndConcurrency(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir_obj = tempfile.TemporaryDirectory()
         self.work_dir = Path(self.temp_dir_obj.name)
+        for d in glob.glob("/tmp/rvs_target_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
     def tearDown(self) -> None:
         self.temp_dir_obj.cleanup()
+        for d in glob.glob("/tmp/rvs_target_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
     def test_high_throughput_sequential_burst(self) -> None:
         """

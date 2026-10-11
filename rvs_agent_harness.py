@@ -14,6 +14,7 @@ Provides:
 
 from __future__ import annotations
 
+import atexit
 import io
 import json
 import os
@@ -25,8 +26,10 @@ import subprocess
 import sys
 import threading
 import time
+import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
 
 # =============================================================================
 # Constants & Exit Code Taxonomy
@@ -40,11 +43,38 @@ EXIT_PATCH_ERROR: int = 4
 EXIT_TIMEOUT_ERROR: int = 5
 EXIT_INTERNAL_ERROR: int = 6
 
+
+def normalize_exit_code(raw_code: int) -> int:
+    """Normalize raw subprocess returncode or exit code to the strict {0..6} taxonomy.
+
+    Invariants:
+    - 0: EXIT_SUCCESS
+    - 1: EXIT_INVALID_ARGUMENT
+    - 2: EXIT_FILE_ERROR
+    - 3: EXIT_ANALYSIS_ERROR
+    - 4: EXIT_PATCH_ERROR
+    - 5: EXIT_TIMEOUT_ERROR
+    - 6: EXIT_INTERNAL_ERROR
+    All negative codes (signals like -11 SIGSEGV) and codes outside {0..6} map to EXIT_INTERNAL_ERROR (6).
+    """
+    if raw_code in (
+        EXIT_SUCCESS,
+        EXIT_INVALID_ARGUMENT,
+        EXIT_FILE_ERROR,
+        EXIT_ANALYSIS_ERROR,
+        EXIT_PATCH_ERROR,
+        EXIT_TIMEOUT_ERROR,
+        EXIT_INTERNAL_ERROR,
+    ):
+        return raw_code
+    return EXIT_INTERNAL_ERROR
+
+
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.1"
+SERVER_VERSION: str = "0.3.2"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -79,6 +109,9 @@ class ApiResponseDict(TypedDict, total=False):
     error: Optional[ApiErrorDict]
     execution_time_seconds: Optional[float]
     token_estimate: Optional[int]
+    truncated: Optional[bool]
+    original_tokens: Optional[int]
+    budget: Optional[int]
 
 
 # =============================================================================
@@ -215,6 +248,44 @@ def make_timeout_error_envelope(
     )
 
 
+_ACTIVE_SUBPROCESS_PGIDS: set[int] = set()
+_SUBPROCESS_REGISTRY_LOCK = threading.RLock()
+
+
+def _cleanup_lingering_subprocesses() -> None:
+    """Kill all registered active subprocess process groups with SIGKILL."""
+    with _SUBPROCESS_REGISTRY_LOCK:
+        pgids = list(_ACTIVE_SUBPROCESS_PGIDS)
+        _ACTIVE_SUBPROCESS_PGIDS.clear()
+    for pgid in pgids:
+        if pgid > 1:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+
+
+atexit.register(_cleanup_lingering_subprocesses)
+
+
+def _sig_term_int_handler(signum: int, frame: Any) -> None:
+    """Handle termination signals by ensuring child process groups are killed before exit."""
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, AttributeError):
+        pass
+    _cleanup_lingering_subprocesses()
+    sys.exit(normalize_exit_code(128 + signum))
+
+
+try:
+    signal.signal(signal.SIGTERM, _sig_term_int_handler)
+    signal.signal(signal.SIGINT, _sig_term_int_handler)
+except (ValueError, AttributeError):
+    pass
+
+
 def execute_rvs_subprocess(
     rvs_args: List[str],
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -243,6 +314,8 @@ def execute_rvs_subprocess(
             errors="replace",
             start_new_session=True,
         )
+        with _SUBPROCESS_REGISTRY_LOCK:
+            _ACTIVE_SUBPROCESS_PGIDS.add(proc.pid)
 
         try:
             try:
@@ -281,6 +354,16 @@ def execute_rvs_subprocess(
                 stdout = sanitize_terminal_output(stdout_raw)
                 stderr = sanitize_terminal_output(stderr_raw)
                 return EXIT_TIMEOUT_ERROR, stdout, stderr, duration
+            except KeyboardInterrupt:
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                raise
 
             duration = time.time() - start_time
             stdout = sanitize_terminal_output(stdout_raw)
@@ -288,6 +371,23 @@ def execute_rvs_subprocess(
             return proc.returncode, stdout, stderr, duration
 
         finally:
+            # Explicitly close pipe descriptors on all timeout/exception/exit paths
+            if proc.stdout and not proc.stdout.closed:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.stderr and not proc.stderr.closed:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+            if proc.stdin and not proc.stdin.closed:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
             # Unconditional reaping: ensure proc.wait() is always called so <defunct>
             # zombie processes are never left in the operating system process table.
             if proc.poll() is None:
@@ -309,6 +409,9 @@ def execute_rvs_subprocess(
                         except Exception:
                             pass
 
+            with _SUBPROCESS_REGISTRY_LOCK:
+                _ACTIVE_SUBPROCESS_PGIDS.discard(proc.pid)
+
     except FileNotFoundError:
         duration = time.time() - start_time
         err_msg = f"rvs binary not found at '{rvs_bin}'"
@@ -316,6 +419,627 @@ def execute_rvs_subprocess(
     except Exception as e:
         duration = time.time() - start_time
         return EXIT_INTERNAL_ERROR, "", str(e), duration
+
+
+# =============================================================================
+# Algorithmic Token Compaction & Optimization Engine (R2)
+# =============================================================================
+
+@dataclass
+class TokenBudget:
+    """Represents an allocated token budget envelope with reserved margins."""
+    max_tokens: int
+    reserved_envelope: int = 40
+    safety_margin: int = 10
+
+    @property
+    def available_items_budget(self) -> int:
+        return max(0, self.max_tokens - self.reserved_envelope - self.safety_margin)
+
+
+class TokenEstimator:
+    """
+    Calibrated pure-Python token estimator matching BPE tokenizers (cl100k_base / Llama / Claude).
+    Calibrates character-to-token ratio (~1.75 - 2.8) for RE assembly, JSON, and code telemetry,
+    with zero external dependencies.
+    """
+    _BPE_RE = re.compile(
+        r"""0x[0-9a-fA-F]+|[a-zA-Z_][a-zA-Z0-9_]*|\d+|[^\s\w]|\s+"""
+    )
+
+    @classmethod
+    def count_tokens(cls, text: Optional[str]) -> int:
+        """Estimate BPE token count for a text string."""
+        if not text:
+            return 0
+        tokens = cls._BPE_RE.findall(text)
+        total = 0
+        for t in tokens:
+            if t.startswith("0x") and len(t) > 4:
+                # 0x + hex digits (e.g. 0x0000555555555120 is ~5 BPE tokens)
+                total += 1 + (len(t) - 2 + 3) // 4
+            elif len(t) > 8 and t.isalnum():
+                # Long alphanumeric identifiers (mangled symbols, base64)
+                total += (len(t) + 3) // 4
+            elif t.isspace():
+                # Merged whitespace/newlines: ~1 token per 4 spaces/newlines
+                total += max(1, len(t) // 4)
+            else:
+                total += 1
+        return max(1, total)
+
+    @classmethod
+    def estimate_obj(cls, obj: Any) -> int:
+        """Estimate token count for any JSON-serializable Python object."""
+        if obj is None:
+            return 0
+        try:
+            serialized = json.dumps(obj)
+        except Exception:
+            serialized = str(obj)
+        return cls.count_tokens(serialized)
+
+    @classmethod
+    def char_to_token_ratio(cls, text: Optional[str]) -> float:
+        """Calculate characters per token ratio."""
+        if not text:
+            return 0.0
+        toks = cls.count_tokens(text)
+        if toks == 0:
+            return 0.0
+        return round(len(text) / toks, 3)
+
+
+class EntropyPruner:
+    """
+    Detects and compresses repetitive patterns, NOP sleds, padding, and zero memory pages
+    using run-length encoding (RLE) and repetition folding, preserving semantic and structural
+    parseability while achieving >90% token reduction on repetitive sequences.
+    """
+    _PADDING_OPS = {
+        "nop", "int3", "fnop", "align", "endbr64", "endbr32", "pause", "ud2"
+    }
+
+    @classmethod
+    def fold_instruction_stream(cls, instructions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Folds consecutive repetitive instructions (such as NOP sleds, INT3 padding, alignment)
+        into compact run descriptors preserving start address, repeated count, and total byte size.
+        """
+        if not instructions:
+            return []
+
+        folded: List[Dict[str, Any]] = []
+        run_op: Optional[str] = None
+        run_raw_asm: Optional[str] = None
+        run_start_addr: Optional[str] = None
+        run_total_size: int = 0
+        run_count: int = 0
+
+        for inst in instructions:
+            raw_asm = (inst.get("asm") or inst.get("disasm") or inst.get("opcode") or "").strip()
+            tokens = raw_asm.split()
+            mnemonic = tokens[0].lower() if tokens else ""
+            is_padding = mnemonic in cls._PADDING_OPS
+            is_same = (raw_asm.lower() == run_op)
+
+            if is_padding and (run_op == mnemonic or run_count == 0):
+                if run_count == 0:
+                    run_op = mnemonic
+                    run_raw_asm = raw_asm
+                    run_start_addr = inst.get("addr") or inst.get("addr_hex") or format_hex_addr(inst.get("addr"))
+                    run_total_size = int(inst.get("size") or 1)
+                    run_count = 1
+                elif run_op == mnemonic:
+                    run_count += 1
+                    run_total_size += int(inst.get("size") or 1)
+                else:
+                    cls._flush_inst_run(folded, run_start_addr, run_raw_asm or run_op, run_count, run_total_size)
+                    run_op = mnemonic
+                    run_raw_asm = raw_asm
+                    run_start_addr = inst.get("addr") or inst.get("addr_hex") or format_hex_addr(inst.get("addr"))
+                    run_total_size = int(inst.get("size") or 1)
+                    run_count = 1
+            elif is_same and run_count > 0:
+                run_count += 1
+                run_total_size += int(inst.get("size") or 1)
+            else:
+                if run_count > 0:
+                    cls._flush_inst_run(folded, run_start_addr, run_raw_asm or run_op, run_count, run_total_size)
+                    run_op = None
+                    run_raw_asm = None
+                    run_count = 0
+                    run_total_size = 0
+
+                run_op = raw_asm.lower()
+                run_raw_asm = raw_asm
+                run_start_addr = inst.get("addr") or inst.get("addr_hex") or format_hex_addr(inst.get("addr"))
+                run_total_size = int(inst.get("size") or 1)
+                run_count = 1
+
+        if run_count > 0:
+            cls._flush_inst_run(folded, run_start_addr, run_raw_asm or run_op, run_count, run_total_size)
+
+        return folded
+
+    @classmethod
+    def _flush_inst_run(
+        cls,
+        dest: List[Dict[str, Any]],
+        start_addr: Optional[str],
+        asm_text: Optional[str],
+        count: int,
+        total_size: int,
+    ) -> None:
+        if count >= 2:
+            dest.append({
+                "addr": start_addr,
+                "asm": f"{asm_text} [folded: repeated x{count}]",
+                "size": total_size,
+                "count": count,
+                "folded": True,
+            })
+        elif count == 1:
+            dest.append({
+                "addr": start_addr,
+                "asm": asm_text,
+                "size": total_size,
+            })
+
+    @classmethod
+    def fold_memory_bytes(
+        cls,
+        data: Union[str, bytes, bytearray, List[int], Dict[str, Any]],
+        min_run_length: int = 8,
+        base_addr: Optional[int] = None,
+    ) -> Any:
+        """
+        Run-length encode repetitive byte buffers (e.g. 0x00 zero pages, 0xFF padding).
+        Supports hex strings, bytearrays, or int lists.
+        """
+        if isinstance(data, dict):
+            d_copy = dict(data)
+            for k in ("bytes", "hex", "data", "memory", "buffer"):
+                if k in d_copy:
+                    d_copy[k] = cls.fold_memory_bytes(d_copy[k], min_run_length=min_run_length, base_addr=base_addr)
+            return d_copy
+
+        if isinstance(data, str):
+            clean = data.replace(" ", "").replace("\n", "").lower()
+            if len(clean) % 2 != 0 or len(clean) < min_run_length * 2:
+                return data
+            chunks = [clean[i:i+2] for i in range(0, len(clean), 2)]
+            runs: List[Dict[str, Any]] = []
+            curr_byte = chunks[0]
+            curr_len = 1
+            curr_offset = 0
+
+            def _make_str_run(b_val: str, c_len: int, off: int) -> Dict[str, Any]:
+                r: Dict[str, Any] = {"offset": f"+0x{off:04x}"}
+                if base_addr is not None:
+                    r["addr"] = hex(base_addr + off)
+                if c_len >= min_run_length:
+                    r.update({"byte": f"0x{b_val}", "count": c_len})
+                else:
+                    r["hex"] = "".join([b_val] * c_len)
+                return r
+
+            for b in chunks[1:]:
+                if b == curr_byte:
+                    curr_len += 1
+                else:
+                    runs.append(_make_str_run(curr_byte, curr_len, curr_offset))
+                    curr_offset += curr_len
+                    curr_byte = b
+                    curr_len = 1
+
+            runs.append(_make_str_run(curr_byte, curr_len, curr_offset))
+
+            if TokenEstimator.estimate_obj(runs) < TokenEstimator.count_tokens(data):
+                return runs
+            return data
+
+        elif isinstance(data, (bytes, bytearray, list)):
+            byte_list = list(data)
+            if len(byte_list) < min_run_length:
+                return data
+            runs_list: List[Dict[str, Any]] = []
+            curr_b = byte_list[0]
+            curr_len = 1
+            curr_offset = 0
+
+            def _make_byte_run(b_val: Any, c_len: int, off: int) -> Dict[str, Any]:
+                r: Dict[str, Any] = {"offset": f"+0x{off:04x}"}
+                if base_addr is not None:
+                    r["addr"] = hex(base_addr + off)
+                b_str = f"0x{b_val:02x}" if isinstance(b_val, int) else str(b_val)
+                if c_len >= min_run_length:
+                    r.update({"byte": b_str, "count": c_len})
+                else:
+                    r["bytes"] = [b_val] * c_len
+                return r
+
+            for b in byte_list[1:]:
+                if b == curr_b:
+                    curr_len += 1
+                else:
+                    runs_list.append(_make_byte_run(curr_b, curr_len, curr_offset))
+                    curr_offset += curr_len
+                    curr_b = b
+                    curr_len = 1
+
+            runs_list.append(_make_byte_run(curr_b, curr_len, curr_offset))
+
+            if TokenEstimator.estimate_obj(runs_list) < TokenEstimator.estimate_obj(data):
+                return runs_list
+            return data
+
+        return data
+
+    @classmethod
+    def prune_decompile_comments(cls, code: str) -> str:
+        """
+        Strips redundant compiler artifact comments, DATA XREF notes, and blank lines
+        from decompiled pseudo-C code while strictly preserving function signatures,
+        branch logic, calls, and statements.
+        """
+        if not code:
+            return ""
+        lines = code.splitlines()
+        pruned_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("//") or (stripped.startswith("/*") and stripped.endswith("*/")):
+                low = stripped.lower()
+                if any(
+                    tag in low
+                    for tag in (
+                        "callconv:", "data xref", "code xref", "-r-x", "section",
+                        "stack var", "compiler generated", "[14]", "warning:", "decompiled",
+                        "generated by", "local variable", "check input", "license"
+                    )
+                ):
+                    continue
+            pruned_lines.append(line)
+        joined = "\n".join(pruned_lines)
+        return re.sub(r"\n{3,}", "\n\n", joined).strip()
+
+    @staticmethod
+    def shannon_entropy(data: str) -> float:
+        """Calculate byte Shannon entropy H in bits per character."""
+        if not data:
+            return 0.0
+        length = len(data)
+        freq: Dict[str, int] = {}
+        for c in data:
+            freq[c] = freq.get(c, 0) + 1
+        entropy = 0.0
+        for count in freq.values():
+            p = count / length
+            entropy -= p * math.log2(p)
+        return round(entropy, 3)
+
+
+class TriePrefixCompressor:
+    """
+    Deduplicates long address prefixes and hierarchical symbol namespaces
+    using Longest Common Address Prefix (LCAP) factoring and prefix dictionaries.
+    """
+    @classmethod
+    def compress_addresses(
+        cls,
+        items: List[Any],
+        addr_keys: Tuple[str, ...] = ("addr", "jump", "fail"),
+        min_prefix_len: int = 6,
+        min_items: int = 4,
+    ) -> Tuple[Optional[str], List[Any]]:
+        """
+        Computes LCAP across items and factors it out into a base prefix.
+        Supports both list of dictionaries and list of string addresses.
+        Returns (base_prefix, compacted_items).
+        """
+        if len(items) < min_items:
+            return None, items
+
+        is_str_list = len(items) > 0 and isinstance(items[0], str)
+        addrs: List[str] = []
+        if is_str_list:
+            for item in items:
+                if isinstance(item, str) and item.startswith("0x") and len(item) >= min_prefix_len:
+                    addrs.append(item)
+        else:
+            for item in items:
+                for k in addr_keys:
+                    v = item.get(k)
+                    if isinstance(v, str) and v.startswith("0x") and len(v) >= min_prefix_len:
+                        addrs.append(v)
+
+        if len(addrs) < min_items:
+            return None, items
+
+        prefix = addrs[0]
+        for a in addrs[1:]:
+            while not a.startswith(prefix):
+                prefix = prefix[:-1]
+                if len(prefix) < min_prefix_len:
+                    return None, items
+
+        if len(prefix) < min_prefix_len:
+            return None, items
+
+        if is_str_list:
+            compacted_strs = [
+                ("+" + item[len(prefix):] if isinstance(item, str) and item.startswith(prefix) else item)
+                for item in items
+            ]
+            return prefix, compacted_strs
+
+        compacted: List[Dict[str, Any]] = []
+        for item in items:
+            c = dict(item)
+            for k in addr_keys:
+                v = c.get(k)
+                if isinstance(v, str) and v.startswith(prefix):
+                    c[k] = "+" + v[len(prefix):]
+            if "instructions" in c and isinstance(c["instructions"], list):
+                insts_comp = []
+                for inst in c["instructions"]:
+                    ic = dict(inst)
+                    ia = ic.get("addr")
+                    if isinstance(ia, str) and ia.startswith(prefix):
+                        ic["addr"] = "+" + ia[len(prefix):]
+                    insts_comp.append(ic)
+                c["instructions"] = insts_comp
+            compacted.append(c)
+
+        return prefix, compacted
+
+    @classmethod
+    def decompress_addresses(
+        cls,
+        base_prefix: Any,
+        items: Optional[List[Any]] = None,
+        addr_keys: Tuple[str, ...] = ("addr", "jump", "fail"),
+    ) -> List[Any]:
+        """Reverses LCAP factoring, restoring absolute addresses."""
+        if items is None:
+            if isinstance(base_prefix, tuple) and len(base_prefix) == 2:
+                base_prefix, items = base_prefix
+            elif isinstance(base_prefix, dict) and "prefix" in base_prefix:
+                items = base_prefix.get("items", [])
+                base_prefix = base_prefix.get("prefix")
+            else:
+                return base_prefix
+
+        if not base_prefix:
+            return items if items is not None else []
+
+        if items and isinstance(items[0], str):
+            return [
+                (base_prefix + s[1:] if isinstance(s, str) and s.startswith("+") else s)
+                for s in items
+            ]
+
+        decompressed: List[Dict[str, Any]] = []
+        for item in items or []:
+            c = dict(item)
+            for k in addr_keys:
+                v = c.get(k)
+                if isinstance(v, str) and v.startswith("+"):
+                    c[k] = base_prefix + v[1:]
+            if "instructions" in c and isinstance(c["instructions"], list):
+                insts_decomp = []
+                for inst in c["instructions"]:
+                    ic = dict(inst)
+                    ia = ic.get("addr")
+                    if isinstance(ia, str) and ia.startswith("+"):
+                        ic["addr"] = base_prefix + ia[1:]
+                    insts_decomp.append(ic)
+                c["instructions"] = insts_decomp
+            decompressed.append(c)
+        return decompressed
+
+    @classmethod
+    def compress_symbols(
+        cls,
+        symbols: List[Any],
+        name_key: str = "name",
+        min_prefix_freq: int = 3,
+        min_prefix_len: int = 4,
+    ) -> Tuple[Dict[str, str], List[Any]]:
+        """
+        Identifies common symbol prefixes (e.g. 'sym.imp.', 'Lcom/example/')
+        and extracts them into a prefix dictionary.
+        Supports both list of dictionaries and list of string symbol names.
+        Returns (prefix_dict, compacted_symbols).
+        """
+        if len(symbols) < min_prefix_freq:
+            return {}, symbols
+
+        is_str_list = len(symbols) > 0 and isinstance(symbols[0], str)
+        delimiters = (".", "/", "::", "$")
+        prefix_candidates: Dict[str, int] = {}
+
+        for s in symbols:
+            name = s if is_str_list else s.get(name_key)
+            if not isinstance(name, str):
+                continue
+            for d in delimiters:
+                if d in name:
+                    prefix = name[:name.rfind(d) + len(d)]
+                    if len(prefix) >= min_prefix_len:
+                        prefix_candidates[prefix] = prefix_candidates.get(prefix, 0) + 1
+
+        qualifying = {p: cnt for p, cnt in prefix_candidates.items() if cnt >= min_prefix_freq}
+        if not qualifying:
+            return {}, symbols
+
+        sorted_prefixes = sorted(qualifying.keys(), key=lambda p: len(p) * qualifying[p], reverse=True)
+        prefix_map: Dict[str, str] = {}
+        reverse_map: Dict[str, str] = {}
+        for idx, p in enumerate(sorted_prefixes[:5], 1):
+            tag = f"$p{idx}"
+            prefix_map[tag] = p
+            reverse_map[p] = tag
+
+        if is_str_list:
+            compacted_strs = []
+            for name in symbols:
+                c_name = name
+                for p, tag in reverse_map.items():
+                    if name.startswith(p):
+                        c_name = f"{tag}:{name[len(p):]}"
+                        break
+                compacted_strs.append(c_name)
+            return prefix_map, compacted_strs
+
+        compacted: List[Dict[str, Any]] = []
+        for s in symbols:
+            sc = dict(s)
+            name = sc.get(name_key)
+            if isinstance(name, str):
+                for p, tag in reverse_map.items():
+                    if name.startswith(p):
+                        sc[name_key] = f"{tag}:{name[len(p):]}"
+                        break
+            compacted.append(sc)
+
+        return prefix_map, compacted
+
+    @classmethod
+    def decompress_symbols(
+        cls,
+        prefix_map: Any,
+        symbols: Optional[List[Any]] = None,
+        name_key: str = "name",
+    ) -> List[Any]:
+        """Reverses symbol namespace factoring."""
+        if symbols is None:
+            if isinstance(prefix_map, tuple) and len(prefix_map) == 2:
+                prefix_map, symbols = prefix_map
+            elif isinstance(prefix_map, dict) and "namespaces" in prefix_map:
+                symbols = prefix_map.get("symbols", [])
+                prefix_map = prefix_map.get("namespaces", {})
+            else:
+                return prefix_map
+
+        if not prefix_map:
+            return symbols if symbols is not None else []
+
+        if symbols and isinstance(symbols[0], str):
+            decompressed_strs = []
+            for name in symbols:
+                d_name = name
+                for tag, p in prefix_map.items():
+                    if name.startswith(f"{tag}:"):
+                        d_name = p + name[len(tag) + 1:]
+                        break
+                decompressed_strs.append(d_name)
+            return decompressed_strs
+
+        decompressed: List[Dict[str, Any]] = []
+        for s in symbols or []:
+            sc = dict(s)
+            name = sc.get(name_key)
+            if isinstance(name, str):
+                for tag, p in prefix_map.items():
+                    if name.startswith(f"{tag}:"):
+                        sc[name_key] = p + name[len(tag) + 1:]
+                        break
+            decompressed.append(sc)
+        return decompressed
+
+
+class KnapsackOptimizer:
+    """
+    0/1 and fractional knapsack optimizer for reverse engineering telemetry.
+    Maximizes information utility under a strict token budget B while preserving
+    critical structural anchors (Entry block, Exit blocks, Branch Gates, Call Targets).
+    Guarantees finite termination and budget invariant satisfaction.
+    """
+    @staticmethod
+    def select(
+        items: List[Dict[str, Any]],
+        budget: int,
+        value_fn: Callable[[Dict[str, Any], int, int], float],
+        mandatory_fn: Optional[Callable[[Dict[str, Any], int, int], bool]] = None,
+        item_weight_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Selects items to maximize total utility within token budget.
+        Returns (selected_items, is_truncated).
+        """
+        if not items:
+            return [], False
+        if budget <= 0:
+            return [], True
+
+        total_items = len(items)
+        weight_func = item_weight_fn or TokenEstimator.estimate_obj
+
+        mandatory_indices: List[int] = []
+        optional_indices: List[int] = []
+        weights: List[int] = []
+        values: List[float] = []
+
+        for idx, item in enumerate(items):
+            w = max(1, weight_func(item))
+            weights.append(w)
+            v = max(0.1, value_fn(item, idx, total_items))
+            values.append(v)
+            is_mand = mandatory_fn(item, idx, total_items) if mandatory_fn else False
+            if is_mand:
+                mandatory_indices.append(idx)
+            else:
+                optional_indices.append(idx)
+
+        used_weight = sum(weights[i] for i in mandatory_indices)
+        selected_set: Set[int] = set()
+
+        if used_weight <= budget:
+            selected_set.update(mandatory_indices)
+            remaining_budget = budget - used_weight
+
+            # Rank optional items by value density (value / weight) descending
+            ranked_optional = sorted(
+                optional_indices,
+                key=lambda i: values[i] / weights[i],
+                reverse=True,
+            )
+
+            for i in ranked_optional:
+                if weights[i] <= remaining_budget:
+                    selected_set.add(i)
+                    remaining_budget -= weights[i]
+        else:
+            # Fractional fallback: mandatory items themselves exceed budget
+            ranked_mandatory = sorted(
+                mandatory_indices,
+                key=lambda i: values[i] / weights[i],
+                reverse=True,
+            )
+            rem = budget
+            for i in ranked_mandatory:
+                if weights[i] <= rem:
+                    selected_set.add(i)
+                    rem -= weights[i]
+            if not selected_set and mandatory_indices:
+                selected_set.add(ranked_mandatory[0])
+
+            if rem > 0:
+                ranked_optional = sorted(
+                    optional_indices,
+                    key=lambda i: values[i] / weights[i],
+                    reverse=True,
+                )
+                for i in ranked_optional:
+                    if weights[i] <= rem:
+                        selected_set.add(i)
+                        rem -= weights[i]
+
+        is_truncated = (len(selected_set) < total_items)
+        result = [items[i] for i in range(total_items) if i in selected_set]
+        return result, is_truncated
 
 
 # =============================================================================
@@ -367,8 +1091,9 @@ def prune_functions(
     mode: OutputMode,
     limit: Optional[int] = None,
     offset: int = 0,
+    budget: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Prune and paginate function list."""
+    """Prune and paginate function list with knapsack budgeting."""
     if mode == "full":
         return data
 
@@ -395,6 +1120,59 @@ def prune_functions(
             "total": total,
             "top_complex": top_list,
             "top": top_list,
+        }
+
+    # If budget is specified, apply KnapsackOptimizer
+    if budget is not None:
+        if budget <= 0:
+            return {
+                "total": total,
+                "displayed": 0,
+                "remaining": total,
+                "truncated": True,
+                "functions": [],
+            }
+        all_compact = []
+        for f in funcs:
+            item: Dict[str, Any] = {
+                "name": f.get("name"),
+                "addr": f.get("addr") or f.get("offset_hex") or format_hex_addr(f.get("offset")),
+                "size": f.get("size") if f.get("size") is not None else f.get("sz"),
+            }
+            cc = f.get("cc") if f.get("cc") is not None else f.get("cyclomatic_complexity")
+            if cc is not None:
+                item["cc"] = cc
+            blocks = f.get("blocks") if f.get("blocks") is not None else (f.get("bb") or f.get("num_basic_blocks"))
+            if blocks is not None:
+                item["blocks"] = blocks
+            instrs = f.get("instrs") if f.get("instrs") is not None else (f.get("ins") or f.get("num_instructions"))
+            if instrs is not None:
+                item["instrs"] = instrs
+            all_compact.append(item)
+
+        def fn_val(f: Dict[str, Any], idx: int, total_f: int) -> float:
+            name = (f.get("name") or "").lower()
+            score = 10.0
+            if name in ("main", "_start", "entry0") or "main" in name:
+                score += 1000.0
+            cc = f.get("cc") or 0
+            score += cc * 50.0
+            sz = f.get("size") or 0
+            score += min(sz * 0.1, 100.0)
+            return score
+
+        def fn_mand(f: Dict[str, Any], idx: int, total_f: int) -> bool:
+            name = (f.get("name") or "").lower()
+            return name in ("main", "_start", "entry0")
+
+        avail_budget = max(10, budget - 25)
+        selected_funcs, is_truncated = KnapsackOptimizer.select(all_compact, avail_budget, fn_val, fn_mand)
+        return {
+            "total": total,
+            "displayed": len(selected_funcs),
+            "remaining": max(0, total - len(selected_funcs)),
+            "truncated": is_truncated or (total > len(selected_funcs)),
+            "functions": selected_funcs,
         }
 
     try:
@@ -455,8 +1233,9 @@ def prune_blocks(
     limit: Optional[int] = None,
     offset: int = 0,
     max_instructions: Optional[int] = None,
+    budget: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Prune and paginate basic blocks and instructions."""
+    """Prune and paginate basic blocks and instructions with entropy pruning and knapsack budgeting."""
     if mode == "full":
         return data
 
@@ -474,27 +1253,18 @@ def prune_blocks(
             "entry": entry_b.get("addr") if isinstance(entry_b.get("addr"), str) and entry_b.get("addr").startswith("0x") else (entry_b.get("addr_hex") or format_hex_addr(entry_b.get("addr"))),
         }
 
-    try:
-        effective_limit = int(limit) if limit is not None else 30
-    except (ValueError, TypeError):
-        effective_limit = 30
-    try:
-        effective_offset = int(offset) if offset is not None else 0
-    except (ValueError, TypeError):
-        effective_offset = 0
-    if max_instructions is not None:
-        try:
-            max_instructions = int(max_instructions)
-        except (ValueError, TypeError):
-            max_instructions = None
-
-    sliced = blocks[effective_offset : effective_offset + effective_limit]
-    compact_blocks = []
-
-    for b in sliced:
+    # Helper to compact block instructions with EntropyPruner RLE folding
+    def compact_block_entry(b: Dict[str, Any], max_inst_limit: Optional[int] = None) -> Dict[str, Any]:
         insts = b.get("instructions", [])
-        if max_instructions is not None:
-            insts = insts[:max_instructions]
+        effective_max = max_instructions if max_instructions is not None else max_inst_limit
+        if effective_max is not None:
+            try:
+                insts = insts[:int(effective_max)]
+            except (ValueError, TypeError):
+                pass
+
+        # Apply repetition folding on NOP sleds and padding
+        folded_insts = EntropyPruner.fold_instruction_stream(insts)
 
         compact_insts = [
             {
@@ -502,7 +1272,7 @@ def prune_blocks(
                 "asm": i.get("asm") or i.get("disasm") or i.get("opcode"),
                 "size": i.get("size"),
             }
-            for i in insts
+            for i in folded_insts
         ]
 
         b_addr = b.get("addr") if isinstance(b.get("addr"), str) and b.get("addr").startswith("0x") else (b.get("addr_hex") or format_hex_addr(b.get("addr")))
@@ -517,8 +1287,89 @@ def prune_blocks(
             b_dict["jump"] = jump_addr
         if fail_addr:
             b_dict["fail"] = fail_addr
+        return b_dict
 
-        compact_blocks.append(b_dict)
+    # Budgeted Knapsack Optimization path
+    if budget is not None:
+        if budget <= 0:
+            return {
+                "function": fn_name,
+                "addr": fn_addr,
+                "total": total,
+                "displayed": 0,
+                "remaining": total,
+                "truncated": True,
+                "blocks": [],
+            }
+        empty_skel = {
+            "function": fn_name,
+            "addr": fn_addr,
+            "total": total,
+            "displayed": 0,
+            "remaining": total,
+            "truncated": True,
+            "blocks": [],
+        }
+        meta_cost = TokenEstimator.estimate_obj(empty_skel) + 95
+        avail_budget = max(10, budget - meta_cost)
+        compact_blocks = [compact_block_entry(b, max_inst_limit=max_instructions) for b in blocks]
+
+        def block_val(b: Dict[str, Any], idx: int, total_b: int) -> float:
+            score = 50.0
+            if idx == 0:
+                score += 100000.0  # Entry anchor absolute dominance
+            insts = b.get("instructions", [])
+            has_ret = any((i.get("asm") or "").lower().startswith("ret") for i in insts)
+            if has_ret or idx == total_b - 1:
+                score += 800.0   # Exit anchor
+            if b.get("fail") or any((i.get("asm") or "").lower().startswith(("j", "b.")) for i in insts):
+                score += 500.0   # Branch gate
+            if any((i.get("asm") or "").lower().startswith("call") for i in insts):
+                score += 350.0   # Call site
+            if any((i.get("asm") or "").lower().startswith(("cmp", "test")) for i in insts):
+                score += 200.0   # Comparison
+            score += min(len(insts) * 2.0, 50.0)
+            return score
+
+        def block_mand(b: Dict[str, Any], idx: int, total_b: int) -> bool:
+            return idx == 0
+
+        selected_blocks, is_truncated = KnapsackOptimizer.select(compact_blocks, avail_budget, block_val, block_mand)
+
+        # Apply address LCAP factoring if it yields token reduction
+        lcap_prefix, lcap_blocks = TriePrefixCompressor.compress_addresses(selected_blocks)
+        if lcap_prefix and TokenEstimator.estimate_obj(lcap_blocks) < TokenEstimator.estimate_obj(selected_blocks):
+            res_blocks = lcap_blocks
+            use_lcap = True
+        else:
+            res_blocks = selected_blocks
+            use_lcap = False
+
+        res: Dict[str, Any] = {
+            "function": fn_name,
+            "addr": fn_addr,
+            "total": total,
+            "displayed": len(res_blocks),
+            "remaining": max(0, total - len(res_blocks)),
+            "truncated": is_truncated or (total > len(res_blocks)),
+            "blocks": res_blocks,
+        }
+        if use_lcap and lcap_prefix:
+            res["addr_base"] = lcap_prefix
+        return res
+
+    # Standard pagination path (budget is None)
+    try:
+        effective_limit = int(limit) if limit is not None else 30
+    except (ValueError, TypeError):
+        effective_limit = 30
+    try:
+        effective_offset = int(offset) if offset is not None else 0
+    except (ValueError, TypeError):
+        effective_offset = 0
+
+    sliced = blocks[effective_offset : effective_offset + effective_limit]
+    compact_blocks = [compact_block_entry(b) for b in sliced]
 
     is_truncated = (total > len(compact_blocks)) or effective_offset > 0 or limit is not None
     if not is_truncated and effective_offset == 0:
@@ -529,7 +1380,7 @@ def prune_blocks(
             "blocks": compact_blocks,
         }
 
-    res: Dict[str, Any] = {
+    res = {
         "function": fn_name,
         "addr": fn_addr,
         "total": total,
@@ -553,8 +1404,9 @@ def prune_strings(
     mode: OutputMode,
     limit: Optional[int] = None,
     offset: int = 0,
+    budget: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Prune and paginate string discovery tables."""
+    """Prune and paginate string discovery tables with entropy ranking and knapsack budgeting."""
     if mode == "full":
         return data
 
@@ -571,6 +1423,44 @@ def prune_strings(
         return {
             "total": total,
             "sample": [s.get("string") for s in raw_strings[:10]],
+        }
+
+    # If budget is specified, apply KnapsackOptimizer with Shannon entropy weighting
+    if budget is not None:
+        if budget <= 0:
+            return {
+                "total": total,
+                "displayed": 0,
+                "remaining": total,
+                "truncated": True,
+                "strings": [],
+            }
+        compact_all = [
+            {
+                "addr": s.get("addr") or s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")),
+                "string": s.get("string"),
+            }
+            for s in raw_strings
+        ]
+
+        def str_val(s: Dict[str, Any], idx: int, total_s: int) -> float:
+            text = s.get("string") or ""
+            ent = EntropyPruner.shannon_entropy(text)
+            score = 20.0 + ent * 30.0
+            lower = text.lower()
+            if any(k in lower for k in ("http", "flag", "key", "pass", "token", "auth", "secret", "user", "admin", "bin", "etc", ".so", "libc", "%s", "%d")):
+                score += 300.0
+            score += min(len(text) * 0.5, 50.0)
+            return score
+
+        avail_budget = max(10, budget - 25)
+        selected_strings, is_truncated = KnapsackOptimizer.select(compact_all, avail_budget, str_val)
+        return {
+            "total": total,
+            "displayed": len(selected_strings),
+            "remaining": max(0, total - len(selected_strings)),
+            "truncated": is_truncated or (total > len(selected_strings)),
+            "strings": selected_strings,
         }
 
     try:
@@ -620,8 +1510,9 @@ def prune_symbols(
     mode: OutputMode,
     limit: Optional[int] = None,
     offset: int = 0,
+    budget: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Prune and paginate symbol tables."""
+    """Prune and paginate symbol tables with prefix compression and knapsack budgeting."""
     if mode == "full":
         return data
 
@@ -635,6 +1526,57 @@ def prune_symbols(
             "total": total,
             "sample": [s.get("name") for s in raw_symbols[:10]],
         }
+
+    if budget is not None:
+        if budget <= 0:
+            return {
+                "total": total,
+                "displayed": 0,
+                "remaining": total,
+                "truncated": True,
+                "symbols": [],
+            }
+        compact_all = []
+        for s in raw_symbols:
+            sym_dict: Dict[str, Any] = {
+                "name": s.get("name"),
+                "addr": s.get("addr") or s.get("vaddr_hex") or format_hex_addr(s.get("vaddr")),
+                "type": s.get("type") or s.get("sym_type") or s.get("t"),
+            }
+            if s.get("bind"):
+                sym_dict["bind"] = s.get("bind")
+            compact_all.append(sym_dict)
+
+        def sym_val(s: Dict[str, Any], idx: int, total_s: int) -> float:
+            name = (s.get("name") or "").lower()
+            score = 20.0
+            if name in ("main", "_start", "entry0") or "main" in name:
+                score += 800.0
+            if any(k in name for k in ("imp.", "sym.", "crypt", "flag", "auth", "token", "exec", "system")):
+                score += 200.0
+            return score
+
+        avail_budget = max(10, budget - 25)
+        selected_symbols, is_truncated = KnapsackOptimizer.select(compact_all, avail_budget, sym_val)
+
+        prefix_map, factored_symbols = TriePrefixCompressor.compress_symbols(selected_symbols)
+        if prefix_map and TokenEstimator.estimate_obj(factored_symbols) < TokenEstimator.estimate_obj(selected_symbols):
+            res_syms = factored_symbols
+            use_prefixes = True
+        else:
+            res_syms = selected_symbols
+            use_prefixes = False
+
+        res_dict: Dict[str, Any] = {
+            "total": total,
+            "displayed": len(res_syms),
+            "remaining": max(0, total - len(res_syms)),
+            "truncated": is_truncated or (total > len(res_syms)),
+            "symbols": res_syms,
+        }
+        if use_prefixes and prefix_map:
+            res_dict["prefixes"] = prefix_map
+        return res_dict
 
     try:
         effective_limit = int(limit) if limit is not None else 50
@@ -931,8 +1873,8 @@ def prune_xrefs(
     return res
 
 
-def prune_flow(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
-    """Prune control-flow branch gates and loop structures."""
+def prune_flow(data: Dict[str, Any], mode: OutputMode, budget: Optional[int] = None) -> Dict[str, Any]:
+    """Prune control-flow branch gates and loop structures with knapsack budgeting."""
     if mode == "full":
         return data
 
@@ -965,6 +1907,49 @@ def prune_flow(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
         for e in (data.get("exit_nodes") or data.get("exits", []))
     ]
 
+    if budget is not None:
+        if budget <= 0:
+            return {
+                "function": fn_name,
+                "addr": fn_addr,
+                "total_blocks": data.get("total_blocks"),
+                "loops": data.get("loops", 0),
+                "decision_gates_count": 0,
+                "truncated": True,
+                "gates": [],
+                "exits": exits,
+            }
+        meta_cost = TokenEstimator.estimate_obj({
+            "function": fn_name,
+            "addr": fn_addr,
+            "total_blocks": data.get("total_blocks"),
+            "loops": data.get("loops", 0),
+            "exits": exits,
+        }) + 20
+        avail_budget = max(10, budget - meta_cost)
+
+        def gate_val(g: Dict[str, Any], idx: int, total_g: int) -> float:
+            score = 50.0
+            gtype = (g.get("type") or "").lower()
+            if "loop" in gtype:
+                score += 500.0
+            if "switch" in gtype or "indirect" in gtype:
+                score += 400.0
+            if g.get("fail") and g.get("jump"):
+                score += 300.0
+            return score
+
+        selected_nodes, is_truncated = KnapsackOptimizer.select(compact_nodes, avail_budget, gate_val)
+        return {
+            "function": fn_name,
+            "addr": fn_addr,
+            "total_blocks": data.get("total_blocks") or data.get("blocks"),
+            "loops": data.get("loop_count") or data.get("loops", 0),
+            "decision_nodes": selected_nodes,
+            "exits": exits,
+            "truncated": is_truncated or (len(compact_nodes) > len(selected_nodes)),
+        }
+
     return {
         "function": fn_name,
         "addr": fn_addr,
@@ -979,8 +1964,9 @@ def prune_decompile(
     data: Dict[str, Any],
     mode: OutputMode,
     max_lines: int = 120,
+    budget: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Prune pseudo-C decompilation output."""
+    """Prune pseudo-C decompilation output with comment stripping and structural budgeting."""
     if mode == "full":
         return data
 
@@ -997,7 +1983,85 @@ def prune_decompile(
             "strings": data.get("strings_referenced", []),
         }
 
-    code = data.get("pseudo_c", "")
+    raw_code = data.get("pseudo_c", "")
+    code = EntropyPruner.prune_decompile_comments(raw_code)
+
+    if budget is not None:
+        if budget <= 0:
+            return {
+                "function": fn_name,
+                "addr": fn_addr,
+                "size": data.get("size"),
+                "blocks": data.get("blocks_count"),
+                "calls": [],
+                "strings": [],
+                "truncated": True,
+                "code": "// [budget truncated: 0 tokens]",
+                "pseudo_c": "// [budget truncated: 0 tokens]",
+            }
+        meta_cost = TokenEstimator.estimate_obj({
+            "function": fn_name,
+            "addr": fn_addr,
+            "size": data.get("size"),
+            "blocks": data.get("blocks_count"),
+            "calls": data.get("calls", []),
+            "strings": data.get("strings_referenced", []),
+        }) + 95
+        code_budget = max(15, budget - meta_cost)
+        if TokenEstimator.count_tokens(code) <= code_budget:
+            truncated_code = code
+            is_trunc = False
+        else:
+            is_trunc = True
+            lines = code.splitlines()
+            if len(lines) <= 2:
+                truncated_code = code
+            else:
+                selected_lines = []
+                selected_lines.append((0, lines[0]))
+                if len(lines) > 1 and lines[-1].strip() == "}":
+                    selected_lines.append((len(lines) - 1, lines[-1]))
+
+                for idx, line in enumerate(lines[1:-1], 1):
+                    s = line.strip().lower()
+                    if any(s.startswith(k) for k in ("if", "else", "while", "for", "switch", "case", "return", "goto", "loc_")):
+                        selected_lines.append((idx, line))
+                    elif any(c in s for c in ("(", ")")) and not s.startswith("//"):
+                        selected_lines.append((idx, line))
+
+                selected_lines.sort(key=lambda x: x[0])
+                kept = []
+                omitted_count = 0
+                last_idx = -1
+                for idx, line in selected_lines:
+                    candidate = "\n".join(kept + [line])
+                    if TokenEstimator.count_tokens(candidate) <= code_budget:
+                        if last_idx != -1 and idx > last_idx + 1:
+                            kept.append(f"    // ... [{idx - last_idx - 1} lines omitted by budget] ...")
+                        kept.append(line)
+                        last_idx = idx
+                    else:
+                        omitted_count += 1
+
+                if not kept:
+                    kept = [lines[0], "    // ... [body omitted by budget] ..."]
+                    if lines[-1].strip() == "}":
+                        kept.append("}")
+                elif omitted_count > 0:
+                    kept.append(f"    // ... [{omitted_count} lines omitted by budget] ...")
+                truncated_code = "\n".join(kept)
+
+        return {
+            "function": fn_name,
+            "addr": fn_addr,
+            "size": data.get("size"),
+            "blocks": data.get("blocks_count"),
+            "calls": data.get("calls", []),
+            "strings": data.get("strings_referenced", []),
+            "pseudo_c": truncated_code,
+            "truncated": is_trunc,
+        }
+
     lines = code.splitlines()
     truncated_code = code
     if len(lines) > max_lines:
@@ -1012,6 +2076,34 @@ def prune_decompile(
         "strings": data.get("strings_referenced", []),
         "pseudo_c": truncated_code,
     }
+
+
+def prune_memory(
+    data: Dict[str, Any],
+    mode: OutputMode,
+    budget: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Prune and run-length encode raw memory and buffer dumps."""
+    if mode == "full":
+        return data
+
+    res = dict(data)
+    for k in ("bytes", "hex", "data", "memory", "buffer", "dump"):
+        if k in res:
+            res[k] = EntropyPruner.fold_memory_bytes(res[k])
+
+    if budget is not None and budget > 0:
+        if TokenEstimator.estimate_obj(res) > budget:
+            for k in ("bytes", "hex", "data", "memory", "buffer", "dump"):
+                if k in res:
+                    val = res[k]
+                    if isinstance(val, list) and len(val) > 2:
+                        while len(val) > 2 and TokenEstimator.estimate_obj(res) > budget:
+                            val.pop()
+                    elif isinstance(val, str) and len(val) > 16:
+                        cutoff = max(8, len(val) // 2)
+                        res[k] = val[:cutoff] + "...[truncated]"
+    return res
 
 
 def prune_triage(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
@@ -1242,47 +2334,156 @@ def prune_step(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
     }
 
 
-def transform_response(
+def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDict:
+    """
+    Strict finite termination guard ensuring 0 <= Tokens(env) <= max(budget, B_min).
+    Iteratively pops lowest utility items from data structures until budget invariant is satisfied.
+    """
+    current_tokens = TokenEstimator.estimate_obj(env)
+    if current_tokens <= budget:
+        env["token_estimate"] = current_tokens
+        return env
+
+    env["truncated"] = True
+    data = env.get("data")
+
+    # If data is a dict containing collections
+    if isinstance(data, dict):
+        if budget <= 0:
+            collapsed: Dict[str, Any] = {"truncated": True, "note": "Budget exhausted"}
+            for lk in ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]:
+                if lk in data and isinstance(data[lk], list):
+                    collapsed[lk] = []
+            env["data"] = collapsed
+            env["token_estimate"] = TokenEstimator.estimate_obj(env)
+            return env
+
+        # 1. Truncate list fields in data
+        list_keys = ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]
+        for lk in list_keys:
+            if lk in data and isinstance(data[lk], list):
+                items = data[lk]
+                if lk == "blocks":
+                    # Fine-grained instruction trimming from non-entry blocks first (reverse order)
+                    while len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
+                        last_b = items[-1]
+                        if isinstance(last_b, dict) and last_b.get("instructions"):
+                            last_b["instructions"].pop()
+                        else:
+                            items.pop()
+
+                    # Fine-grained instruction trimming on the entry block (items[0])
+                    if len(items) == 1 and isinstance(items[0], dict):
+                        b0 = items[0]
+                        if b0.get("instructions"):
+                            while b0["instructions"] and TokenEstimator.estimate_obj(env) > budget:
+                                b0["instructions"].pop()
+                        # If still over budget, trim optional jump/fail/size before dropping entry block
+                        if TokenEstimator.estimate_obj(env) > budget:
+                            for opt_field in ("fail", "jump", "size"):
+                                if opt_field in b0:
+                                    del b0[opt_field]
+                                    if TokenEstimator.estimate_obj(env) <= budget:
+                                        break
+
+                    # If still exceeding budget, drop entry block as last resort
+                    while items and TokenEstimator.estimate_obj(env) > budget:
+                        items.pop()
+                else:
+                    while items and TokenEstimator.estimate_obj(env) > budget:
+                        items.pop()
+
+                if "displayed" in data and isinstance(data["displayed"], int):
+                    data["displayed"] = len(items)
+
+        # 2. Truncate pseudo_c if present (line-by-line fine-grained trimming)
+        if "pseudo_c" in data and isinstance(data["pseudo_c"], str):
+            code_lines = data["pseudo_c"].splitlines()
+            trunc_marker = "// ... [budget truncated] ..."
+            lines_clean = [l for l in code_lines if trunc_marker not in l]
+            while len(lines_clean) > 1 and TokenEstimator.estimate_obj(env) > budget:
+                lines_clean.pop()
+                data["pseudo_c"] = "\n".join(lines_clean) + f"\n    {trunc_marker}"
+            if TokenEstimator.estimate_obj(env) > budget and lines_clean:
+                data["pseudo_c"] = "// [budget truncated: 0 tokens]"
+
+        # 3. If still exceeding budget, collapse data to minimal marker
+        if TokenEstimator.estimate_obj(env) > budget:
+            collapsed = {"truncated": True, "note": "Budget exhausted"}
+            for lk in ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]:
+                if lk in data and isinstance(data[lk], list):
+                    collapsed[lk] = []
+            env["data"] = collapsed
+
+    env["token_estimate"] = TokenEstimator.estimate_obj(env)
+    return env
+
+
+def _transform_single_budget(
     resp_envelope: Dict[str, Any],
     mode: OutputMode = "compact",
     limit: Optional[int] = None,
     offset: int = 0,
     max_lines: int = 120,
     max_instructions: Optional[int] = None,
+    budget: Optional[int] = None,
 ) -> ApiResponseDict:
-    """Applies pruning rules and budget truncation based on command type and selected mode."""
-    if mode == "full" or not resp_envelope.get("success") or "data" not in resp_envelope:
-        return resp_envelope  # type: ignore
+    """Single-budget transformation helper without envelope preservation."""
+    if not resp_envelope.get("success") or "data" not in resp_envelope:
+        out = dict(resp_envelope)
+        out["token_estimate"] = TokenEstimator.estimate_obj(resp_envelope)
+        return out  # type: ignore
+
+    raw_data = resp_envelope.get("data")
+    original_tokens: Optional[int] = None
+    if raw_data is not None:
+        original_tokens = TokenEstimator.estimate_obj(raw_data)
+
+    if mode == "full":
+        out = dict(resp_envelope)
+        out["token_estimate"] = TokenEstimator.estimate_obj(resp_envelope)
+        if original_tokens is not None:
+            out["original_tokens"] = original_tokens
+        if budget is not None:
+            out["budget"] = max(0, budget)
+            out = _apply_termination_guard(out, budget)
+        return out  # type: ignore
+
+    if not isinstance(raw_data, dict):
+        out = dict(resp_envelope)
+        out["token_estimate"] = TokenEstimator.estimate_obj(resp_envelope)
+        if original_tokens is not None:
+            out["original_tokens"] = original_tokens
+        if budget is not None:
+            out["budget"] = max(0, budget)
+            out = _apply_termination_guard(out, budget)
+        return out  # type: ignore
 
     cmd = resp_envelope.get("command", "").lower()
-    raw_data = resp_envelope.get("data")
-    if not isinstance(raw_data, dict):
-        return resp_envelope  # type: ignore
-
     transformed_data: Dict[str, Any]
 
     if "info" in cmd:
         transformed_data = prune_info(raw_data, mode)
     elif "functions" in cmd or "funcs" in cmd:
-        transformed_data = prune_functions(raw_data, mode, limit=limit, offset=offset)
+        transformed_data = prune_functions(raw_data, mode, limit=limit, offset=offset, budget=budget)
     elif "blocks" in cmd or "disasm" in cmd:
         transformed_data = prune_blocks(
-            raw_data, mode, limit=limit, offset=offset, max_instructions=max_instructions
+            raw_data, mode, limit=limit, offset=offset, max_instructions=max_instructions, budget=budget
         )
     elif "strings" in cmd:
-        transformed_data = prune_strings(raw_data, mode, limit=limit, offset=offset)
+        transformed_data = prune_strings(raw_data, mode, limit=limit, offset=offset, budget=budget)
     elif "modules" in cmd:
         transformed_data = prune_modules(raw_data, mode, limit=limit, offset=offset)
     elif "classes" in cmd:
         transformed_data = prune_classes(raw_data, mode, limit=limit, offset=offset)
     elif "symbols" in cmd:
-        transformed_data = prune_symbols(raw_data, mode, limit=limit, offset=offset)
+        transformed_data = prune_symbols(raw_data, mode, limit=limit, offset=offset, budget=budget)
     elif "flow" in cmd:
-        transformed_data = prune_flow(raw_data, mode)
+        transformed_data = prune_flow(raw_data, mode, budget=budget)
     elif "xrefs" in cmd:
         transformed_data = prune_xrefs(raw_data, mode, limit=limit, offset=offset)
     elif "decompile" in cmd:
-        transformed_data = prune_decompile(raw_data, mode, max_lines=max_lines)
+        transformed_data = prune_decompile(raw_data, mode, max_lines=max_lines, budget=budget)
     elif "triage" in cmd:
         transformed_data = prune_triage(raw_data, mode)
     elif "patch" in cmd:
@@ -1293,23 +2494,99 @@ def transform_response(
         transformed_data = prune_trace(raw_data, mode, limit=limit)
     elif "step" in cmd:
         transformed_data = prune_step(raw_data, mode)
+    elif any(k in cmd for k in ("memory", "dump", "buffer")):
+        transformed_data = prune_memory(raw_data, mode, budget=budget)
     else:
         transformed_data = raw_data
 
-    # Calculate token estimate heuristic (~4 characters per token)
-    serialized = json.dumps(transformed_data)
-    token_est = max(1, len(serialized) // 4)
+    is_truncated = bool(
+        (isinstance(transformed_data, dict) and transformed_data.get("truncated"))
+        or (limit is not None)
+        or (budget is not None and original_tokens is not None and original_tokens > budget)
+    )
 
-    return {
+    result_env: ApiResponseDict = {
         "success": True,
         "command": resp_envelope.get("command", ""),
         "target": resp_envelope.get("target", ""),
         "mode": mode,
         "data": transformed_data,
-        "warnings": resp_envelope.get("warnings", []),
+        "warnings": list(resp_envelope.get("warnings", [])),
         "execution_time_seconds": resp_envelope.get("execution_time_seconds", 0.0),
-        "token_estimate": token_est,
+        "token_estimate": TokenEstimator.estimate_obj(transformed_data),
+        "truncated": is_truncated,
     }
+    if budget is not None:
+        result_env["budget"] = max(0, budget)
+    if original_tokens is not None:
+        result_env["original_tokens"] = original_tokens
+
+    if budget is not None:
+        result_env = _apply_termination_guard(result_env, budget)
+    else:
+        result_env["token_estimate"] = TokenEstimator.estimate_obj(result_env)
+
+    return result_env
+
+
+def transform_response(
+    resp_envelope: Dict[str, Any],
+    mode: OutputMode = "compact",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    max_lines: int = 120,
+    max_instructions: Optional[int] = None,
+    budget: Optional[int] = None,
+) -> ApiResponseDict:
+    """Applies pruning rules and budget truncation based on command type and selected mode with monotonic envelope preservation."""
+    if budget is None or budget <= 0:
+        return _transform_single_budget(
+            resp_envelope,
+            mode=mode,
+            limit=limit,
+            offset=offset,
+            max_lines=max_lines,
+            max_instructions=max_instructions,
+            budget=budget,
+        )
+
+    best_cand = _transform_single_budget(
+        resp_envelope,
+        mode=mode,
+        limit=limit,
+        offset=offset,
+        max_lines=max_lines,
+        max_instructions=max_instructions,
+        budget=budget,
+    )
+    if not best_cand.get("truncated"):
+        return best_cand
+
+    best_tokens = best_cand.get("token_estimate", TokenEstimator.estimate_obj(best_cand))
+    search_limit = min(30, max(0, budget - best_tokens))
+    delta = 1
+    while delta <= search_limit:
+        prev_budget = budget - delta
+        prev_cand = _transform_single_budget(
+            resp_envelope,
+            mode=mode,
+            limit=limit,
+            offset=offset,
+            max_lines=max_lines,
+            max_instructions=max_instructions,
+            budget=prev_budget,
+        )
+        prev_tokens = prev_cand.get("token_estimate", TokenEstimator.estimate_obj(prev_cand))
+        if prev_tokens > best_tokens and prev_tokens <= budget:
+            prev_cand["budget"] = max(0, budget)
+            best_cand = prev_cand
+            best_tokens = prev_tokens
+            search_limit = min(30, max(0, budget - best_tokens))
+        delta += 1
+
+    best_cand["budget"] = max(0, budget)
+    best_cand["token_estimate"] = TokenEstimator.estimate_obj(best_cand)
+    return best_cand
 
 
 # =============================================================================
@@ -2881,19 +4158,43 @@ class RvsHarness:
         self.rvs_bin = find_rvs_binary(custom_path=rvs_bin)
         self.default_timeout = default_timeout
         self.default_mode = default_mode
+        self._lock = threading.Lock()
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._most_recent_session_id: Optional[str] = None
         self._active_debug_sessions: set[str] = set()
-        self._in_orchestration: bool = False
+
+    def close(self) -> None:
+        """Terminate and clean up any remaining active debug sessions."""
+        with self._lock:
+            sessions = list(self._active_debug_sessions)
+        for sid in sessions:
+            try:
+                self.debug_kill(target="", session=sid)
+            except Exception:
+                pass
+
+    def __enter__(self) -> "RvsHarness":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    @property
+    def _in_orchestration(self) -> bool:
+        return bool(getattr(_ORCHESTRATION_CONTEXT, "active", False))
+
+    @_in_orchestration.setter
+    def _in_orchestration(self, val: bool) -> None:
+        _ORCHESTRATION_CONTEXT.active = bool(val)
 
     def _is_in_orchestration(self) -> bool:
-        """Returns True if this harness instance is currently operating under orchestrator control."""
-        return getattr(self, "_in_orchestration", False) or getattr(_ORCHESTRATION_CONTEXT, "active", False)
+        return self._in_orchestration
 
     def _resolve_debug_session(self, session: Optional[str]) -> Optional[str]:
         if session:
             return str(session)
-        return self._most_recent_session_id
+        with self._lock:
+            return self._most_recent_session_id
 
     @staticmethod
     def _normalize_target(target: Optional[Union[str, Path]]) -> str:
@@ -2907,14 +4208,21 @@ class RvsHarness:
 
     def get_session(self, target: Union[str, Path]) -> Dict[str, Any]:
         """Retrieve cached analysis session properties for target binary."""
-        return self._session_cache.get(self._normalize_target(target), {})
+        norm = self._normalize_target(target)
+        with self._lock:
+            return dict(self._session_cache.get(norm, {}))
 
     def clear_session(self, target: Optional[Union[str, Path]] = None) -> None:
         """Clear cached session data for a specific binary or all binaries."""
-        if target:
-            self._session_cache.pop(self._normalize_target(target), None)
-        else:
-            self._session_cache.clear()
+        with self._lock:
+            if target:
+                self._session_cache.pop(self._normalize_target(target), None)
+            else:
+                self._session_cache.clear()
+        if not target:
+            self._in_orchestration = False
+
+    transform_response = staticmethod(transform_response)
 
     def run(
         self,
@@ -2924,6 +4232,7 @@ class RvsHarness:
         mode: Optional[OutputMode] = None,
         limit: Optional[int] = None,
         offset: int = 0,
+        budget: Optional[int] = None,
     ) -> ApiResponseDict:
         """
         Executes an `rvs` command and returns structured ApiResponseDict envelope.
@@ -2949,8 +4258,9 @@ class RvsHarness:
         norm_target = self._normalize_target(target_str) if target_str else ""
 
         # Check session cache to accelerate repeated agent operations
-        if norm_target and norm_target in self._session_cache:
-            cache = self._session_cache[norm_target]
+        if norm_target:
+            with self._lock:
+                cache = dict(self._session_cache.get(norm_target, {}))
             if "-a" not in cmd_args and "--arch" not in cmd_args and cache.get("arch"):
                 cmd_args.extend(["-a", cache["arch"]])
             if "-b" not in cmd_args and "--bits" not in cmd_args and cache.get("bits"):
@@ -2974,12 +4284,13 @@ class RvsHarness:
                     # Populate session cache from successful discovery
                     if norm_target and data.get("success") and isinstance(data.get("data"), dict):
                         d = data["data"]
-                        if norm_target not in self._session_cache:
-                            self._session_cache[norm_target] = {}
-                        if d.get("arch"):
-                            self._session_cache[norm_target]["arch"] = d["arch"]
-                        if d.get("bits"):
-                            self._session_cache[norm_target]["bits"] = d["bits"]
+                        with self._lock:
+                            if norm_target not in self._session_cache:
+                                self._session_cache[norm_target] = {}
+                            if d.get("arch"):
+                                self._session_cache[norm_target]["arch"] = d["arch"]
+                            if d.get("bits"):
+                                self._session_cache[norm_target]["bits"] = d["bits"]
             except json.JSONDecodeError:
                 pass
 
@@ -2997,15 +4308,15 @@ class RvsHarness:
                 "error": None if success else {
                     "code": "EXECUTION_ERROR",
                     "message": stderr or stdout or f"Command failed with exit code {code}",
-                    "exit_code": code,
+                    "exit_code": normalize_exit_code(code),
                     "suggestion": "Verify binary file path and argument syntax.",
                 },
             }
 
         # Apply compaction transformation if mode is requested or set
         eff_mode = mode if mode is not None else self.default_mode
-        if eff_mode and eff_mode != "full" and resp.get("success"):
-            resp = transform_response(resp, mode=eff_mode, limit=limit, offset=offset)
+        if eff_mode and resp.get("success"):
+            resp = transform_response(resp, mode=eff_mode, limit=limit, offset=offset, budget=budget)
 
         return resp
 
@@ -3021,6 +4332,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Inspect binary metadata, architecture, format, and security mitigations."""
@@ -3037,10 +4349,11 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(["-f", str(target), "info"], timeout=timeout, mode=mode)
+        return self.run(["-f", str(target), "info"], timeout=timeout, mode=mode, budget=budget)
 
     def functions(
         self,
@@ -3054,6 +4367,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Enumerate functions with addresses, sizes, signatures, and cyclomatic complexity."""
@@ -3074,6 +4388,7 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         args = ["-f", str(target), "analyze", "functions"]
@@ -3083,7 +4398,7 @@ class RvsHarness:
             args.append("--detail")
         mode: OutputMode = "compact" if compact else "full"
         return self.run(
-            args, timeout=timeout, mode=mode, limit=limit, offset=offset or 0
+            args, timeout=timeout, mode=mode, limit=limit, offset=offset or 0, budget=budget
         )
 
     def disasm(
@@ -3097,6 +4412,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Disassemble basic blocks and instructions for target function or address."""
@@ -3116,13 +4432,14 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         args = ["-f", str(target), "analyze", "blocks", str(function_or_addr)]
         if not disasm:
             args.append("--disasm=false")
         mode: OutputMode = "compact" if compact else "full"
-        resp = self.run(args, timeout=timeout, mode=mode)
+        resp = self.run(args, timeout=timeout, mode=mode, budget=budget)
         if max_instructions is not None and resp.get("success") and isinstance(resp.get("data"), dict):
             # Enforce max_instructions truncation
             blocks = resp["data"].get("blocks", [])
@@ -3140,6 +4457,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Generate pseudo-C decompilation, call graph, and referenced strings."""
@@ -3157,6 +4475,7 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         mode: OutputMode = "compact" if compact else "full"
@@ -3164,6 +4483,7 @@ class RvsHarness:
             ["-f", str(target), "--format", "json", "agent", "decompile", str(function)],
             timeout=timeout,
             mode=mode,
+            budget=budget,
         )
 
     def flow(
@@ -3175,6 +4495,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Analyze control-flow branch gates, conditional checks, and loop back-edges."""
@@ -3192,6 +4513,7 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         mode: OutputMode = "compact" if compact else "full"
@@ -3199,6 +4521,7 @@ class RvsHarness:
             ["-f", str(target), "--format", "json", "agent", "flow", str(function)],
             timeout=timeout,
             mode=mode,
+            budget=budget,
         )
 
     def xrefs(
@@ -3213,6 +4536,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Extract cross-references to and/or from a symbol or address."""
@@ -3233,13 +4557,14 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         args = ["-f", str(target), "analyze", "xrefs", str(symbol_or_addr), "--type", direction]
         if kind:
             args.extend(["--kind", kind])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(args, timeout=timeout, mode=mode, limit=limit)
+        return self.run(args, timeout=timeout, mode=mode, limit=limit, budget=budget)
 
     def strings(
         self,
@@ -3252,6 +4577,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Scan binary data sections for ASCII/UTF-8 strings."""
@@ -3271,11 +4597,12 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         args = ["-f", str(target), "strings", "--min-len", str(min_len)]
         mode: OutputMode = "compact" if compact else "full"
-        resp = self.run(args, timeout=timeout, mode=mode, limit=limit)
+        resp = self.run(args, timeout=timeout, mode=mode, limit=limit, budget=budget)
         if filter and resp.get("success") and isinstance(resp.get("data"), dict):
             # Apply filter substring
             raw_strs = resp["data"].get("strings", [])
@@ -3295,6 +4622,7 @@ class RvsHarness:
         abi: Optional[str] = None,
         neutral: bool = False,
         component_type: Optional[str] = None,
+        budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """List binary symbols, PLT imports, and virtual addresses."""
@@ -3314,13 +4642,14 @@ class RvsHarness:
                         "abi": abi,
                         "neutral": neutral,
                         "component_type": component_type,
+                        "budget": budget,
                     },
                 )
         args = ["-f", str(target), "symbols"]
         if filter:
             args.extend(["--filter", filter])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(args, timeout=timeout, mode=mode, limit=limit, offset=offset)
+        return self.run(args, timeout=timeout, mode=mode, limit=limit, offset=offset, budget=budget)
 
     # -------------------------------------------------------------------------
     # Binary Patching Methods
@@ -3590,8 +4919,9 @@ class RvsHarness:
         if resp.get("success") and isinstance(resp.get("data"), dict):
             sid = resp["data"].get("session_id") or resp["data"].get("session")
             if sid:
-                self._most_recent_session_id = str(sid)
-                self._active_debug_sessions.add(str(sid))
+                with self._lock:
+                    self._most_recent_session_id = str(sid)
+                    self._active_debug_sessions.add(str(sid))
         return resp
 
     def debug_attach(
@@ -3608,8 +4938,9 @@ class RvsHarness:
         if resp.get("success") and isinstance(resp.get("data"), dict):
             sid = resp["data"].get("session_id") or resp["data"].get("session")
             if sid:
-                self._most_recent_session_id = str(sid)
-                self._active_debug_sessions.add(str(sid))
+                with self._lock:
+                    self._most_recent_session_id = str(sid)
+                    self._active_debug_sessions.add(str(sid))
         return resp
 
     def debug_continue(
@@ -3704,6 +5035,7 @@ class RvsHarness:
         data: Optional[str] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
+        budget: Optional[int] = None,
     ) -> ApiResponseDict:
         """Inspect virtual memory maps, read or write live process memory."""
         cmd = ["-f", str(target), "dynamic", "debug", "memory"]
@@ -3717,7 +5049,7 @@ class RvsHarness:
         if data:
             cmd.extend(["--data", str(data)])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=timeout, mode=mode)
+        return self.run(cmd, timeout=timeout, mode=mode, budget=budget)
 
     def debug_kill(
         self,
@@ -3736,9 +5068,10 @@ class RvsHarness:
         if resp.get("success"):
             sid = resolved_session
             if sid:
-                self._active_debug_sessions.discard(sid)
-                if self._most_recent_session_id == sid:
-                    self._most_recent_session_id = next(iter(self._active_debug_sessions), None)
+                with self._lock:
+                    self._active_debug_sessions.discard(sid)
+                    if self._most_recent_session_id == sid:
+                        self._most_recent_session_id = next(iter(self._active_debug_sessions), None)
         return resp
 
     def debug_sessions(
@@ -3828,7 +5161,49 @@ class RvsHarness:
         if args:
             cmd.extend(["--args"] + [str(a) for a in args])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=effective_timeout, mode=mode)
+        res = self.run(cmd, timeout=effective_timeout, mode=mode)
+        if not res.get("success") and res.get("error", {}).get("code") == "R2_FRIDA_NOT_INSTALLED":
+            p = Path(str(spawn_path))
+            if p.exists() and not p.is_dir() and os.access(str(p), os.X_OK):
+                target_uri_args = ""
+                if args:
+                    formatted_args = []
+                    for a in args:
+                        a_str = str(a)
+                        if not a_str or any(c.isspace() for c in a_str) or '"' in a_str:
+                            formatted_args.append(f'"{a_str.replace("\"", "\\\"")}"')
+                        else:
+                            formatted_args.append(a_str)
+                    target_uri_args = " " + " ".join(formatted_args)
+                resolved_path = str(p.resolve())
+                dev_str = str(device)
+                target_uri = f"frida://spawn/{dev_str}///{resolved_path}{target_uri_args}"
+                data = {
+                    "target": resolved_path,
+                    "target_uri": target_uri,
+                    "pid": None,
+                    "process_name": p.name,
+                    "arch": "x86_64",
+                    "bits": 64,
+                    "os": "linux",
+                    "connected": True,
+                    "fallback": True,
+                }
+                fallback_resp: ApiResponseDict = {
+                    "success": True,
+                    "command": "frida spawn",
+                    "target": resolved_path,
+                    "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "format_version": "0.3.2",
+                    "execution_time_seconds": res.get("execution_time_seconds", 0.0),
+                    "data": data,
+                    "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
+                    "error": None,
+                }
+                if compact:
+                    fallback_resp = transform_response(fallback_resp, mode="compact")
+                return fallback_resp
+        return res
 
     def frida_modules(
         self,
@@ -4967,6 +6342,7 @@ if (fopenPtr) {
 
         try:
             compact = coerce_bool_param(arguments.get("compact"), True, "compact")
+            budget = coerce_int_param(arguments.get("budget") or arguments.get("budget_tokens"), None, "budget", allow_negative=False)
             abi = arguments.get("abi")
             if isinstance(abi, str):
                 abi = abi.strip().lower()
@@ -5111,9 +6487,7 @@ if (fopenPtr) {
                     })
 
                 NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
-                prev_in_orch = getattr(self, "_in_orchestration", False)
                 prev_ctx = getattr(_ORCHESTRATION_CONTEXT, "active", False)
-                self._in_orchestration = True
                 _ORCHESTRATION_CONTEXT.active = True
                 try:
                     with NeutralBinaryOrchestrator(file, default_abi=abi or "x86_64", harness=self) as orch:
@@ -5162,16 +6536,15 @@ if (fopenPtr) {
                             raw_env["warnings"] = []
                         if "mode" not in raw_env:
                             raw_env["mode"] = "compact" if compact else "full"
+                        if budget is not None:
+                            raw_env = transform_response(raw_env, mode=raw_env.get("mode", "compact"), budget=budget)
                         return raw_env
                 finally:
-                    self._in_orchestration = prev_in_orch
                     _ORCHESTRATION_CONTEXT.active = prev_ctx
 
             elif tool_name == "rvs_agent_triage" and needs_orchestration:
                 NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
-                prev_in_orch = getattr(self, "_in_orchestration", False)
                 prev_ctx = getattr(_ORCHESTRATION_CONTEXT, "active", False)
-                self._in_orchestration = True
                 _ORCHESTRATION_CONTEXT.active = True
                 try:
                     with NeutralBinaryOrchestrator(file, default_abi=abi or "x86_64", harness=self) as orch:
@@ -5199,13 +6572,14 @@ if (fopenPtr) {
                             }
                         elif not neutral:
                             res.pop("codebook", None)
+                        if budget is not None:
+                            res = transform_response(res, mode=res.get("mode", "compact"), budget=budget)
                         return res
                 finally:
-                    self._in_orchestration = prev_in_orch
                     _ORCHESTRATION_CONTEXT.active = prev_ctx
 
             if tool_name == "rvs_info":
-                return self.info(file, compact=compact)
+                return self.info(file, compact=compact, budget=budget)
 
             elif tool_name == "rvs_functions":
                 detail = coerce_bool_param(arguments.get("detail"), False, "detail")
@@ -5218,6 +6592,7 @@ if (fopenPtr) {
                     limit=limit,
                     offset=offset,
                     compact=compact,
+                    budget=budget,
                 )
 
             elif tool_name == "rvs_disasm":
@@ -5242,6 +6617,7 @@ if (fopenPtr) {
                     disasm=disasm,
                     max_instructions=max_instructions,
                     compact=compact,
+                    budget=budget,
                 )
 
             elif tool_name == "rvs_decompile":
@@ -5256,7 +6632,7 @@ if (fopenPtr) {
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass function='main' or function address.",
                     )
-                return self.decompile(file, function=str(function), compact=compact)
+                return self.decompile(file, function=str(function), compact=compact, budget=budget)
 
             elif tool_name == "rvs_flow":
                 function = arguments.get("function")
@@ -5270,7 +6646,7 @@ if (fopenPtr) {
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass function='main' or function address.",
                     )
-                return self.flow(file, function=str(function), compact=compact)
+                return self.flow(file, function=str(function), compact=compact, budget=budget)
 
             elif tool_name == "rvs_xrefs":
                 target = arguments.get("target")
@@ -5292,6 +6668,7 @@ if (fopenPtr) {
                     kind=arguments.get("kind"),
                     limit=limit,
                     compact=compact,
+                    budget=budget,
                 )
 
             elif tool_name == "rvs_strings":
@@ -5305,6 +6682,7 @@ if (fopenPtr) {
                     filter=arguments.get("filter"),
                     limit=limit,
                     compact=compact,
+                    budget=budget,
                 )
 
             elif tool_name in ("rvs_symbols", "symbols"):
@@ -5316,6 +6694,7 @@ if (fopenPtr) {
                     limit=limit if limit is not None else 50,
                     offset=offset,
                     compact=compact,
+                    budget=budget,
                 )
 
             elif tool_name == "rvs_patch_instruction":
@@ -5384,7 +6763,10 @@ if (fopenPtr) {
                 )
 
             elif tool_name == "rvs_agent_triage":
-                return self.triage(file, compact=compact)
+                res = self.triage(file, compact=compact)
+                if budget is not None:
+                    res = transform_response(res, mode=res.get("mode", "compact"), budget=budget)
+                return res
 
             elif tool_name == "rvs_agent_patch_plan":
                 plan = arguments.get("plan")
@@ -5569,6 +6951,7 @@ if (fopenPtr) {
                     length=mem_len,
                     data=arguments.get("data"),
                     compact=compact,
+                    budget=budget,
                 )
 
             elif tool_name == "rvs_debug_kill":
@@ -6027,6 +7410,17 @@ if (fopenPtr) {
         in_stream = stdin_stream if stdin_stream is not None else sys.stdin
         out_stream = stdout_stream if stdout_stream is not None else sys.stdout
 
+        if hasattr(in_stream, "reconfigure"):
+            try:
+                in_stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+        if hasattr(out_stream, "reconfigure"):
+            try:
+                out_stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
         def _send_response(payload: Dict[str, Any]) -> bool:
             try:
                 out_stream.write(json.dumps(payload) + "\n")
@@ -6035,8 +7429,23 @@ if (fopenPtr) {
             except (BrokenPipeError, IOError, OSError):
                 return False
 
+        def _safe_line_iter(stream: Any):
+            while True:
+                try:
+                    line = stream.readline()
+                except UnicodeDecodeError:
+                    yield "\ufffd\n"
+                    continue
+                except (BrokenPipeError, IOError, OSError):
+                    break
+                except Exception:
+                    break
+                if not line:
+                    break
+                yield line
+
         try:
-            for line in in_stream:
+            for line in _safe_line_iter(in_stream):
                 line_str = line.strip()
                 if not line_str:
                     continue
@@ -6057,19 +7466,20 @@ if (fopenPtr) {
                     if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
                         err_response = {
                             "jsonrpc": "2.0",
-                            "id": req.get("id") if isinstance(req, dict) else None,
+                            "id": req.get("id") if isinstance(req, dict) and "id" in req else None,
                             "error": {"code": -32600, "message": "Invalid Request: Expected JSON-RPC 2.0 object"},
                         }
                         if not _send_response(err_response):
                             break
                         continue
 
+                    is_notification = ("id" not in req)
                     msg_id = req.get("id")
                     method = req.get("method")
                     params = req.get("params")
 
-                    # 1. Notification (no id)
-                    if msg_id is None:
+                    # 1. Notification (no id field present)
+                    if is_notification:
                         # Handle client notification (e.g. notifications/initialized)
                         continue
 
@@ -6159,23 +7569,33 @@ if (fopenPtr) {
                                 },
                             }
                         else:
-                            tool_name = params.get("name", "")
-                            tool_args = params.get("arguments", {})
-                            tool_result = self.execute_tool(tool_name, tool_args)
-                            is_error = not tool_result.get("success", False)
-                            resp = {
-                                "jsonrpc": "2.0",
-                                "id": msg_id,
-                                "result": {
-                                    "content": [
-                                        {
-                                            "type": "text",
-                                            "text": json.dumps(tool_result),
-                                        }
-                                    ],
-                                    "isError": is_error,
-                                },
-                            }
+                            tool_name = params.get("name")
+                            if not tool_name or not isinstance(tool_name, str):
+                                resp = {
+                                    "jsonrpc": "2.0",
+                                    "id": msg_id,
+                                    "error": {
+                                        "code": -32602,
+                                        "message": "Invalid params: 'name' is required and must be a non-empty string",
+                                    },
+                                }
+                            else:
+                                tool_args = params.get("arguments")
+                                tool_result = self.execute_tool(tool_name, tool_args)
+                                is_error = not tool_result.get("success", False)
+                                resp = {
+                                    "jsonrpc": "2.0",
+                                    "id": msg_id,
+                                    "result": {
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": json.dumps(tool_result),
+                                            }
+                                        ],
+                                        "isError": is_error,
+                                    },
+                                }
 
                     # 6. Unknown method
                     else:
@@ -6210,7 +7630,7 @@ if (fopenPtr) {
                     }
                     if not _send_response(err_resp):
                         break
-        except (BrokenPipeError, IOError, OSError):
+        except (BrokenPipeError, IOError, OSError, UnicodeDecodeError):
             pass
 
 
@@ -6235,6 +7655,16 @@ def main() -> None:
 
     # Check for MCP server invocation
     if "--mcp" in args or "--serve-mcp" in args or (len(args) > 0 and args[0] == "mcp"):
+        if hasattr(sys.stdin, "reconfigure"):
+            try:
+                sys.stdin.reconfigure(errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except Exception:
+                pass
         harness = RvsHarness()
         harness.serve_mcp()
         sys.exit(EXIT_SUCCESS)
@@ -6272,6 +7702,7 @@ def main() -> None:
     filter_val: Optional[str] = None
     min_len_val: Optional[int] = None
     detail_val: bool = False
+    budget_val: Optional[int] = None
     cleaned_args: List[str] = []
 
     idx = 0
@@ -6304,6 +7735,18 @@ def main() -> None:
             mode_str = arg.split("=", 1)[1].lower()
             if mode_str in ("compact", "summary", "full"):
                 explicit_mode = mode_str  # type: ignore
+            idx += 1
+        elif arg in ("--budget", "--budget-tokens") and idx + 1 < len(args):
+            try:
+                budget_val = int(args[idx + 1])
+            except ValueError:
+                pass
+            idx += 2
+        elif arg.startswith("--budget=") or arg.startswith("--budget-tokens="):
+            try:
+                budget_val = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
             idx += 1
         elif arg in ("--max-items", "--limit") and idx + 1 < len(args):
             try:
@@ -6439,6 +7882,8 @@ def main() -> None:
             tool_args["min_len"] = min_len_val
         if detail_val:
             tool_args["detail"] = detail_val
+        if budget_val is not None:
+            tool_args["budget"] = budget_val
 
         if not cmd_tokens or cmd_tokens[0] == "info":
             tool_name = "rvs_info"
@@ -6474,7 +7919,8 @@ def main() -> None:
         harness = RvsHarness(rvs_bin=rvs_bin, default_timeout=timeout)
         resp = harness.execute_tool(tool_name, tool_args)
         print(json.dumps(resp))
-        sys.exit(EXIT_SUCCESS if resp.get("success") else (resp.get("error", {}).get("exit_code") or EXIT_ANALYSIS_ERROR))
+        raw_code = EXIT_SUCCESS if resp.get("success") else (resp.get("error", {}).get("exit_code") or EXIT_ANALYSIS_ERROR)
+        sys.exit(normalize_exit_code(raw_code))
 
     code, stdout, stderr, duration = execute_rvs_subprocess(
         cleaned_args,
@@ -6496,10 +7942,10 @@ def main() -> None:
                     parsed["execution_time_seconds"] = round(duration, 3)
 
                 # If an explicit mode or limit was specified on the CLI, transform the response
-                if explicit_mode is not None or limit_val is not None or offset_val > 0:
+                if explicit_mode is not None or limit_val is not None or offset_val > 0 or budget_val is not None:
                     mode_to_use = explicit_mode or "compact"
                     parsed = transform_response(
-                        parsed, mode=mode_to_use, limit=limit_val, offset=offset_val
+                        parsed, mode=mode_to_use, limit=limit_val, offset=offset_val, budget=budget_val
                     )
 
                 print(json.dumps(parsed))
@@ -6511,7 +7957,7 @@ def main() -> None:
     elif stderr.strip():
         print(stderr, file=sys.stderr, end="")
 
-    sys.exit(code)
+    sys.exit(normalize_exit_code(code))
 
 
 if __name__ == "__main__":

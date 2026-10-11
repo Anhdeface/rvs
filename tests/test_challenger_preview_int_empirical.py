@@ -87,6 +87,11 @@ class TestStress1RapidRepeatedApkQueries(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        for d in _get_active_rvs_target_dirs():
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
         cls.temp_dir_obj = tempfile.TemporaryDirectory(prefix="rvs_chal_stress1_")
         cls.apk_path = Path(cls.temp_dir_obj.name) / "sample_multidex.apk"
         create_synthetic_apk(cls.apk_path, multidex=True)
@@ -95,6 +100,11 @@ class TestStress1RapidRepeatedApkQueries(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir_obj.cleanup()
+        for d in _get_active_rvs_target_dirs():
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
     def test_01_sequential_rapid_queries_zero_leak(self) -> None:
         """Runs 25 consecutive execute_tool queries and asserts zero lingering temp dirs."""
