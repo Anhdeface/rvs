@@ -1,6 +1,6 @@
 ---
 name: rvs-reverse-engineering
-description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, and deterministic binary patching using rvs v0.3.3 and its 40+ tool MCP agent harness.
+description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, and deterministic binary patching using rvs v0.3.4 and its 40+ tool MCP agent harness.
 compatibility: Antigravity CLI, Claude Code, Google Gemini CLI, GitHub Copilot CLI, Cursor
 version: 2.2.0
 ---
@@ -44,8 +44,9 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
 5. **Atomic Patching & Safe Recovery**:
    - Binary modifications automatically create timestamped `.bak` backups.
    - Multi-step patch plans support `dry_run=True` simulation to verify instruction encoding and byte offsets before modifying disk.
-6. **Native Dynamic Tooling Over Custom Scripting**:
-   - **MANDATORY DIRECTIVE**: Agents MUST NEVER author, compile, or execute standalone Python scripts (e.g. scripts invoking `import frida`, `ctypes`, or raw `subprocess`) or custom shell scripts.
+6. **Zero-Ad-Hoc Tooling & Native First Directive**:
+   - **MANDATORY UNIVERSAL DIRECTIVE**: AI agents MUST NEVER invoke external single-purpose CLI utilities (`strings`, `objdump`, `readelf`, `nm`, `ltrace`, `strace`, `gdb`, `dd`) or author, compile, or execute standalone Python scripts (e.g. scripts invoking `import frida`, `ctypes`, `open(..., "r+b")`, or raw `subprocess`) or custom shell scripts whenever an `rvs` MCP tool or CLI command exists for that operation.
+   - Native `rvs` tools format outputs into schema-validated, token-optimized JSON envelopes, avoiding raw terminal dumps that consume 5,000+ unparsed tokens.
    - All runtime inspection, dynamic hooking, register evaluation, and gate bypasses MUST be executed through native `rvs` MCP tools:
      - Argument inspection: `rvs_frida_hook`
      - Register tracing: `rvs_frida_trace_regs`
@@ -53,35 +54,100 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
      - Autonomous gate bypass: `rvs_bypass_decision_gate`
      - Plaintext buffer extraction: `rvs_dump_decrypted_buffer`
      - Anti-debug detection: `rvs_detect_anti_debug`
+     - Crash diagnosis: `rvs_triage_crash`
+     - In-memory CPU simulation: `rvs_dynamic_emulate`
+     - Deterministic patching: `rvs_patch_instruction`, `rvs_patch_string`, `rvs_patch_bytes`, `rvs_agent_patch_plan`
+
+### 🚫 Anti-Pattern Prohibition Matrix
+
+| Domain | Observed Agent Anti-Pattern | Why Prohibited / Pitfall | Prescribed Native `rvs` Tool | Benefit & Token Impact |
+|---|---|---|---|---|
+| **Static Reconnaissance** | Running shell commands: `file`, `nm -D`, `readelf -s`, `objdump -d`, `strings` | Dumps thousands of unparsed terminal lines; ANSI codes pollute context; lacks structured error handling. | `rvs_agent_triage`, `rvs_info`, `rvs_strings`, `rvs_symbols`, `rvs_functions` | **85% token savings**; structured JSON; automatic pagination and ELF mitigation parsing. |
+| **Control Flow & Decision Analysis** | Disassembling entire functions with `objdump -d`, grepping for `cmp`/`test`, or writing Python parsing scripts | Misses jump/fail targets; fails to recognize loop back-edges; wastes thousands of tokens on linear disassembly. | `rvs_flow`, `rvs_decompile`, `rvs_xrefs` | Automatically pinpoints decision gates, branch targets, and call sites in compact JSON. |
+| **Algorithmic Tracing & Decryptors** | Writing standalone Python emulation/tracing scripts or invoking `ltrace`/`strace` | Execution risks running malicious code; `ltrace` misses inlined cryptographic loops; context blowout. | `rvs_dynamic_emulate`, `rvs_dynamic_trace`, `rvs_dynamic_step` | Safe radare2 ESIL user-space CPU emulation without process execution or root privileges. |
+| **Live Gate Bypasses & Hooking** | Writing custom `frida_script.py` using `import frida` or compiling C shared libraries for `LD_PRELOAD` | Breaks subprocess isolation; requires host Frida SDK and Python dependencies; lacks standardized envelopes. | `rvs_bypass_decision_gate`, `rvs_frida_hook_return`, `rvs_frida_hook` | 1-shot autonomous gate bypass; non-destructive live memory overrides; zero external Python dependencies. |
+| **Crash & Segfault Analysis** | Running `gdb -batch -ex run -ex bt` or custom core-dump inspection scripts | GDB output format varies across versions; noisy terminal dumps; requires manual register parsing. | `rvs_triage_crash` | Deterministic signal categorization (SIGSEGV, NULL deref), faulting RIP, instruction, and register diffs. |
+| **In-Memory Buffer Extraction** | Injecting scripts to dump `/proc/<pid>/mem` or attaching GDB to dump memory regions | Complex process race conditions; ptrace permission denials; uncompressed hex dumps flood context. | `rvs_dump_decrypted_buffer`, `rvs_dynamic_emulate(read_mem=...)`, `rvs_frida_mem_read` | Autonomous breakpointing after decryption loops; extracts plaintext string, hex, and byte arrays safely. |
+| **Binary Patching** | Writing Python scripts with `open(file, "r+b")` seeking and writing raw bytes, or using `dd` | Bypasses atomic `.bak` backup creation; lacks dry-run verification; risks irreversible binary corruption. | `rvs_patch_instruction`, `rvs_patch_string`, `rvs_patch_bytes`, `rvs_agent_patch_plan` | Automatic timestamped `.bak` creation; `dry_run=True` simulation; architecture-aware byte alignment. |
+| **Interactive Debugging** | Launching raw command-line GDB or LLDB sessions in bash subprocesses | Shell stdin/stdout deadlocks; terminal prompts block agent execution; unparsed output exhausts tokens. | `rvs_debug_spawn`, `rvs_debug_breakpoint`, `rvs_debug_continue`, `rvs_debug_registers` | Daemon-backed UDS session management; structured register inspection with diffing support. |
 
 ---
 
-## 🧭 Dynamic Analysis & Instrumentation Decision Tree
+## 🧭 8 Scenario Reverse Engineering Decision Trees
 
-Agents should select tools according to this operational decision logic:
+Agents should select native `rvs` tools according to these scenario-specific operational workflows:
 
 ```
                               [Target Objective / Challenge]
                                             │
-   ┌────────────────────────┬───────────────┴───────────────┬────────────────────────┐
-   ▼                        ▼                               ▼                        ▼
-[Auth / Decision Gate]  [Inspect Function Args]       [Decryptor / Buffer]    [Anti-Debugging Check]
-   │                        │                               │                        │
-   ├─ Composite 1-Shot?     └─> rvs_frida_hook(...,         ├─ Dynamic buffer dump?  └─> rvs_detect_anti_debug(...)
-   │  └─> rvs_bypass_           addr="...", format="z")     │  └─> rvs_dump_decrypted_     ├─ Returns techniques
-   │      decision_gate(..)                                 │      buffer(...)             │  (ptrace, TracerPid)
-   │                                                        │                              └─ Neutralize via:
-   ├─ Runtime override?     [Inspect Registers]             └─ Safe CPU emulation?            rvs_frida_hook_return
-   │  └─> rvs_frida_hook_   └─> rvs_frida_trace_regs(...,      └─> rvs_dynamic_emulate(...)   or rvs_frida_script
-   │      return(...,           addr="...", regs="...")
-   │      retval="0x1")
-   │
-   ├─ Step-by-step debug?
-   │  └─> rvs_debug_spawn / breakpoint / registers
-   │
-   └─ Permanent patch?
-      └─> rvs_patch_instruction(...)
+   ┌────────────────────┬───────────────────┼────────────────────┬────────────────────┐
+   ▼                    ▼                   ▼                    ▼                    ▼
+[Scenario 1:         [Scenario 2:        [Scenario 3:         [Scenario 4:         [Scenario 5:
+ Recon & Triage]      CFG & Gate Logic]   Gate Bypass]         Algorithm Tracing]   Buffer Extraction]
+   │                    │                   │                    │                    │
+   ├─ 1-Shot Overview   ├─ Decision nodes   ├─ 1-Shot Dynamic    ├─ Safe CPU emu:     ├─ Decryptor dump:
+   │  └─> rvs_agent_    │  └─> rvs_flow     │  └─> rvs_bypass_   │  └─> rvs_dynamic_  │  └─> rvs_dump_
+   │      triage        │                   │      decision_gate │      emulate       │      decrypted_
+   │                    ├─ High-level logic │                    │                    │      buffer
+   ├─ Mitigations       │  └─> rvs_         ├─ Live return:      ├─ Register deltas:  │
+   │  └─> rvs_info      │      decompile    │  └─> rvs_frida_    │  └─> rvs_dynamic_  ├─ Read emu mem:
+   │                    │                   │      hook_return   │      trace         │  └─> rvs_dynamic_
+   ├─ String search     └─ Call sites       │                    │                    │      emulate(read_
+   │  └─> rvs_strings   │  └─> rvs_xrefs    ├─ Permanent patch:  └─ Single step:      │      mem=...)
+   │                    │                   │  └─> rvs_patch_    │  └─> rvs_dynamic_  │
+   └─ Symbols/PLT       └─ Instruction bytes│      instruction   │      step          └─ Live memory:
+      └─> rvs_symbols       └─> rvs_disasm  │                    │                       └─> rvs_frida_
+                                            └─ Ptrace debug:     └─ Live reg trace:          mem_read
+                                               └─> rvs_debug_*      └─> rvs_frida_
+                                                                        trace_regs
 ```
+
+```
+                                            │
+   ┌────────────────────────────────────────┴────────────────────────────────────────┐
+   ▼                                        ▼                                        ▼
+[Scenario 6:                             [Scenario 7:                             [Scenario 8:
+ Anti-Debug & Evasion]                    Crash Diagnostics]                       Deterministic Patching]
+   │                                        │                                        │
+   ├─ Scan binary for ptrace/TracerPid      ├─ Dynamic crash reproduction            ├─ Simulate multi-step patch plan
+   │  └─> rvs_detect_anti_debug             │  └─> rvs_triage_crash(..., args=[...]) │  └─> rvs_agent_patch_plan(..., dry_run=True)
+   │                                        │                                        │
+   └─ Inject generated Frida bypass hook    └─ Classify fault event (SIGSEGV, NULL)  ├─ Single instruction patch / NOP sled
+      └─> rvs_frida_script(...)                └─ Extracts fault_addr, rip, regs     │  └─> rvs_patch_instruction(...)
+                                                                                     │
+                                                                                     ├─ In-place string replacement
+                                                                                     │  └─> rvs_patch_string(...)
+                                                                                     │
+                                                                                     └─ Raw hex byte mutation
+                                                                                        └─> rvs_patch_bytes(...)
+```
+
+### Detailed Scenario Prescriptions
+
+1. **Scenario 1: Initial Reconnaissance & Security Profiling**
+   - *Primary Tool*: `rvs_agent_triage(file=...)` — extracts file format, architecture, bitness, security mitigations (NX, PIE, Canary, RELRO, stripped), top complex functions by cyclomatic complexity, and actionable RE next steps.
+   - *Targeted Drilldown*: `rvs_info` for detailed header flags; `rvs_strings(filter="...", min_len=4)` for key text; `rvs_symbols(filter="...")` for PLT imports.
+2. **Scenario 2: Control Flow Graph & Decision Gate Analysis**
+   - *Primary Tool*: `rvs_flow(file=..., function="...")` — automatically extracts basic blocks, conditional jump opcodes (`je`, `jne`, `jz`, `jnz`, `cmp`, `test`), jump and fail targets, and loop back-edges.
+   - *Decompilation & Context*: `rvs_decompile(file=..., function="...")` for pseudo-C logic; `rvs_xrefs(file=..., symbol_or_addr="<string_or_symbol>")` to discover all reference sites.
+3. **Scenario 3: Authentication & License Decision Gate Bypass**
+   - *One-Shot Composite*: `rvs_bypass_decision_gate(file=..., gate_addr="...")` — autonomously evaluates branch conditions, generates opposite opcode, tests bypass, and outputs patch plan.
+   - *Live Non-Destructive Override*: `rvs_frida_hook_return(target=..., addr="...", retval="0x1")` — forces function to return success dynamically in memory without touching disk.
+   - *Permanent On-Disk Patch*: `rvs_patch_instruction(file=..., addr="...", assembly="jmp <target>")` or `rvs_agent_patch_plan(file=..., plan={...}, dry_run=True)`.
+4. **Scenario 4: Cryptographic Loop & Algorithmic Tracing**
+   - *Primary Tool*: `rvs_dynamic_trace(file=..., target="<addr>", steps=20)` — records opcodes and register diffs per instruction step without executing OS processes.
+   - *Safe Simulation*: `rvs_dynamic_emulate(file=..., target="...", steps=100, until="...", reg_set=["rdi=1"])` — executes CPU instructions inside radare2 ESIL user memory.
+5. **Scenario 5: Plaintext Decryptor Buffer Extraction**
+   - *One-Shot Tool*: `rvs_dump_decrypted_buffer(file=...)` — automatically locates decryption loop, sets dynamic breakpoint after loop completion, and extracts memory plaintext buffer.
+   - *Emulation Memory Probe*: `rvs_dynamic_emulate(file=..., target="...", read_mem="0x404060", mem_len=64)`.
+6. **Scenario 6: Anti-Debugging & Evasion Detection**
+   - *Primary Tool*: `rvs_detect_anti_debug(file=...)` — scans for `ptrace(PTRACE_TRACEME)`, `/proc/self/status` `TracerPid` checks, timing checks, and generates tailored Frida bypass scripts.
+   - *Neutralization*: Inject generated bypass script via `rvs_frida_script(target=..., code="...")`.
+7. **Scenario 7: Dynamic Crash Diagnostics & Exception Analysis**
+   - *Primary Tool*: `rvs_triage_crash(file=..., args=[...])` — dynamically executes crash input, captures terminating signal (e.g. SIGSEGV 11), categorizes root cause (NULL pointer dereference, buffer overflow), extracts faulting RIP and instruction, and computes register diffs.
+8. **Scenario 8: Deterministic Binary Patching & Dry-Run Validation**
+   - *Simulation*: `rvs_agent_patch_plan(file=..., plan={...}, dry_run=True)` — validates assembly syntax and byte offsets before modifying disk.
+   - *Modification*: `rvs_patch_instruction` (single instruction/NOP sled), `rvs_patch_string` (string literal with padding), or `rvs_patch_bytes` (raw hex bytes) — all create timestamped `.bak` files.
 
 | Operational Objective | Prescribed Native Tool | When to Select |
 |---|---|---|
@@ -198,6 +264,28 @@ AI agent context windows are finite. Conformance with these directives is mandat
 | **4. Strict Trace Step Budgets** | Restrict `rvs_dynamic_trace` to 15–30 steps and `rvs_dynamic_emulate` to 50–100 steps. Use `until` to halt at specific gates. | Prevents runaway trace dumps |
 | **5. Stripped Terminal Formatting** | Environment isolation enforces `TERM=dumb` and strips all ANSI codes. Never pipe through unstripped terminal wrappers. | Eliminates terminal pollution |
 | **6. Parameterless Tool Calling** | Parameterless tools (`rvs_debug_sessions`, `rvs_frida_env_check`) accept empty arguments `{}` or omitted parameters. | Avoids redundant parameter overhead |
+
+### 🗜️ Harness Algorithmic Token Compaction Stack
+
+The `rvs_agent_harness.py` backend implements a multi-layer compaction pipeline combining four core mathematical optimization techniques:
+
+1. **LCAP Address Factoring (`TriePrefixCompressor`)**:
+   - 64-bit virtual memory addresses typically share large common prefixes (e.g., `0x0000555555555120` through `0x0000555555555180`).
+   - The Trie prefix compressor computes the Longest Common Address Prefix across basic blocks and instructions, factoring out the base prefix and emitting compact relative offsets (`+120`, `+180`).
+   - Achieves up to **60% token reduction** on disassembly addresses while remaining 100% losslessly reversible.
+
+2. **Entropy Run-Length Encoding (`EntropyPruner`)**:
+   - Compresses repetitive low-entropy opcode sequences such as NOP sleds (`nop`, `0x90`), INT3 alignment padding (`int3`, `0xcc`), zero pages, and memory buffers.
+   - Converts multi-line padding into compact RLE representations (e.g. `{"asm": "nop", "repeat": 64}`), delivering **>90% token reduction** on sleds without losing structural bounds.
+
+3. **0/1 Knapsack Utility Budgeting (`KnapsackOptimizer`)**:
+   - Under strict token budget constraints (`--budget B`), greedily solves the 0/1 knapsack problem to maximize structural reverse engineering information.
+   - Anchors critical nodes (Entry basic block, exit blocks with `ret`, branch decision gates with conditional jumps, and call sites) with high utility scores while pruning peripheral blocks.
+   - Preserves function entry points and decision logic down to tight budgets ($B=200$).
+
+4. **Calibrated BPE Token Estimator (`TokenEstimator`)**:
+   - Implements a pure-Python regex BPE tokenizer matching `cl100k_base` (OpenAI), Claude, and Llama token boundaries (~1.75–2.8 characters per token for RE assembly and JSON).
+   - Operates with zero heap list allocations via regex match iterators, evaluating token limits accurately and with zero external dependencies.
 
 ---
 

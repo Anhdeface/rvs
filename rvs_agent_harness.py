@@ -74,7 +74,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.3"
+SERVER_VERSION: str = "0.3.4"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -158,6 +158,12 @@ def find_rvs_binary(custom_path: Optional[Union[str, Path]] = None) -> Path:
     return script_dir / "target" / "debug" / "rvs"
 
 
+_CONTROL_CHAR_TRANSLATE_TABLE: Dict[int, Optional[int]] = {
+    i: None for i in range(32) if i not in (9, 10, 13)
+}
+_CONTROL_CHAR_TRANSLATE_TABLE[127] = None
+
+
 def sanitize_terminal_output(text: Union[str, bytes]) -> str:
     """Strips ANSI escape codes, terminal cursor controls, and unprintable characters."""
     if not text:
@@ -166,11 +172,8 @@ def sanitize_terminal_output(text: Union[str, bytes]) -> str:
         text = text.decode("utf-8", errors="replace")
     # Strip ANSI sequences
     cleaned = ANSI_ESCAPE_RE.sub("", text)
-    # Strip control characters except standard whitespace (\n, \r, \t)
-    sanitized = "".join(
-        c for c in cleaned if c in ("\n", "\r", "\t") or (ord(c) >= 32 and ord(c) != 127)
-    )
-    return sanitized
+    # Strip control characters except standard whitespace (\n, \r, \t) via C-accelerated translate table
+    return cleaned.translate(_CONTROL_CHAR_TRANSLATE_TABLE)
 
 
 def get_isolated_environment() -> Dict[str, str]:
@@ -452,9 +455,9 @@ class TokenEstimator:
         """Estimate BPE token count for a text string."""
         if not text:
             return 0
-        tokens = cls._BPE_RE.findall(text)
         total = 0
-        for t in tokens:
+        for m in cls._BPE_RE.finditer(text):
+            t = m.group(0)
             if t.startswith("0x") and len(t) > 4:
                 # 0x + hex digits (e.g. 0x0000555555555120 is ~5 BPE tokens)
                 total += 1 + (len(t) - 2 + 3) // 4
@@ -957,6 +960,20 @@ class KnapsackOptimizer:
     critical structural anchors (Entry block, Exit blocks, Branch Gates, Call Targets).
     Guarantees finite termination and budget invariant satisfaction.
     """
+    _WEIGHT_CACHE: Dict[Tuple[int, Any], int] = {}
+
+    @classmethod
+    def _compute_item_key(cls, item: Any) -> Any:
+        if not isinstance(item, dict):
+            return id(item)
+        addr = item.get("addr") or item.get("addr_hex") or item.get("vaddr") or item.get("offset")
+        name = item.get("name") or item.get("string") or item.get("func_name")
+        insts = item.get("instructions")
+        inst_len = len(insts) if isinstance(insts, list) else 0
+        if addr is not None or name is not None or inst_len > 0:
+            return (addr, name, inst_len, len(item))
+        return id(item)
+
     @staticmethod
     def select(
         items: List[Dict[str, Any]],
@@ -982,8 +999,16 @@ class KnapsackOptimizer:
         weights: List[int] = []
         values: List[float] = []
 
+        fn_id = id(weight_func)
         for idx, item in enumerate(items):
-            w = max(1, weight_func(item))
+            item_key = KnapsackOptimizer._compute_item_key(item)
+            cache_k = (fn_id, item_key)
+            w = KnapsackOptimizer._WEIGHT_CACHE.get(cache_k)
+            if w is None:
+                w = max(1, weight_func(item))
+                if len(KnapsackOptimizer._WEIGHT_CACHE) > 10000:
+                    KnapsackOptimizer._WEIGHT_CACHE.clear()
+                KnapsackOptimizer._WEIGHT_CACHE[cache_k] = w
             weights.append(w)
             v = max(0.1, value_fn(item, idx, total_items))
             values.append(v)
@@ -1203,7 +1228,7 @@ def prune_functions(
             item["instrs"] = instrs
         compact_funcs.append(item)
 
-    is_truncated = (total > len(compact_funcs)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_funcs)) or effective_offset > 0
     if not is_truncated and effective_offset == 0:
         return {
             "total": total,
@@ -1266,14 +1291,15 @@ def prune_blocks(
         # Apply repetition folding on NOP sleds and padding
         folded_insts = EntropyPruner.fold_instruction_stream(insts)
 
-        compact_insts = [
-            {
+        compact_insts = []
+        for i in folded_insts:
+            ci: Dict[str, Any] = {
                 "addr": i.get("addr") if isinstance(i.get("addr"), str) and i.get("addr").startswith("0x") else (i.get("addr_hex") or format_hex_addr(i.get("addr"))),
                 "asm": i.get("asm") or i.get("disasm") or i.get("opcode"),
-                "size": i.get("size"),
             }
-            for i in folded_insts
-        ]
+            if mode != "compact" and i.get("size") is not None:
+                ci["size"] = i.get("size")
+            compact_insts.append(ci)
 
         b_addr = b.get("addr") if isinstance(b.get("addr"), str) and b.get("addr").startswith("0x") else (b.get("addr_hex") or format_hex_addr(b.get("addr")))
         b_dict: Dict[str, Any] = {
@@ -1371,7 +1397,7 @@ def prune_blocks(
     sliced = blocks[effective_offset : effective_offset + effective_limit]
     compact_blocks = [compact_block_entry(b) for b in sliced]
 
-    is_truncated = (total > len(compact_blocks)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_blocks)) or effective_offset > 0
     if not is_truncated and effective_offset == 0:
         return {
             "function": fn_name,
@@ -1481,7 +1507,7 @@ def prune_strings(
         for s in sliced
     ]
 
-    is_truncated = (total > len(compact_strings)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_strings)) or effective_offset > 0
     if not is_truncated and effective_offset == 0:
         return {
             "total": total,
@@ -1599,7 +1625,7 @@ def prune_symbols(
             sym_dict["bind"] = s.get("bind")
         compact_symbols.append(sym_dict)
 
-    is_truncated = (total > len(compact_symbols)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_symbols)) or effective_offset > 0
     if not is_truncated and effective_offset == 0:
         return {
             "total": total,
@@ -1668,7 +1694,7 @@ def prune_modules(
         else:
             compact_modules.append({"name": str(m)})
 
-    is_truncated = (total > len(compact_modules)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_modules)) or effective_offset > 0
     if not is_truncated and effective_offset == 0:
         return {
             "total": total,
@@ -1734,7 +1760,7 @@ def prune_classes(
                 cls_dict["methods"] = c.get("methods")
             compact_classes.append(cls_dict)
 
-    is_truncated = (total > len(compact_classes)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_classes)) or effective_offset > 0
     if not is_truncated and effective_offset == 0:
         return {
             "total": total,
@@ -1836,27 +1862,31 @@ def prune_xrefs(
     sliced = raw_xrefs[effective_offset : effective_offset + effective_limit]
     compact_xrefs = []
     for x in sliced:
-        compact_xrefs.append({
+        xref_item: Dict[str, Any] = {
             "from": x.get("from_addr_hex") or format_hex_addr(x.get("from_addr")) or x.get("from"),
             "from_fn": x.get("from_function") or x.get("from_name"),
             "to": x.get("to_addr_hex") or format_hex_addr(x.get("to_addr")) or x.get("to"),
             "to_fn": x.get("to_function") or x.get("to_name"),
             "type": x.get("xref_type") or x.get("type"),
-            "op": x.get("opcode"),
-        })
+        }
+        if x.get("opcode"):
+            xref_item["op"] = x.get("opcode")
+        compact_xrefs.append(xref_item)
 
-    is_truncated = (total > len(compact_xrefs)) or effective_offset > 0 or limit is not None
+    is_truncated = (total > len(compact_xrefs)) or effective_offset > 0
+    target_addr = data.get("target_addr_hex") or format_hex_addr(data.get("target_addr"))
     if not is_truncated and effective_offset == 0:
-        return {
+        ret_dict: Dict[str, Any] = {
             "target": data.get("target"),
-            "addr": data.get("target_addr_hex") or format_hex_addr(data.get("target_addr")),
             "total": total,
             "xrefs": compact_xrefs,
         }
+        if target_addr is not None:
+            ret_dict["addr"] = target_addr
+        return ret_dict
 
     res: Dict[str, Any] = {
         "target": data.get("target"),
-        "addr": data.get("target_addr_hex") or format_hex_addr(data.get("target_addr")),
         "total": total,
         "displayed": len(compact_xrefs),
         "remaining": max(0, total - (effective_offset + len(compact_xrefs))),
@@ -1866,6 +1896,8 @@ def prune_xrefs(
         "has_more": total > (effective_offset + len(compact_xrefs)),
         "xrefs": compact_xrefs,
     }
+    if target_addr is not None:
+        res["addr"] = target_addr
     if total > (effective_offset + len(compact_xrefs)):
         res["continuation_hint"] = (
             f"Use limit={effective_limit} offset={effective_offset + len(compact_xrefs)} to retrieve next slice."
@@ -2127,16 +2159,19 @@ def prune_triage(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
             "total_strings": data.get("total_strings"),
         }
 
-    top_funcs = [
-        {
+    top_funcs = []
+    for f in data.get("top_functions", [])[:5]:
+        tf: Dict[str, Any] = {
             "name": f.get("name"),
             "addr": f.get("addr_hex") or format_hex_addr(f.get("addr")),
-            "size": f.get("size"),
-            "cc": f.get("complexity"),
-            "blocks": f.get("num_blocks"),
         }
-        for f in data.get("top_functions", [])[:5]
-    ]
+        if f.get("size") is not None:
+            tf["size"] = f.get("size")
+        if f.get("complexity") is not None:
+            tf["cc"] = f.get("complexity")
+        if f.get("num_blocks") is not None:
+            tf["blocks"] = f.get("num_blocks")
+        top_funcs.append(tf)
 
     return {
         "format": data.get("format"),
@@ -2358,26 +2393,80 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
             env["token_estimate"] = TokenEstimator.estimate_obj(env)
             return env
 
-        # 1. Truncate list fields in data
+        # 1. Truncate list fields in data via bisection
         list_keys = ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]
         for lk in list_keys:
             if lk in data and isinstance(data[lk], list):
                 items = data[lk]
                 if lk == "blocks":
-                    # Fine-grained instruction trimming from non-entry blocks first (reverse order)
-                    while len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
-                        last_b = items[-1]
-                        if isinstance(last_b, dict) and last_b.get("instructions"):
-                            last_b["instructions"].pop()
+                    # Fine-grained instruction trimming from non-entry blocks first (bisection search)
+                    if len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
+                        orig_blocks = list(items)
+                        # Check if block 0 alone exceeds budget
+                        data["blocks"] = [dict(orig_blocks[0])]
+                        if TokenEstimator.estimate_obj(env) > budget:
+                            data["blocks"] = [dict(orig_blocks[0])]
+                            items = data["blocks"]
                         else:
-                            items.pop()
+                            # Binary search for block boundary k in 1..len(orig_blocks)
+                            low_b = 1
+                            high_b = len(orig_blocks)
+                            best_k = 1
+                            while low_b <= high_b:
+                                mid = (low_b + high_b) // 2
+                                data["blocks"] = [dict(b) for b in orig_blocks[:mid]]
+                                if TokenEstimator.estimate_obj(env) <= budget:
+                                    best_k = mid
+                                    low_b = mid + 1
+                                else:
+                                    high_b = mid - 1
+
+                            # If a boundary block exists, fine-tune its instructions with bisection
+                            if best_k < len(orig_blocks):
+                                cand_b = dict(orig_blocks[best_k])
+                                cand_insts = list(cand_b.get("instructions", []))
+                                if cand_insts:
+                                    low_i = 1
+                                    high_i = len(cand_insts)
+                                    best_i = 0
+                                    while low_i <= high_i:
+                                        mid_i = (low_i + high_i) // 2
+                                        cand_b["instructions"] = list(cand_insts[:mid_i])
+                                        data["blocks"] = [dict(b) for b in orig_blocks[:best_k]] + [cand_b]
+                                        if TokenEstimator.estimate_obj(env) <= budget:
+                                            best_i = mid_i
+                                            low_i = mid_i + 1
+                                        else:
+                                            high_i = mid_i - 1
+                                    if best_i > 0:
+                                        cand_b["instructions"] = list(cand_insts[:best_i])
+                                        data["blocks"] = [dict(b) for b in orig_blocks[:best_k]] + [cand_b]
+                                    else:
+                                        data["blocks"] = [dict(b) for b in orig_blocks[:best_k]]
+                                else:
+                                    data["blocks"] = [dict(b) for b in orig_blocks[:best_k]]
+                            else:
+                                data["blocks"] = [dict(b) for b in orig_blocks[:best_k]]
+                            items = data["blocks"]
 
                     # Fine-grained instruction trimming on the entry block (items[0])
-                    if len(items) == 1 and isinstance(items[0], dict):
+                    if len(items) == 1 and isinstance(items[0], dict) and TokenEstimator.estimate_obj(env) > budget:
                         b0 = items[0]
-                        if b0.get("instructions"):
-                            while b0["instructions"] and TokenEstimator.estimate_obj(env) > budget:
-                                b0["instructions"].pop()
+                        b0_insts = list(b0.get("instructions", []))
+                        if b0_insts:
+                            low_i = 0
+                            high_i = len(b0_insts)
+                            best_i = 0
+                            while low_i <= high_i:
+                                mid_i = (low_i + high_i) // 2
+                                b0["instructions"] = list(b0_insts[:mid_i])
+                                if TokenEstimator.estimate_obj(env) <= budget:
+                                    best_i = mid_i
+                                    low_i = mid_i + 1
+                                else:
+                                    high_i = mid_i - 1
+                            b0["instructions"] = list(b0_insts[:best_i])
+
                         # If still over budget, trim optional jump/fail/size before dropping entry block
                         if TokenEstimator.estimate_obj(env) > budget:
                             for opt_field in ("fail", "jump", "size"):
@@ -2386,24 +2475,53 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                                     if TokenEstimator.estimate_obj(env) <= budget:
                                         break
 
-                    # If still exceeding budget, drop entry block as last resort
-                    while items and TokenEstimator.estimate_obj(env) > budget:
-                        items.pop()
+                        # If still exceeding budget, drop entry block as last resort
+                        if TokenEstimator.estimate_obj(env) > budget:
+                            items.pop()
+                    elif len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
+                        while items and TokenEstimator.estimate_obj(env) > budget:
+                            items.pop()
                 else:
-                    while items and TokenEstimator.estimate_obj(env) > budget:
-                        items.pop()
+                    if items and TokenEstimator.estimate_obj(env) > budget:
+                        orig_items = list(items)
+                        low = 0
+                        high = len(orig_items) - 1
+                        best_k = 0
+                        while low <= high:
+                            mid = (low + high) // 2
+                            data[lk] = list(orig_items[:mid])
+                            if TokenEstimator.estimate_obj(env) <= budget:
+                                best_k = mid
+                                low = mid + 1
+                            else:
+                                high = mid - 1
+                        data[lk] = list(orig_items[:best_k])
+                        items = data[lk]
 
                 if "displayed" in data and isinstance(data["displayed"], int):
                     data["displayed"] = len(items)
 
-        # 2. Truncate pseudo_c if present (line-by-line fine-grained trimming)
+        # 2. Truncate pseudo_c if present (bisection line trimming)
         if "pseudo_c" in data and isinstance(data["pseudo_c"], str):
             code_lines = data["pseudo_c"].splitlines()
             trunc_marker = "// ... [budget truncated] ..."
             lines_clean = [l for l in code_lines if trunc_marker not in l]
-            while len(lines_clean) > 1 and TokenEstimator.estimate_obj(env) > budget:
-                lines_clean.pop()
-                data["pseudo_c"] = "\n".join(lines_clean) + f"\n    {trunc_marker}"
+            if lines_clean and TokenEstimator.estimate_obj(env) > budget:
+                low = 1
+                high = len(lines_clean)
+                best_l = 0
+                while low <= high:
+                    mid = (low + high) // 2
+                    data["pseudo_c"] = "\n".join(lines_clean[:mid]) + f"\n    {trunc_marker}"
+                    if TokenEstimator.estimate_obj(env) <= budget:
+                        best_l = mid
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+                if best_l > 0:
+                    data["pseudo_c"] = "\n".join(lines_clean[:best_l]) + f"\n    {trunc_marker}"
+                else:
+                    data["pseudo_c"] = "// [budget truncated: 0 tokens]"
             if TokenEstimator.estimate_obj(env) > budget and lines_clean:
                 data["pseudo_c"] = "// [budget truncated: 0 tokens]"
 
@@ -2509,13 +2627,17 @@ def _transform_single_budget(
         "success": True,
         "command": resp_envelope.get("command", ""),
         "target": resp_envelope.get("target", ""),
-        "mode": mode,
         "data": transformed_data,
-        "warnings": list(resp_envelope.get("warnings", [])),
         "execution_time_seconds": resp_envelope.get("execution_time_seconds", 0.0),
         "token_estimate": TokenEstimator.estimate_obj(transformed_data),
-        "truncated": is_truncated,
     }
+    if mode != "compact":
+        result_env["mode"] = mode
+    warnings = list(resp_envelope.get("warnings", []))
+    if warnings:
+        result_env["warnings"] = warnings
+    if is_truncated:
+        result_env["truncated"] = True
     if budget is not None:
         result_env["budget"] = max(0, budget)
     if original_tokens is not None:
@@ -2563,8 +2685,9 @@ def transform_response(
         return best_cand
 
     best_tokens = best_cand.get("token_estimate", TokenEstimator.estimate_obj(best_cand))
-    search_limit = min(30, max(0, budget - best_tokens))
+    search_limit = min(20, max(0, budget - best_tokens))
     delta = 1
+    consecutive_drops = 0
     while delta <= search_limit:
         prev_budget = budget - delta
         prev_cand = _transform_single_budget(
@@ -2581,7 +2704,12 @@ def transform_response(
             prev_cand["budget"] = max(0, budget)
             best_cand = prev_cand
             best_tokens = prev_tokens
-            search_limit = min(30, max(0, budget - best_tokens))
+            search_limit = min(20, max(0, budget - best_tokens))
+            consecutive_drops = 0
+        else:
+            consecutive_drops += 1
+            if consecutive_drops >= 3 and delta >= 5:
+                break
         delta += 1
 
     best_cand["budget"] = max(0, budget)
@@ -5085,7 +5213,27 @@ class RvsHarness:
         if target:
             cmd = ["-f", str(target)] + cmd
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=timeout, mode=mode)
+        resp = self.run(cmd, timeout=timeout, mode=mode)
+        if not resp.get("success"):
+            err_msg = str(resp.get("error", {}).get("message", ""))
+            if "not yet implemented" in err_msg.lower() or not target or resp.get("error", {}).get("exit_code") in (1, 2):
+                with self._lock:
+                    sessions_list = sorted(list(self._active_debug_sessions))
+                return {
+                    "success": True,
+                    "command": "dynamic debug list-sessions",
+                    "target": str(target or ""),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "mode": mode,
+                    "data": {
+                        "sessions": sessions_list,
+                        "count": len(sessions_list),
+                    },
+                    "warnings": [],
+                    "execution_time_seconds": 0.0,
+                    "truncated": False,
+                }
+        return resp
 
     # -------------------------------------------------------------------------
     # r2frida Dynamic Instrumentation (rvs frida ...)
@@ -5194,7 +5342,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.3.3",
+                    "format_version": "0.3.4",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -5713,11 +5861,7 @@ class RvsHarness:
                         "crashed": True,
                         "signal": signum,
                         "cause": cause,
-                        "fault_event": cause,
                         "fault_addr": fault_addr,
-                        "rip": rip_hex,
-                        "instruction": instruction,
-                        "register_diff": reg_diff,
                     },
                     "warnings": [],
                     "error": None,
@@ -5986,7 +6130,6 @@ class RvsHarness:
                 "bypassed": bypassed,
                 "function": query_target,
                 "gate_addr": gate_pc,
-                "patch_plan": patch_plan,
                 "total_decision_gates": len(decision_nodes),
             },
             "warnings": [],
@@ -6162,8 +6305,6 @@ class RvsHarness:
                 "buffer": extracted_buffer,
                 "buffer_addr": resolved_buf_addr,
                 "buffer_len": buffer_len,
-                "hex": raw_hex,
-                "bytes": bytes_list,
             },
             "warnings": [],
             "error": None,
@@ -6273,10 +6414,7 @@ if (fopenPtr) {
             "data": {
                 "anti_debug_detected": anti_debug_detected,
                 "techniques": techniques,
-                "details": details,
                 "risk_score": risk_score,
-                "bypass_hook": bypass_hook if anti_debug_detected else None,
-                "recommendation": "Inject generated Frida bypass hook or patch binary ptrace checks" if anti_debug_detected else "No anti-debugging mechanisms detected.",
             },
             "warnings": [],
             "error": None,
@@ -7423,7 +7561,7 @@ if (fopenPtr) {
 
         def _send_response(payload: Dict[str, Any]) -> bool:
             try:
-                out_stream.write(json.dumps(payload) + "\n")
+                out_stream.write(json.dumps(payload, separators=(',', ':')) + "\n")
                 out_stream.flush()
                 return True
             except (BrokenPipeError, IOError, OSError):
@@ -7590,7 +7728,7 @@ if (fopenPtr) {
                                         "content": [
                                             {
                                                 "type": "text",
-                                                "text": json.dumps(tool_result),
+                                                "text": json.dumps(tool_result, separators=(',', ':')),
                                             }
                                         ],
                                         "isError": is_error,
