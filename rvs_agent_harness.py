@@ -74,7 +74,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.2"
+SERVER_VERSION: str = "0.3.3"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -5194,7 +5194,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.3.2",
+                    "format_version": "0.3.3",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],

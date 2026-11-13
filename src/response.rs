@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::error::AppError;
 
-pub const CURRENT_FORMAT_VERSION: &str = "0.3.2";
+pub const CURRENT_FORMAT_VERSION: &str = "0.3.3";
 
 /// Standard API response envelope wrapping all CLI outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

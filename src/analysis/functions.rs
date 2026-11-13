@@ -34,89 +34,93 @@ pub struct FunctionInfo {
     pub stack_frame_size: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawR2Function {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    addr: Option<u64>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    realsz: Option<u64>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    calltype: Option<String>,
+    #[serde(default)]
+    cc: Option<u64>,
+    #[serde(default)]
+    cost: Option<u64>,
+    #[serde(default)]
+    nbbs: Option<u64>,
+    #[serde(default)]
+    ninstrs: Option<u64>,
+    #[serde(default, rename = "is-pure")]
+    is_pure: Option<serde_json::Value>,
+    #[serde(default)]
+    nargs: Option<u64>,
+    #[serde(default)]
+    nlocals: Option<u64>,
+    #[serde(default)]
+    stackframe: Option<u64>,
+}
+
 pub fn analyze_functions(
     driver: &R2Driver,
     filter: Option<&str>,
     detail: bool,
 ) -> Result<FunctionsResponse, AppError> {
-    let raw_funcs: Vec<serde_json::Value> = driver.cmdj("aa; aflj")?;
+    let raw_funcs: Vec<RawR2Function> = driver.cmdj("aa; aflj")?;
 
-
-    let mut functions = Vec::new();
+    let mut functions = Vec::with_capacity(raw_funcs.len());
 
     for f in raw_funcs {
-        let name = f.get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let name_str = f.name.as_deref().unwrap_or("unknown");
 
         if let Some(f_pat) = filter {
-            if !name.contains(f_pat) {
+            if !name_str.contains(f_pat) {
                 continue;
             }
         }
 
-        let offset = f.get("offset")
-            .or_else(|| f.get("addr"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let name = f.name.unwrap_or_else(|| "unknown".to_string());
+        let offset = f.offset.or(f.addr).unwrap_or(0);
+        let size = f.size.or(f.realsz).unwrap_or(0);
+        let signature = f.signature;
+        let calltype = f.calltype;
+        let cyclomatic_complexity = f.cc.or(f.cost);
+        let num_basic_blocks = f.nbbs;
+        let num_instructions = f.ninstrs;
 
-        let size = f.get("size")
-            .or_else(|| f.get("realsz"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        let signature = f.get("signature").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let calltype = f.get("calltype").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let cyclomatic_complexity = f.get("cc").or_else(|| f.get("cost")).and_then(|v| v.as_u64());
-        let num_basic_blocks = f.get("nbbs").and_then(|v| v.as_u64());
-        let num_instructions = f.get("ninstrs").and_then(|v| v.as_u64());
-        
-        let is_pure = f.get("is-pure")
-            .and_then(|v| {
-                if let Some(b) = v.as_bool() {
-                    Some(b)
-                } else {
-                    v.as_str().map(|s| s == "true")
-                }
-            });
-
-        let num_args = f.get("nargs").and_then(|v| v.as_u64());
-        let num_locals = f.get("nlocals").and_then(|v| v.as_u64());
-        let stack_frame_size = f.get("stackframe").and_then(|v| v.as_u64());
-
-        let func_info = if detail {
-            FunctionInfo {
-                name,
-                offset,
-                offset_hex: format!("{:#x}", offset),
-                size,
-                signature,
-                calltype,
-                cyclomatic_complexity,
-                num_basic_blocks,
-                num_instructions,
-                is_pure,
-                num_args,
-                num_locals,
-                stack_frame_size,
+        let is_pure = f.is_pure.as_ref().and_then(|v| {
+            if let Some(b) = v.as_bool() {
+                Some(b)
+            } else {
+                v.as_str().map(|s| s == "true")
             }
-        } else {
-            FunctionInfo {
-                name,
-                offset,
-                offset_hex: format!("{:#x}", offset),
-                size,
-                signature,
-                calltype,
-                cyclomatic_complexity,
-                num_basic_blocks,
-                num_instructions,
-                is_pure,
-                num_args,
-                num_locals,
-                stack_frame_size: None,
-            }
+        });
+
+        let num_args = f.nargs;
+        let num_locals = f.nlocals;
+        let stack_frame_size = if detail { f.stackframe } else { None };
+
+        let func_info = FunctionInfo {
+            name,
+            offset,
+            offset_hex: format!("{:#x}", offset),
+            size,
+            signature,
+            calltype,
+            cyclomatic_complexity,
+            num_basic_blocks,
+            num_instructions,
+            is_pure,
+            num_args,
+            num_locals,
+            stack_frame_size,
         };
 
         functions.push(func_info);

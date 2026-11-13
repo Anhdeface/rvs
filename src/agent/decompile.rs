@@ -68,7 +68,7 @@ pub fn run_decompile(driver: &R2Driver, function: &str) -> Result<AgentDecompile
     // Run radare2 decompilation / disassembly with analysis
     let r2_batch = driver.cmd_batch(&[
         &format!("aa; s {target_hex}; pdc"),
-        &format!("aa; pdf @ {target_hex}"),
+        &format!("pdf @ {target_hex}"),
     ])?;
 
     let pdc_out = r2_batch.first().map(|s| s.trim()).unwrap_or("");
@@ -82,13 +82,24 @@ pub fn run_decompile(driver: &R2Driver, function: &str) -> Result<AgentDecompile
         String::new()
     };
 
-    // Extract xrefs from function to find referenced strings & data
+    // Extract xrefs from function to find referenced strings & data (batched)
     if let Ok(xrefs_resp) = analysis::analyze_xrefs(driver, &target_hex, XrefDirection::From, None) {
-        for x in &xrefs_resp.xrefs_from {
-            if let Ok(str_val) = driver.read_string_at(&x.to_addr_hex) {
-                let s_trim = str_val.trim();
-                if s_trim.len() >= 3 && seen_strings.insert(s_trim.to_string()) {
-                    strings_referenced.push(s_trim.to_string());
+        let candidate_addrs: Vec<&str> = xrefs_resp
+            .xrefs_from
+            .iter()
+            .filter(|x| x.xref_type != "call" && x.xref_type != "code")
+            .map(|x| x.to_addr_hex.as_str())
+            .collect();
+
+        if !candidate_addrs.is_empty() {
+            let batch_cmds: Vec<String> = candidate_addrs.iter().map(|addr| format!("s {addr}; ps")).collect();
+            let batch_refs: Vec<&str> = batch_cmds.iter().map(|s| s.as_str()).collect();
+            if let Ok(outputs) = driver.cmd_batch(&batch_refs) {
+                for str_val in outputs {
+                    let s_trim = str_val.trim();
+                    if s_trim.len() >= 3 && seen_strings.insert(s_trim.to_string()) {
+                        strings_referenced.push(s_trim.to_string());
+                    }
                 }
             }
         }

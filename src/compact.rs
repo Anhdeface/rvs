@@ -108,11 +108,29 @@ impl CompactFunction {
             instrs: if detail { src.num_instructions } else { None },
         }
     }
+
+    pub fn from_info_owned(src: FunctionInfo, detail: bool) -> Self {
+        Self {
+            name: src.name,
+            addr: src.offset_hex,
+            size: src.size,
+            signature: if detail { src.signature } else { None },
+            cc: src.cyclomatic_complexity,
+            blocks: src.num_basic_blocks,
+            instrs: if detail { src.num_instructions } else { None },
+        }
+    }
 }
 
 impl From<&FunctionInfo> for CompactFunction {
     fn from(src: &FunctionInfo) -> Self {
         Self::from_info(src, false)
+    }
+}
+
+impl From<FunctionInfo> for CompactFunction {
+    fn from(src: FunctionInfo) -> Self {
+        Self::from_info_owned(src, false)
     }
 }
 
@@ -123,11 +141,24 @@ impl CompactFunctionsResponse {
             functions: src.functions.iter().map(|f| CompactFunction::from_info(f, detail)).collect(),
         }
     }
+
+    pub fn from_response_owned(src: FunctionsResponse, detail: bool) -> Self {
+        Self {
+            count: src.count,
+            functions: src.functions.into_iter().map(|f| CompactFunction::from_info_owned(f, detail)).collect(),
+        }
+    }
 }
 
 impl From<&FunctionsResponse> for CompactFunctionsResponse {
     fn from(src: &FunctionsResponse) -> Self {
         Self::from_response(src, false)
+    }
+}
+
+impl From<FunctionsResponse> for CompactFunctionsResponse {
+    fn from(src: FunctionsResponse) -> Self {
+        Self::from_response_owned(src, false)
     }
 }
 
@@ -160,11 +191,33 @@ impl From<&StringsResponse> for CompactStringsResponse {
     }
 }
 
+impl From<StringsResponse> for CompactStringsResponse {
+    fn from(src: StringsResponse) -> Self {
+        let mut map = BTreeMap::new();
+        for s in src.strings {
+            map.insert(s.vaddr_hex, s.string);
+        }
+        Self {
+            count: src.count,
+            strings: map,
+        }
+    }
+}
+
 impl From<&StringEntry> for CompactStringEntry {
     fn from(src: &StringEntry) -> Self {
         Self {
             addr: src.vaddr_hex.clone(),
             string: src.string.clone(),
+        }
+    }
+}
+
+impl From<StringEntry> for CompactStringEntry {
+    fn from(src: StringEntry) -> Self {
+        Self {
+            addr: src.vaddr_hex,
+            string: src.string,
         }
     }
 }
@@ -289,6 +342,40 @@ impl From<&BinaryInfo> for CompactBinaryInfo {
     }
 }
 
+impl From<BinaryInfo> for CompactBinaryInfo {
+    fn from(src: BinaryInfo) -> Self {
+        let mut sec = Vec::new();
+        if src.security.canary { sec.push("canary".to_string()); }
+        if src.security.nx { sec.push("nx".to_string()); }
+        if src.security.pic { sec.push("pic".to_string()); }
+        if src.security.relro != "none" && !src.security.relro.is_empty() {
+            sec.push(format!("relro:{}", src.security.relro));
+        }
+        if src.security.stripped { sec.push("stripped".to_string()); }
+
+        let endian = if src.endian != "little" && !src.endian.is_empty() {
+            Some(src.endian)
+        } else {
+            None
+        };
+        let os = if src.os != "linux" && !src.os.is_empty() {
+            Some(src.os)
+        } else {
+            None
+        };
+
+        Self {
+            format: src.format,
+            arch: src.arch,
+            bits: src.bits,
+            entry_point_hex: src.entry_point_hex,
+            security: sec,
+            endian,
+            os,
+        }
+    }
+}
+
 // ── Compact Graph ──────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -341,6 +428,35 @@ impl From<&GraphResponse> for CompactGraphResponse {
     }
 }
 
+impl From<GraphResponse> for CompactGraphResponse {
+    fn from(src: GraphResponse) -> Self {
+        if src.graph_type == "callgraph" {
+            Self {
+                graph_type: src.graph_type,
+                target: src.target,
+                nodes: src.nodes.len(),
+                edges: src.edges.len(),
+                calls: src.adjacency,
+                flow: None,
+            }
+        } else {
+            let flow_edges: Vec<CompactGraphEdge> = src.edges.into_iter().map(|e| CompactGraphEdge {
+                from: e.from,
+                to: e.to,
+                edge_type: e.edge_type,
+            }).collect();
+            Self {
+                graph_type: src.graph_type,
+                target: src.target,
+                nodes: src.nodes.len(),
+                edges: flow_edges.len(),
+                calls: None,
+                flow: Some(flow_edges),
+            }
+        }
+    }
+}
+
 // ── Compact Prologue/Epilogue ──────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -381,6 +497,18 @@ impl From<&FrameBoundary> for CompactFrameBoundary {
     }
 }
 
+impl From<FrameBoundary> for CompactFrameBoundary {
+    fn from(src: FrameBoundary) -> Self {
+        Self {
+            pattern: src.pattern,
+            start: src.start_addr_hex,
+            end: src.end_addr_hex,
+            size: src.size,
+            instrs: src.instructions.into_iter().map(|i| i.opcode).collect(),
+        }
+    }
+}
+
 impl From<&FunctionFrameInfo> for CompactFunctionFrame {
     fn from(src: &FunctionFrameInfo) -> Self {
         Self {
@@ -392,11 +520,31 @@ impl From<&FunctionFrameInfo> for CompactFunctionFrame {
     }
 }
 
+impl From<FunctionFrameInfo> for CompactFunctionFrame {
+    fn from(src: FunctionFrameInfo) -> Self {
+        Self {
+            name: src.name,
+            addr: src.addr_hex,
+            prologue: src.prologue.map(CompactFrameBoundary::from),
+            epilogue: src.epilogue.map(CompactFrameBoundary::from),
+        }
+    }
+}
+
 impl From<&PrologueEpilogueResponse> for CompactPrologueEpilogueResponse {
     fn from(src: &PrologueEpilogueResponse) -> Self {
         Self {
             count: src.count,
             functions: src.functions.iter().map(CompactFunctionFrame::from).collect(),
+        }
+    }
+}
+
+impl From<PrologueEpilogueResponse> for CompactPrologueEpilogueResponse {
+    fn from(src: PrologueEpilogueResponse) -> Self {
+        Self {
+            count: src.count,
+            functions: src.functions.into_iter().map(CompactFunctionFrame::from).collect(),
         }
     }
 }
@@ -468,6 +616,45 @@ impl From<&AgentTriageData> for CompactAgentTriageData {
     }
 }
 
+impl From<AgentTriageData> for CompactAgentTriageData {
+    fn from(src: AgentTriageData) -> Self {
+        let mut sec = Vec::new();
+        if let Some(s) = src.security {
+            if s.canary == Some(true) { sec.push("canary".to_string()); }
+            if s.nx == Some(true) { sec.push("nx".to_string()); }
+            if s.pic == Some(true) { sec.push("pic".to_string()); }
+            if let Some(r) = s.relro {
+                if r != "none" && !r.is_empty() { sec.push(format!("relro:{}", r)); }
+            }
+            if s.stripped == Some(true) { sec.push("stripped".to_string()); }
+        }
+
+        let top_functions = src.top_functions.into_iter().take(5).map(|f| CompactTriageFunction {
+            name: f.name,
+            addr: f.addr_hex,
+            sz: f.size,
+            cc: f.complexity,
+            blocks: f.num_blocks,
+        }).collect();
+
+        let interesting_strings = src.interesting_strings.into_iter().take(10).collect();
+        let recommendations = src.recommendations.into_iter().take(2).collect();
+
+        Self {
+            format: src.format,
+            arch: src.arch,
+            bits: src.bits,
+            entry: src.entry_point_hex.unwrap_or_else(|| "0x0".to_string()),
+            security: sec,
+            total_functions: src.total_functions,
+            total_strings: src.total_strings,
+            top_functions,
+            interesting_strings,
+            recommendations,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactBranchGate {
     pub addr: String,
@@ -505,6 +692,30 @@ impl From<&AgentFlowData> for CompactAgentFlowData {
         Self {
             function: src.function_name.clone(),
             addr: src.function_addr_hex.clone(),
+            total_blocks: src.total_blocks,
+            loops: src.loop_count,
+            decision_nodes,
+            exits,
+        }
+    }
+}
+
+impl From<AgentFlowData> for CompactAgentFlowData {
+    fn from(src: AgentFlowData) -> Self {
+        let decision_nodes = src.decision_nodes.into_iter().map(|n| CompactBranchGate {
+            addr: n.addr_hex,
+            cond: n.condition_instruction,
+            branch: n.branch_instruction,
+            jump: n.jump_target_hex,
+            fail: n.fail_target_hex,
+            gate_type: n.gate_type,
+        }).collect();
+
+        let exits = src.exit_nodes.into_iter().map(|e| format!("{:#x}", e)).collect();
+
+        Self {
+            function: src.function_name,
+            addr: src.function_addr_hex,
             total_blocks: src.total_blocks,
             loops: src.loop_count,
             decision_nodes,
@@ -572,6 +783,34 @@ impl From<&AgentXrefsData> for CompactAgentXrefsData {
     }
 }
 
+impl From<AgentXrefsData> for CompactAgentXrefsData {
+    fn from(src: AgentXrefsData) -> Self {
+        let callers = src.callers.into_iter().map(|c| CompactCaller {
+            function: c.function,
+            at: c.call_site_hex,
+        }).collect();
+
+        let callees = src.callees.into_iter().map(|c| CompactCallee {
+            function: c.function,
+            at: c.call_site_hex,
+        }).collect();
+
+        let data_refs = src.data_refs.into_iter().map(|d| CompactDataRef {
+            addr: d.addr_hex,
+            ref_type: d.ref_type,
+            preview: d.value_preview,
+        }).collect();
+
+        Self {
+            target: src.target,
+            addr: src.target_addr_hex,
+            callers,
+            callees,
+            data_refs,
+        }
+    }
+}
+
 // ── Compact Xrefs ──────────────────────────────────
 
 /// Compact xref entry.
@@ -613,6 +852,18 @@ impl From<&XrefsResponse> for CompactXrefsResponse {
     }
 }
 
+impl From<XrefsResponse> for CompactXrefsResponse {
+    fn from(src: XrefsResponse) -> Self {
+        Self {
+            target: src.target,
+            addr: src.target_addr_hex,
+            direction: src.direction,
+            count: src.count,
+            xrefs: src.xrefs.into_iter().map(CompactXrefEntry::from).collect(),
+        }
+    }
+}
+
 impl From<&XrefEntry> for CompactXrefEntry {
     fn from(src: &XrefEntry) -> Self {
         Self {
@@ -622,6 +873,19 @@ impl From<&XrefEntry> for CompactXrefEntry {
             to_name: src.to_function.clone().or_else(|| src.to_name.clone()),
             xref_type: src.xref_type.clone(),
             opcode: src.opcode.clone(),
+        }
+    }
+}
+
+impl From<XrefEntry> for CompactXrefEntry {
+    fn from(src: XrefEntry) -> Self {
+        Self {
+            from: src.from_addr_hex,
+            from_name: src.from_function.or(src.from_name),
+            to: src.to_addr_hex,
+            to_name: src.to_function.or(src.to_name),
+            xref_type: src.xref_type,
+            opcode: src.opcode,
         }
     }
 }
@@ -648,6 +912,16 @@ impl From<&RegisterDiff> for CompactRegisterDiff {
     }
 }
 
+impl From<RegisterDiff> for CompactRegisterDiff {
+    fn from(src: RegisterDiff) -> Self {
+        Self {
+            reg: src.reg,
+            from: src.before_hex,
+            to: src.after_hex,
+        }
+    }
+}
+
 /// Compact function return value representation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactReturnValue {
@@ -661,6 +935,15 @@ impl From<&ReturnValueInfo> for CompactReturnValue {
         Self {
             reg: src.reg.clone(),
             val: src.value_hex.clone(),
+        }
+    }
+}
+
+impl From<ReturnValueInfo> for CompactReturnValue {
+    fn from(src: ReturnValueInfo) -> Self {
+        Self {
+            reg: src.reg,
+            val: src.value_hex,
         }
     }
 }
@@ -694,6 +977,22 @@ impl From<&DynamicEmulateResponse> for CompactDynamicEmulateResponse {
             diff: src.register_diff.iter().map(CompactRegisterDiff::from).collect(),
             mem_before: src.memory_before.clone(),
             mem_after: src.memory_after.clone(),
+        }
+    }
+}
+
+impl From<DynamicEmulateResponse> for CompactDynamicEmulateResponse {
+    fn from(src: DynamicEmulateResponse) -> Self {
+        Self {
+            target: src.target,
+            start: src.start_addr_hex,
+            r#final: src.final_addr_hex,
+            steps: src.steps_executed,
+            stop: src.stop_reason,
+            ret: src.return_value.map(CompactReturnValue::from),
+            diff: src.register_diff.into_iter().map(CompactRegisterDiff::from).collect(),
+            mem_before: src.memory_before,
+            mem_after: src.memory_after,
         }
     }
 }
@@ -743,6 +1042,27 @@ impl From<&AgentEmulateData> for CompactAgentEmulateData {
     }
 }
 
+impl From<AgentEmulateData> for CompactAgentEmulateData {
+    fn from(src: AgentEmulateData) -> Self {
+        Self {
+            function_name: src.function_name,
+            start_addr_hex: src.start_addr_hex,
+            final_addr_hex: src.final_addr_hex,
+            steps_executed: src.steps_executed,
+            stop_reason: src.stop_reason,
+            return_value: src.return_value.map(CompactReturnValue::from),
+            key_registers_changed: src.key_registers_changed.into_iter().map(CompactRegisterDiff::from).collect(),
+            branches_encountered: src.branches_encountered.into_iter().map(|b| CompactAgentBranchOutcome {
+                gate_addr_hex: b.gate_addr_hex,
+                condition_instruction: b.condition_instruction,
+                branch_instruction: b.branch_instruction,
+                taken: b.taken,
+                target_addr_hex: b.target_addr_hex,
+            }).collect(),
+        }
+    }
+}
+
 /// Compact single step (or N steps) response for agents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactDynamicStepResponse {
@@ -760,6 +1080,17 @@ impl From<&DynamicStepResponse> for CompactDynamicStepResponse {
             next: src.next_addr_hex.clone(),
             asm: src.instruction.clone(),
             diff: src.reg_changes.iter().map(CompactRegisterDiff::from).collect(),
+        }
+    }
+}
+
+impl From<DynamicStepResponse> for CompactDynamicStepResponse {
+    fn from(src: DynamicStepResponse) -> Self {
+        Self {
+            curr: src.current_addr_hex,
+            next: src.next_addr_hex,
+            asm: src.instruction,
+            diff: src.reg_changes.into_iter().map(CompactRegisterDiff::from).collect(),
         }
     }
 }
@@ -793,7 +1124,6 @@ impl From<&DynamicTraceResponse> for CompactDynamicTraceResponse {
                 .trace
                 .iter()
                 .map(|s| {
-                    // Suppress redundant instruction pointer register changes that match step address
                     let diff = s
                         .reg_changes
                         .iter()
@@ -817,6 +1147,39 @@ impl From<&DynamicTraceResponse> for CompactDynamicTraceResponse {
     }
 }
 
+impl From<DynamicTraceResponse> for CompactDynamicTraceResponse {
+    fn from(src: DynamicTraceResponse) -> Self {
+        Self {
+            target: src.target,
+            start: src.start_addr_hex,
+            steps: src.total_steps,
+            trace: src
+                .trace
+                .into_iter()
+                .map(|s| {
+                    let diff = s
+                        .reg_changes
+                        .into_iter()
+                        .filter(|d| {
+                            let is_redundant_ip = (d.reg == "rip" || d.reg == "eip" || d.reg == "pc")
+                                && (d.after == s.addr || d.after_hex == s.addr_hex);
+                            !is_redundant_ip
+                        })
+                        .map(CompactRegisterDiff::from)
+                        .collect();
+
+                    CompactTraceStep {
+                        step: s.step,
+                        addr: s.addr_hex,
+                        asm: s.disasm,
+                        diff,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 // ── Basic Block Conversions ────────────────────────
 
 impl From<&BasicBlocksResponse> for CompactBlocksResponse {
@@ -826,6 +1189,17 @@ impl From<&BasicBlocksResponse> for CompactBlocksResponse {
             addr: src.function_addr_hex.clone(),
             total_blocks: src.total_blocks,
             blocks: src.blocks.iter().map(CompactBlock::from).collect(),
+        }
+    }
+}
+
+impl From<BasicBlocksResponse> for CompactBlocksResponse {
+    fn from(src: BasicBlocksResponse) -> Self {
+        Self {
+            function: src.function_name,
+            addr: src.function_addr_hex,
+            total_blocks: src.total_blocks,
+            blocks: src.blocks.into_iter().map(CompactBlock::from).collect(),
         }
     }
 }
@@ -842,11 +1216,33 @@ impl From<&BasicBlockInfo> for CompactBlock {
     }
 }
 
+impl From<BasicBlockInfo> for CompactBlock {
+    fn from(src: BasicBlockInfo) -> Self {
+        Self {
+            addr: src.addr_hex,
+            size: src.size,
+            jump: src.jump_hex,
+            fail: src.fail_hex,
+            instructions: src.instructions.into_iter().map(CompactInstruction::from).collect(),
+        }
+    }
+}
+
 impl From<&InstructionInfo> for CompactInstruction {
     fn from(src: &InstructionInfo) -> Self {
         Self {
             addr: src.addr_hex.clone(),
             asm: src.disasm.clone(),
+            size: src.size,
+        }
+    }
+}
+
+impl From<InstructionInfo> for CompactInstruction {
+    fn from(src: InstructionInfo) -> Self {
+        Self {
+            addr: src.addr_hex,
+            asm: src.disasm,
             size: src.size,
         }
     }

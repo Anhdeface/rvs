@@ -1,26 +1,190 @@
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use serde::de::DeserializeOwned;
 use crate::response::AppError;
 
 #[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+#[repr(C)]
+struct pollfd {
+    fd: std::os::raw::c_int,
+    events: std::os::raw::c_short,
+    revents: std::os::raw::c_short,
+}
 
 #[cfg(unix)]
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn poll(fds: *mut pollfd, nfds: usize, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+struct R2Session {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    buffer: Vec<u8>,
+    buf_pos: usize,
+    buf_len: usize,
+    terminated: bool,
+}
+
+impl R2Session {
+    fn terminate(&mut self) {
+        if !self.terminated {
+            self.terminated = true;
+            #[cfg(unix)]
+            unsafe {
+                kill(-(self.child.id() as i32), 9);
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn read_response(&mut self, timeout: Duration) -> Result<Vec<u8>, AppError> {
+        let start = std::time::Instant::now();
+        let mut result = Vec::new();
+
+        #[cfg(unix)]
+        let raw_fd = self.stdout.as_raw_fd();
+
+        loop {
+            // First check if there is any \0 in the buffered data
+            if self.buf_pos < self.buf_len {
+                if let Some(nul_idx) = self.buffer[self.buf_pos..self.buf_len]
+                    .iter()
+                    .position(|&b| b == 0)
+                {
+                    let actual_idx = self.buf_pos + nul_idx;
+                    result.extend_from_slice(&self.buffer[self.buf_pos..actual_idx]);
+                    self.buf_pos = actual_idx + 1;
+                    return Ok(result);
+                } else {
+                    result.extend_from_slice(&self.buffer[self.buf_pos..self.buf_len]);
+                    self.buf_pos = 0;
+                    self.buf_len = 0;
+                }
+            }
+
+            // Buffer is empty, check timeout before waiting for fd
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                self.terminate();
+                return Err(AppError::Timeout(format!(
+                    "radare2 process timed out after {}s",
+                    timeout.as_secs()
+                )));
+            }
+            let remaining = timeout - elapsed;
+            let remaining_ms = (remaining.as_millis() as std::os::raw::c_int).max(1);
+
+            #[cfg(unix)]
+            {
+                let mut pfd = pollfd {
+                    fd: raw_fd,
+                    events: 0x0001, // POLLIN
+                    revents: 0,
+                };
+                let ret = unsafe { poll(&mut pfd, 1, remaining_ms) };
+                if ret < 0 {
+                    self.terminate();
+                    return Err(AppError::R2ExecutionError("poll() error on radare2 stdout".to_string()));
+                }
+                if ret == 0 {
+                    self.terminate();
+                    return Err(AppError::Timeout(format!(
+                        "radare2 process timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
+            }
+
+            self.buf_pos = 0;
+            match self.stdout.read(&mut self.buffer) {
+                Ok(0) => {
+                    self.terminate();
+                    return Err(AppError::R2ExecutionError(
+                        "radare2 persistent process closed unexpectedly (EOF)".to_string(),
+                    ));
+                }
+                Ok(n) => {
+                    self.buf_len = n;
+                }
+                Err(e) => {
+                    self.terminate();
+                    return Err(AppError::R2ExecutionError(format!(
+                        "Failed to read from radare2 stdout: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn send_command(&mut self, cmd: &str, timeout: Duration) -> Result<String, AppError> {
+        let trimmed = cmd.trim();
+        self.stdin
+            .write_all(trimmed.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| {
+                self.terminate();
+                AppError::R2ExecutionError(format!("Failed to write to radare2 stdin: {e}"))
+            })?;
+
+        let bytes = self.read_response(timeout)?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+}
+
+impl Drop for R2Session {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 /// High-performance driver wrapping radare2 subprocess invocations.
-#[derive(Debug, Clone)]
 pub struct R2Driver {
     pub binary_path: PathBuf,
     pub arch: Option<String>,
     pub bits: Option<u32>,
     pub quiet: bool,
     pub timeout: Duration,
+    session: Arc<Mutex<Option<R2Session>>>,
+    address_cache: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl Clone for R2Driver {
+    fn clone(&self) -> Self {
+        Self {
+            binary_path: self.binary_path.clone(),
+            arch: self.arch.clone(),
+            bits: self.bits,
+            quiet: self.quiet,
+            timeout: self.timeout,
+            session: Arc::clone(&self.session),
+            address_cache: Arc::clone(&self.address_cache),
+        }
+    }
+}
+
+impl std::fmt::Debug for R2Driver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("R2Driver")
+            .field("binary_path", &self.binary_path)
+            .field("arch", &self.arch)
+            .field("bits", &self.bits)
+            .field("quiet", &self.quiet)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 pub const BATCH_DELIMITER: &str = "===RVS_CMD_BATCH_BOUNDARY_DELIM===";
@@ -54,7 +218,77 @@ impl R2Driver {
             bits,
             quiet,
             timeout: Duration::from_secs(30),
+            session: Arc::new(Mutex::new(None)),
+            address_cache: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Spawns a persistent bidirectional radare2 process using -N -0 -2.
+    fn spawn_session(&self) -> Result<R2Session, AppError> {
+        let mut cmd = Command::new("radare2");
+        cmd.arg("-N")
+            .arg("-0")
+            .arg("-2")
+            .arg("-e").arg("scr.color=0")
+            .arg("-e").arg("scr.interactive=0")
+            .arg("-e").arg("scr.prompt=0")
+            .arg("-e").arg("scr.utf8=0")
+            .arg("-e").arg("cfg.fortunes=0")
+            .arg("-e").arg("cfg.plugins=false")
+            .arg("-e").arg("log.level=0")
+            .arg("-e").arg("bin.relocs.apply=false")
+            .arg("-e").arg("anal.hasnext=false")
+            .arg("-e").arg("anal.vars=false");
+
+        if let Some(ref a) = self.arch {
+            cmd.arg("-a").arg(a);
+        }
+        if let Some(b) = self.bits {
+            cmd.arg("-b").arg(b.to_string());
+        }
+
+        cmd.arg(&self.binary_path);
+
+        cmd.env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("R2_NOPLUGINS", "1")
+            .env("RADARE2_RCFILE", "/dev/null")
+            .env("R2_RCFILE", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            AppError::R2ExecutionError(format!("Failed to spawn radare2 process: {e}"))
+        })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            AppError::R2ExecutionError("Failed to open stdin for radare2".to_string())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AppError::R2ExecutionError("Failed to open stdout for radare2".to_string())
+        })?;
+
+        let mut session = R2Session {
+            child,
+            stdin,
+            stdout,
+            buffer: vec![0u8; 16384],
+            buf_pos: 0,
+            buf_len: 0,
+            terminated: false,
+        };
+
+        // Read initial \0 emitted by radare2 on startup
+        if let Err(e) = session.read_response(self.timeout) {
+            session.terminate();
+            return Err(e);
+        }
+
+        Ok(session)
     }
 
     /// Customizes the subprocess execution timeout.
@@ -103,25 +337,20 @@ impl R2Driver {
 
     /// Executes a read-only radare2 command batch and returns raw stdout string.
     pub fn cmd(&self, r2_cmd: &str) -> Result<String, AppError> {
-        let mut cmd = self.build_base_command(false);
-        cmd.arg("-c").arg(r2_cmd);
-        cmd.arg(&self.binary_path);
-
-        let (status, stdout_bytes, stderr_bytes) = execute_command_with_timeout(cmd, self.timeout)?;
-        let stdout = sanitize_terminal_output(&String::from_utf8_lossy(&stdout_bytes));
-        let stderr = sanitize_terminal_output(&String::from_utf8_lossy(&stderr_bytes));
-
-        if !status.success() {
-            if stderr.contains("Permission denied") {
-                return Err(AppError::PermissionDenied(self.binary_path.display().to_string()));
-            }
-            return Err(AppError::R2ExecutionError(format!(
-                "radare2 exited with status {}: {}",
-                status, stderr.trim()
-            )));
+        let mut session_guard = self.session.lock().unwrap();
+        if session_guard.is_none() {
+            *session_guard = Some(self.spawn_session()?);
         }
 
-        Ok(stdout)
+        let raw = match session_guard.as_mut().unwrap().send_command(r2_cmd, self.timeout) {
+            Ok(out) => out,
+            Err(e) => {
+                *session_guard = None;
+                return Err(e);
+            }
+        };
+
+        Ok(sanitize_terminal_output(&raw))
     }
 
     /// Executes a read-only radare2 command batch and deserializes JSON output.
@@ -140,26 +369,32 @@ impl R2Driver {
             return self.cmd(commands[0]).map(|out| vec![out]);
         }
 
-        // Join commands separated by echo delimiter
-        let mut batched_cmd = String::new();
-        for (i, cmd) in commands.iter().enumerate() {
-            if i > 0 {
-                batched_cmd.push_str(&format!("; ?e {}; ", BATCH_DELIMITER));
-            }
-            batched_cmd.push_str(cmd.trim());
-        }
-
-        let raw = self.cmd(&batched_cmd)?;
-        let parts: Vec<&str> = raw.split(BATCH_DELIMITER).collect();
-
+        const CHUNK_SIZE: usize = 30;
         let mut results = Vec::with_capacity(commands.len());
-        for (i, part) in parts.iter().enumerate() {
-            if i < commands.len() {
-                results.push(part.trim().to_string());
+
+        for chunk in commands.chunks(CHUNK_SIZE) {
+            let mut batched_cmd = String::new();
+            for (i, cmd) in chunk.iter().enumerate() {
+                if i > 0 {
+                    batched_cmd.push_str(&format!("; ?e {}; ", BATCH_DELIMITER));
+                }
+                batched_cmd.push_str(cmd.trim());
+            }
+
+            let raw = self.cmd(&batched_cmd)?;
+            let parts: Vec<&str> = raw.split(BATCH_DELIMITER).collect();
+
+            for (i, part) in parts.iter().enumerate() {
+                if i < chunk.len() {
+                    results.push(part.trim().to_string());
+                }
+            }
+
+            while results.len() < results.capacity().min(results.len() + chunk.len().saturating_sub(parts.len())) {
+                results.push(String::new());
             }
         }
 
-        // If radare2 stopped early, fill remaining outputs with empty strings
         while results.len() < commands.len() {
             results.push(String::new());
         }
@@ -169,6 +404,14 @@ impl R2Driver {
 
     /// Executes a write-mode radare2 command batch on the target binary.
     pub fn cmd_write(&self, r2_cmd: &str) -> Result<String, AppError> {
+        // Reset persistent session and invalidate address cache upon write
+        {
+            let mut session_guard = self.session.lock().unwrap();
+            *session_guard = None;
+            let mut cache = self.address_cache.lock().unwrap();
+            cache.clear();
+        }
+
         let mut cmd = self.build_base_command(true);
         cmd.arg("-c").arg(r2_cmd);
         cmd.arg(&self.binary_path);
@@ -280,45 +523,81 @@ impl R2Driver {
             return Ok(addr);
         }
 
-        // Check functions or symbols via radare2 evaluation: "?v <expr>"
-        let eval_out = self.cmd(&format!("?v {}", trimmed))?;
-        let eval_str = eval_out.trim();
-        if let Ok(addr) = eval_str.parse::<u64>() {
-            if addr != 0 || trimmed == "0" || trimmed == "0x0" {
+        // Check in-memory cache
+        {
+            let cache = self.address_cache.lock().unwrap();
+            if let Some(&addr) = cache.get(trimmed) {
                 return Ok(addr);
             }
         }
-        if eval_str.starts_with("0x") || eval_str.starts_with("0X") {
-            if let Ok(addr) = u64::from_str_radix(&eval_str[2..], 16) {
+
+        // Check functions or symbols via radare2 evaluation: "?v <expr>"
+        if let Ok(eval_out) = self.cmd(&format!("?v {}", trimmed)) {
+            let eval_str = eval_out.trim();
+            let mut resolved: Option<u64> = None;
+            if let Ok(addr) = eval_str.parse::<u64>() {
                 if addr != 0 || trimmed == "0" || trimmed == "0x0" {
-                    return Ok(addr);
+                    resolved = Some(addr);
+                }
+            } else if eval_str.starts_with("0x") || eval_str.starts_with("0X") {
+                if let Ok(addr) = u64::from_str_radix(&eval_str[2..], 16) {
+                    if addr != 0 || trimmed == "0" || trimmed == "0x0" {
+                        resolved = Some(addr);
+                    }
                 }
             }
+            if let Some(addr) = resolved {
+                let mut cache = self.address_cache.lock().unwrap();
+                cache.insert(trimmed.to_string(), addr);
+                return Ok(addr);
+            }
+        }
+
+        // Check if symbol exists in symbol table (isj) first (faster than aa; aflj)
+        let symbols: Vec<serde_json::Value> = self.cmdj("isj").unwrap_or_default();
+        let mut found_addr = None;
+        {
+            let mut cache = self.address_cache.lock().unwrap();
+            for s in symbols {
+                if let Some(name) = s.get("name").or_else(|| s.get("flagname")).or_else(|| s.get("realname")).and_then(|n| n.as_str()) {
+                    if let Some(addr) = s.get("vaddr").or_else(|| s.get("paddr")).or_else(|| s.get("offset")).and_then(|a| a.as_u64()) {
+                        cache.insert(name.to_string(), addr);
+                        let clean = name.trim_start_matches("sym.");
+                        if clean != name {
+                            cache.insert(clean.to_string(), addr);
+                        }
+                        if found_addr.is_none() && (name == trimmed || clean == trimmed) {
+                            found_addr = Some(addr);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(addr) = found_addr {
+            return Ok(addr);
         }
 
         // Check if symbol exists in AFL
         let funcs: Vec<serde_json::Value> = self.cmdj("aa; aflj").unwrap_or_default();
-
-        for f in funcs {
-            if let Some(name) = f.get("name").and_then(|n| n.as_str()) {
-                if name == trimmed || name.trim_start_matches("sym.") == trimmed {
+        {
+            let mut cache = self.address_cache.lock().unwrap();
+            for f in funcs {
+                if let Some(name) = f.get("name").and_then(|n| n.as_str()) {
                     if let Some(addr) = f.get("offset").or_else(|| f.get("addr")).and_then(|a| a.as_u64()) {
-                        return Ok(addr);
+                        cache.insert(name.to_string(), addr);
+                        let clean = name.trim_start_matches("sym.");
+                        if clean != name {
+                            cache.insert(clean.to_string(), addr);
+                        }
+                        if found_addr.is_none() && (name == trimmed || clean == trimmed) {
+                            found_addr = Some(addr);
+                        }
                     }
                 }
             }
         }
-
-        // Check if symbol exists in symbol table (isj)
-        let symbols: Vec<serde_json::Value> = self.cmdj("isj").unwrap_or_default();
-        for s in symbols {
-            if let Some(name) = s.get("name").or_else(|| s.get("flagname")).or_else(|| s.get("realname")).and_then(|n| n.as_str()) {
-                if name == trimmed || name.trim_start_matches("sym.") == trimmed {
-                    if let Some(addr) = s.get("vaddr").or_else(|| s.get("paddr")).or_else(|| s.get("offset")).and_then(|a| a.as_u64()) {
-                        return Ok(addr);
-                    }
-                }
-            }
+        if let Some(addr) = found_addr {
+            return Ok(addr);
         }
 
         Err(AppError::SymbolNotFound(target.to_string()))
@@ -357,6 +636,7 @@ fn execute_command_with_timeout(
     });
 
     let start = std::time::Instant::now();
+    let mut sleep_dur = Duration::from_micros(100);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -375,7 +655,10 @@ fn execute_command_with_timeout(
                         timeout.as_secs()
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(sleep_dur);
+                if sleep_dur < Duration::from_millis(2) {
+                    sleep_dur = (sleep_dur * 2).min(Duration::from_millis(2));
+                }
             }
             Err(e) => {
                 #[cfg(unix)]

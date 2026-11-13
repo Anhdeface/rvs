@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use serde::Deserialize;
 use crate::error::AppError;
 use crate::frida::types::FridaEnvStatus;
@@ -16,8 +17,14 @@ struct IoPluginInfo {
     permissions: Option<String>,
 }
 
-/// Probes the host system and radare2 configuration for r2frida availability.
+static FRIDA_ENV_CACHE: OnceLock<FridaEnvStatus> = OnceLock::new();
+
+/// Probes the host system and radare2 configuration for r2frida availability (memoized).
 pub fn probe_r2frida_env() -> FridaEnvStatus {
+    FRIDA_ENV_CACHE.get_or_init(probe_r2frida_env_uncached).clone()
+}
+
+fn probe_r2frida_env_uncached() -> FridaEnvStatus {
     let mut search_paths = Vec::new();
     let mut r2_version = "unknown".to_string();
 

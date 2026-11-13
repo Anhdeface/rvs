@@ -102,6 +102,72 @@ pub fn normalize_xref_type(raw_type: &str) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct RawR2XrefTo {
+    #[serde(default)]
+    from: Option<u64>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    addr: Option<u64>,
+    #[serde(default, rename = "type")]
+    xref_type: Option<String>,
+    #[serde(default)]
+    opcode: Option<String>,
+    #[serde(default)]
+    perm: Option<String>,
+    #[serde(default)]
+    fcn_addr: Option<u64>,
+    #[serde(default)]
+    fcn_name: Option<String>,
+    #[serde(default)]
+    refname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawR2XrefFrom {
+    #[serde(default)]
+    from: Option<u64>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    addr: Option<u64>,
+    #[serde(default)]
+    to: Option<u64>,
+    #[serde(default, rename = "ref")]
+    ref_addr: Option<u64>,
+    #[serde(default, rename = "type")]
+    xref_type: Option<String>,
+    #[serde(default)]
+    opcode: Option<String>,
+    #[serde(default)]
+    perm: Option<String>,
+    #[serde(default)]
+    refname: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawR2XrefFcn {
+    #[serde(default)]
+    at: Option<u64>,
+    #[serde(default)]
+    from: Option<u64>,
+    #[serde(default, rename = "ref")]
+    ref_addr: Option<u64>,
+    #[serde(default)]
+    to: Option<u64>,
+    #[serde(default, rename = "type")]
+    xref_type: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    refname: Option<String>,
+    #[serde(default)]
+    opcode: Option<String>,
+}
+
 /// Analyzes cross references to and/or from a given target address or symbol.
 pub fn analyze_xrefs(
     driver: &R2Driver,
@@ -142,20 +208,25 @@ pub fn analyze_xrefs(
     let mut to_entries = Vec::new();
     let mut from_entries = Vec::new();
 
-    // 1. References TO target (axtj)
-    if direction == XrefDirection::To || direction == XrefDirection::All {
+    if direction == XrefDirection::All {
         let cmd_axt = format!("aaa; axtj @ {}", target_addr_hex);
-        let raw_axt: Vec<serde_json::Value> = driver.cmdj(&cmd_axt).unwrap_or_default();
+        let cmd_axf = format!("axfj @ {}", target_addr_hex);
+        let cmd_axff = format!("axffj @ {}", target_addr_hex);
+        let batch = driver.cmd_batch(&[&cmd_axt, &cmd_axf, &cmd_axff])?;
+
+        let raw_axt: Vec<RawR2XrefTo> = batch.first().and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
+        let raw_axf: Vec<RawR2XrefFrom> = batch.get(1).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
+        let raw_axff: Vec<RawR2XrefFcn> = batch.get(2).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
 
         for item in raw_axt {
-            let from = item.get("from").or_else(|| item.get("offset")).or_else(|| item.get("addr")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("code");
+            let from = item.from.or(item.offset).or(item.addr).unwrap_or(0);
+            let raw_type = item.xref_type.as_deref().unwrap_or("code");
             let norm_type = normalize_xref_type(raw_type);
-            let opcode = item.get("opcode").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let perm = item.get("perm").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let fcn_addr = item.get("fcn_addr").and_then(|v| v.as_u64());
-            let fcn_name = item.get("fcn_name").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let refname = item.get("refname").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let opcode = item.opcode;
+            let perm = item.perm;
+            let fcn_addr = item.fcn_addr;
+            let fcn_name = item.fcn_name;
+            let refname = item.refname;
 
             to_entries.push(XrefEntry {
                 from_addr: from,
@@ -172,21 +243,15 @@ pub fn analyze_xrefs(
                 fcn_addr,
             });
         }
-    }
-
-    // 2. References FROM target (axfj / axffj)
-    if direction == XrefDirection::From || direction == XrefDirection::All {
-        let cmd_axf = format!("aaa; axfj @ {}", target_addr_hex);
-        let raw_axf: Vec<serde_json::Value> = driver.cmdj(&cmd_axf).unwrap_or_default();
 
         for item in raw_axf {
-            let from = item.get("from").or_else(|| item.get("offset")).or_else(|| item.get("addr")).and_then(|v| v.as_u64()).unwrap_or(target_addr);
-            let to = item.get("to").or_else(|| item.get("ref")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("code");
+            let from = item.from.or(item.offset).or(item.addr).unwrap_or(target_addr);
+            let to = item.to.or(item.ref_addr).unwrap_or(0);
+            let raw_type = item.xref_type.as_deref().unwrap_or("code");
             let norm_type = normalize_xref_type(raw_type);
-            let opcode = item.get("opcode").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let perm = item.get("perm").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let refname = item.get("refname").or_else(|| item.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let opcode = item.opcode;
+            let perm = item.perm;
+            let refname = item.refname.or(item.name);
 
             from_entries.push(XrefEntry {
                 from_addr: from,
@@ -204,32 +269,113 @@ pub fn analyze_xrefs(
             });
         }
 
-        // Also query function xrefs (axffj)
-        let cmd_axff = format!("aaa; axffj @ {}", target_addr_hex);
-        if let Ok(raw_axff) = driver.cmdj::<Vec<serde_json::Value>>(&cmd_axff) {
-            for item in raw_axff {
-                let from = item.get("at").or_else(|| item.get("from")).and_then(|v| v.as_u64()).unwrap_or(0);
-                let to = item.get("ref").or_else(|| item.get("to")).and_then(|v| v.as_u64()).unwrap_or(0);
-                let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("code");
-                let norm_type = normalize_xref_type(raw_type);
-                let name = item.get("name").or_else(|| item.get("refname")).and_then(|v| v.as_str()).map(|s| s.to_string());
-                let opcode = item.get("opcode").and_then(|v| v.as_str()).map(|s| s.to_string());
+        for item in raw_axff {
+            let from = item.at.or(item.from).unwrap_or(0);
+            let to = item.ref_addr.or(item.to).unwrap_or(0);
+            let raw_type = item.xref_type.as_deref().unwrap_or("code");
+            let norm_type = normalize_xref_type(raw_type);
+            let name = item.name.or(item.refname);
+            let opcode = item.opcode;
 
-                from_entries.push(XrefEntry {
-                    from_addr: from,
-                    from_addr_hex: format!("{:#x}", from),
-                    from_function: Some(target.to_string()),
-                    from_name: Some(target.to_string()),
-                    to_addr: to,
-                    to_addr_hex: format!("{:#x}", to),
-                    to_function: name.clone(),
-                    to_name: name,
-                    xref_type: norm_type,
-                    opcode,
-                    perm: None,
-                    fcn_addr: Some(target_addr),
-                });
-            }
+            from_entries.push(XrefEntry {
+                from_addr: from,
+                from_addr_hex: format!("{:#x}", from),
+                from_function: Some(target.to_string()),
+                from_name: Some(target.to_string()),
+                to_addr: to,
+                to_addr_hex: format!("{:#x}", to),
+                to_function: name.clone(),
+                to_name: name,
+                xref_type: norm_type,
+                opcode,
+                perm: None,
+                fcn_addr: Some(target_addr),
+            });
+        }
+    } else if direction == XrefDirection::To {
+        let cmd_axt = format!("aaa; axtj @ {}", target_addr_hex);
+        let raw_axt: Vec<RawR2XrefTo> = driver.cmdj(&cmd_axt).unwrap_or_default();
+
+        for item in raw_axt {
+            let from = item.from.or(item.offset).or(item.addr).unwrap_or(0);
+            let raw_type = item.xref_type.as_deref().unwrap_or("code");
+            let norm_type = normalize_xref_type(raw_type);
+            let opcode = item.opcode;
+            let perm = item.perm;
+            let fcn_addr = item.fcn_addr;
+            let fcn_name = item.fcn_name;
+            let refname = item.refname;
+
+            to_entries.push(XrefEntry {
+                from_addr: from,
+                from_addr_hex: format!("{:#x}", from),
+                from_function: fcn_name.clone(),
+                from_name: fcn_name,
+                to_addr: target_addr,
+                to_addr_hex: target_addr_hex.clone(),
+                to_function: refname.clone().or_else(|| Some(target.to_string())),
+                to_name: refname.or_else(|| Some(target.to_string())),
+                xref_type: norm_type,
+                opcode,
+                perm,
+                fcn_addr,
+            });
+        }
+    } else {
+        let cmd_axf = format!("aaa; axfj @ {}", target_addr_hex);
+        let cmd_axff = format!("axffj @ {}", target_addr_hex);
+        let batch = driver.cmd_batch(&[&cmd_axf, &cmd_axff])?;
+
+        let raw_axf: Vec<RawR2XrefFrom> = batch.first().and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
+        let raw_axff: Vec<RawR2XrefFcn> = batch.get(1).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
+
+        for item in raw_axf {
+            let from = item.from.or(item.offset).or(item.addr).unwrap_or(target_addr);
+            let to = item.to.or(item.ref_addr).unwrap_or(0);
+            let raw_type = item.xref_type.as_deref().unwrap_or("code");
+            let norm_type = normalize_xref_type(raw_type);
+            let opcode = item.opcode;
+            let perm = item.perm;
+            let refname = item.refname.or(item.name);
+
+            from_entries.push(XrefEntry {
+                from_addr: from,
+                from_addr_hex: format!("{:#x}", from),
+                from_function: Some(target.to_string()),
+                from_name: Some(target.to_string()),
+                to_addr: to,
+                to_addr_hex: format!("{:#x}", to),
+                to_function: refname.clone(),
+                to_name: refname,
+                xref_type: norm_type,
+                opcode,
+                perm,
+                fcn_addr: Some(target_addr),
+            });
+        }
+
+        for item in raw_axff {
+            let from = item.at.or(item.from).unwrap_or(0);
+            let to = item.ref_addr.or(item.to).unwrap_or(0);
+            let raw_type = item.xref_type.as_deref().unwrap_or("code");
+            let norm_type = normalize_xref_type(raw_type);
+            let name = item.name.or(item.refname);
+            let opcode = item.opcode;
+
+            from_entries.push(XrefEntry {
+                from_addr: from,
+                from_addr_hex: format!("{:#x}", from),
+                from_function: Some(target.to_string()),
+                from_name: Some(target.to_string()),
+                to_addr: to,
+                to_addr_hex: format!("{:#x}", to),
+                to_function: name.clone(),
+                to_name: name,
+                xref_type: norm_type,
+                opcode,
+                perm: None,
+                fcn_addr: Some(target_addr),
+            });
         }
     }
 

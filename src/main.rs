@@ -209,13 +209,13 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 )),
                 OutputFormat::Jsonl => serde_json::to_string(&data).map_err(Into::into),
                 OutputFormat::Agent => {
-                    let comp = compact::CompactBinaryInfo::from(&data);
+                    let comp = compact::CompactBinaryInfo::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactBinaryInfo::from(&data);
+                        let comp = compact::CompactBinaryInfo::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -231,7 +231,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_functions(&driver, filter.as_deref(), *detail)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactFunctionsResponse::from_response(&data, *detail);
+                    let comp = compact::CompactFunctionsResponse::from_response_owned(data, *detail);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -258,7 +258,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactFunctionsResponse::from_response(&data, *detail);
+                        let comp = compact::CompactFunctionsResponse::from_response_owned(data, *detail);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -272,7 +272,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_blocks(&driver, target, *disasm)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactBlocksResponse::from(&data);
+                    let comp = compact::CompactBlocksResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -299,7 +299,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactBlocksResponse::from(&data);
+                        let comp = compact::CompactBlocksResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -316,13 +316,13 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_graph(&driver, target.as_deref(), *graph_type, graph_format)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactGraphResponse::from(&data);
+                    let comp = compact::CompactGraphResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactGraphResponse::from(&data);
+                        let comp = compact::CompactGraphResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -336,7 +336,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_prologue_epilogue(&driver, target.as_deref())?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactPrologueEpilogueResponse::from(&data);
+                    let comp = compact::CompactPrologueEpilogueResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -362,7 +362,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactPrologueEpilogueResponse::from(&data);
+                        let comp = compact::CompactPrologueEpilogueResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -378,7 +378,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_xrefs(&driver, target, *xref_type, *kind)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactXrefsResponse::from(&data);
+                    let comp = compact::CompactXrefsResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -418,7 +418,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactXrefsResponse::from(&data);
+                        let comp = compact::CompactXrefsResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -450,7 +450,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::list_strings(&driver, *min_len)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactStringsResponse::from(&data);
+                    let comp = compact::CompactStringsResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -475,7 +475,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactStringsResponse::from(&data);
+                        let comp = compact::CompactStringsResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -542,13 +542,13 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 OutputFormat::Jsonl => serde_json::to_string(&data).map_err(Into::into),
                 OutputFormat::Agent => {
-                    let comp = compact::CompactAgentTriageData::from(&data);
+                    let comp = compact::CompactAgentTriageData::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactAgentTriageData::from(&data);
+                        let comp = compact::CompactAgentTriageData::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -597,13 +597,13 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                     Ok(lines.join("\n"))
                 }
                 OutputFormat::Agent => {
-                    let comp = compact::CompactAgentFlowData::from(&data);
+                    let comp = compact::CompactAgentFlowData::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactAgentFlowData::from(&data);
+                        let comp = compact::CompactAgentFlowData::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -645,13 +645,13 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                     Ok(lines.join("\n"))
                 }
                 OutputFormat::Agent => {
-                    let comp = compact::CompactAgentXrefsData::from(&data);
+                    let comp = compact::CompactAgentXrefsData::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactAgentXrefsData::from(&data);
+                        let comp = compact::CompactAgentXrefsData::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -687,7 +687,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_emulate(&driver, &opts)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactDynamicEmulateResponse::from(&data);
+                    let comp = compact::CompactDynamicEmulateResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -713,7 +713,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 OutputFormat::Jsonl => serde_json::to_string(&data).map_err(Into::into),
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactDynamicEmulateResponse::from(&data);
+                        let comp = compact::CompactDynamicEmulateResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -736,7 +736,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_trace(&driver, &opts)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactDynamicTraceResponse::from(&data);
+                    let comp = compact::CompactDynamicTraceResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -768,7 +768,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactDynamicTraceResponse::from(&data);
+                        let comp = compact::CompactDynamicTraceResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -786,7 +786,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             let data = analysis::analyze_step(&driver, target, *count, reg_set)?;
             match format {
                 OutputFormat::Agent => {
-                    let comp = compact::CompactDynamicStepResponse::from(&data);
+                    let comp = compact::CompactDynamicStepResponse::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
@@ -808,7 +808,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 OutputFormat::Jsonl => serde_json::to_string(&data).map_err(Into::into),
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactDynamicStepResponse::from(&data);
+                        let comp = compact::CompactDynamicStepResponse::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -863,13 +863,13 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                 }
                 OutputFormat::Jsonl => serde_json::to_string(&data).map_err(Into::into),
                 OutputFormat::Agent => {
-                    let comp = compact::CompactAgentEmulateData::from(&data);
+                    let comp = compact::CompactAgentEmulateData::from(data);
                     let resp = make_compact_response(command_name, target_str, comp);
                     resp.to_json(pretty).map_err(Into::into)
                 }
                 _ => {
                     if compact_flag {
-                        let comp = compact::CompactAgentEmulateData::from(&data);
+                        let comp = compact::CompactAgentEmulateData::from(data);
                         let resp = make_compact_response(command_name, target_str, comp);
                         return resp.to_json(pretty).map_err(Into::into);
                     }
@@ -891,7 +891,7 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
             };
             let data = analysis::analyze_trace(&driver, &opts)?;
             if compact_flag {
-                let comp = compact::CompactDynamicTraceResponse::from(&data);
+                let comp = compact::CompactDynamicTraceResponse::from(data);
                 let resp = make_compact_response(command_name, target_str, comp);
                 resp.to_json(pretty).map_err(Into::into)
             } else {

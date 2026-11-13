@@ -19,21 +19,36 @@ pub struct StringEntry {
     pub string: String,
 }
 
-pub fn list_strings(driver: &R2Driver, min_len: usize) -> Result<StringsResponse, AppError> {
-    let raw_strings: Vec<serde_json::Value> = driver.cmdj("izj")?;
+#[derive(Debug, Deserialize)]
+struct RawR2String {
+    #[serde(default)]
+    string: Option<String>,
+    #[serde(default)]
+    vaddr: Option<u64>,
+    #[serde(default)]
+    paddr: Option<u64>,
+    #[serde(default)]
+    size: Option<usize>,
+    #[serde(default, rename = "type")]
+    string_type: Option<String>,
+}
 
-    let mut strings = Vec::new();
+pub fn list_strings(driver: &R2Driver, min_len: usize) -> Result<StringsResponse, AppError> {
+    let raw_strings: Vec<RawR2String> = driver.cmdj("izj")?;
+
+    let mut strings = Vec::with_capacity(raw_strings.len());
 
     for s in raw_strings {
-        let text = s.get("string").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if text.len() < min_len {
+        let text_ref = s.string.as_deref().unwrap_or("");
+        if text_ref.len() < min_len {
             continue;
         }
 
-        let vaddr = s.get("vaddr").and_then(|v| v.as_u64()).unwrap_or(0);
-        let paddr = s.get("paddr").and_then(|v| v.as_u64()).unwrap_or(0);
-        let size = s.get("size").and_then(|v| v.as_u64()).unwrap_or(text.len() as u64) as usize;
-        let string_type = s.get("type").and_then(|v| v.as_str()).unwrap_or("ascii").to_string();
+        let vaddr = s.vaddr.unwrap_or(0);
+        let paddr = s.paddr.unwrap_or(0);
+        let size = s.size.unwrap_or(text_ref.len());
+        let string_type = s.string_type.unwrap_or_else(|| "ascii".to_string());
+        let string = s.string.unwrap_or_default();
 
         strings.push(StringEntry {
             vaddr,
@@ -41,7 +56,7 @@ pub fn list_strings(driver: &R2Driver, min_len: usize) -> Result<StringsResponse
             paddr,
             size,
             string_type,
-            string: text,
+            string,
         });
     }
 

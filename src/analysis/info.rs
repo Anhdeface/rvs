@@ -24,6 +24,19 @@ pub struct SecurityMitigations {
     pub stripped: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawEntryItem {
+    #[serde(default)]
+    vaddr: Option<u64>,
+    #[serde(default)]
+    paddr: Option<u64>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSectionItem {}
+
 pub fn get_binary_info(driver: &R2Driver) -> Result<BinaryInfo, AppError> {
     let batch = driver.cmd_batch(&["iIj", "iej", "iSj"])?;
     let raw_info: serde_json::Value = R2Driver::parse_json(batch.first().map(|s| s.as_str()).unwrap_or(""))?;
@@ -59,10 +72,10 @@ pub fn get_binary_info(driver: &R2Driver) -> Result<BinaryInfo, AppError> {
 
     let baddr = bin_obj.get("baddr").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    // Entry point: try iej or bin.baddr
-    let entry_list: Vec<serde_json::Value> = batch.get(1).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
+    // Entry point: try iej or bin.baddr with strongly-typed deserialization
+    let entry_list: Vec<RawEntryItem> = batch.get(1).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
     let entry_point = entry_list.first()
-        .and_then(|e| e.get("vaddr").or_else(|| e.get("paddr")).or_else(|| e.get("offset")).and_then(|v| v.as_u64()))
+        .and_then(|e| e.vaddr.or(e.paddr).or(e.offset))
         .unwrap_or(baddr);
 
     let canary = bin_obj.get("canary").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -82,7 +95,7 @@ pub fn get_binary_info(driver: &R2Driver) -> Result<BinaryInfo, AppError> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let sections: Vec<serde_json::Value> = batch.get(2).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
+    let sections: Vec<RawSectionItem> = batch.get(2).and_then(|s| R2Driver::parse_json(s).ok()).unwrap_or_default();
     let sections_count = sections.len();
 
     Ok(BinaryInfo {

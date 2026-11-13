@@ -132,8 +132,13 @@ pub fn run_triage(driver: &R2Driver) -> Result<AgentTriageData, AppError> {
             continue;
         }
 
-        let lower = text.to_lowercase();
-        let is_interesting = keywords.iter().any(|&k| lower.contains(k)) || text.len() >= 8;
+        let is_interesting = text.len() >= 8 || keywords.iter().any(|&k| {
+            if text.len() < k.len() {
+                false
+            } else {
+                text.as_bytes().windows(k.len()).any(|w| w.eq_ignore_ascii_case(k.as_bytes()))
+            }
+        });
 
         if is_interesting {
             seen_strings.insert(text.to_string());
