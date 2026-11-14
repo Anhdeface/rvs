@@ -8,6 +8,7 @@ pub mod compact;
 pub mod agent;
 pub mod frida;
 pub mod debug;
+pub mod apk;
 
 pub use cli::{Cli, Commands, FridaCommands, AnalyzeCommands, PatchCommands, AgentCommands, GraphType, GraphFormat, OutputFormat};
 pub use error::AppError;
@@ -16,3 +17,4 @@ pub use r2::R2Driver;
 pub use analysis::xrefs::{XrefDirection, XrefKindFilter};
 pub use agent::*;
 pub use frida::*;
+pub use apk::{ApkPackage, ApkSource, ApkEntry, ManifestInfo, is_binary_axml, detect_elf_abi};

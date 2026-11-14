@@ -56,7 +56,12 @@ pub fn run_decompile(driver: &R2Driver, function: &str) -> Result<AgentDecompile
         instructions_count += b.instructions.len();
         for inst in &b.instructions {
             let op_lower = inst.opcode.to_lowercase();
-            if op_lower.starts_with("call") {
+            if op_lower.starts_with("call")
+                || op_lower.starts_with("bl ")
+                || op_lower.starts_with("blr ")
+                || op_lower.starts_with("bl\t")
+                || op_lower.starts_with("blr\t")
+            {
                 let target_name = inst.opcode.split_whitespace().nth(1).unwrap_or(&inst.opcode).to_string();
                 if seen_calls.insert(target_name.clone()) {
                     calls.push(target_name);
@@ -66,8 +71,13 @@ pub fn run_decompile(driver: &R2Driver, function: &str) -> Result<AgentDecompile
     }
 
     // Run radare2 decompilation / disassembly with analysis
+    let analysis_cmd = if driver.is_aarch64() {
+        format!("aaa; s {target_hex}; pdc")
+    } else {
+        format!("aa; s {target_hex}; pdc")
+    };
     let r2_batch = driver.cmd_batch(&[
-        &format!("aa; s {target_hex}; pdc"),
+        &analysis_cmd,
         &format!("pdf @ {target_hex}"),
     ])?;
 
@@ -154,4 +164,53 @@ pub fn run_decompile(driver: &R2Driver, function: &str) -> Result<AgentDecompile
         calls,
         strings_referenced,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aarch64_call_recognition() {
+        let opcodes = vec![
+            "call 0x1000",
+            "bl helper_add",
+            "blr x0",
+            "bl sym.imp.puts",
+            "b.eq 0x2000",
+            "mov x0, 1",
+        ];
+        let mut calls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for op in opcodes {
+            let op_lower = op.to_lowercase();
+            if op_lower.starts_with("call")
+                || op_lower.starts_with("bl ")
+                || op_lower.starts_with("blr ")
+                || op_lower.starts_with("bl\t")
+                || op_lower.starts_with("blr\t")
+            {
+                let target = op.split_whitespace().nth(1).unwrap_or(op).to_string();
+                if seen.insert(target.clone()) {
+                    calls.push(target);
+                }
+            }
+        }
+
+        assert_eq!(calls, vec!["0x1000", "helper_add", "x0", "sym.imp.puts"]);
+    }
+
+    #[test]
+    fn test_aarch64_decompile_fixture_calls() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sample_aarch64_lib.so");
+        if fixture.exists() {
+            let driver = R2Driver::new(&fixture, None, None, true).expect("Failed to create driver");
+            let res = run_decompile(&driver, "check_zero_and_call").expect("Failed to decompile");
+            assert!(res.calls.iter().any(|c| c.contains("helper_add") || c.starts_with("0x")));
+        }
+    }
 }

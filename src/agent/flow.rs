@@ -89,17 +89,7 @@ pub fn run_flow(driver: &R2Driver, function: &str) -> Result<AgentFlowData, AppE
                     loop_count += 1;
                 }
 
-                let gate_type = if branch_inst.starts_with("je") || branch_inst.starts_with("jz") {
-                    Some("equality_zero_check".to_string())
-                } else if branch_inst.starts_with("jne") || branch_inst.starts_with("jnz") {
-                    Some("inequality_nonzero_check".to_string())
-                } else if branch_inst.starts_with("jg") || branch_inst.starts_with("ja") {
-                    Some("greater_check".to_string())
-                } else if branch_inst.starts_with("jl") || branch_inst.starts_with("jb") {
-                    Some("less_check".to_string())
-                } else {
-                    Some("conditional_branch".to_string())
-                };
+                let gate_type = classify_gate_type(&branch_inst);
 
                 decision_nodes.push(BranchGateNode {
                     addr: branch_addr,
@@ -134,4 +124,121 @@ pub fn run_flow(driver: &R2Driver, function: &str) -> Result<AgentFlowData, AppE
         exit_nodes,
         loop_count,
     })
+}
+
+/// Classifies branch instruction into standard decision gate types.
+/// Supports both x86/x86_64 mnemonics and AArch64 conditional branches:
+/// b.eq, b.ne, b.cs, b.cc, b.mi, b.pl, b.vs, b.vc, b.hi, b.ls, b.ge, b.lt, b.gt, b.le, cbz, cbnz, tbz, tbnz.
+pub fn classify_gate_type(branch_inst: &str) -> Option<String> {
+    let lower = branch_inst.to_lowercase();
+    let mnemonic = lower.split_whitespace().next().unwrap_or("");
+
+    if mnemonic.starts_with("je")
+        || mnemonic.starts_with("jz")
+        || mnemonic == "b.eq"
+        || mnemonic == "cbz"
+        || mnemonic == "tbz"
+    {
+        Some("equality_zero_check".to_string())
+    } else if mnemonic.starts_with("jne")
+        || mnemonic.starts_with("jnz")
+        || mnemonic == "b.ne"
+        || mnemonic == "cbnz"
+        || mnemonic == "tbnz"
+    {
+        Some("inequality_nonzero_check".to_string())
+    } else if mnemonic.starts_with("jg")
+        || mnemonic.starts_with("ja")
+        || mnemonic == "b.gt"
+        || mnemonic == "b.hi"
+        || mnemonic == "b.ge"
+        || mnemonic == "b.pl"
+    {
+        Some("greater_check".to_string())
+    } else if mnemonic.starts_with("jl")
+        || mnemonic.starts_with("jb")
+        || mnemonic == "b.lt"
+        || mnemonic == "b.lo"
+        || mnemonic == "b.le"
+        || mnemonic == "b.ls"
+        || mnemonic == "b.cc"
+        || mnemonic == "b.mi"
+    {
+        Some("less_check".to_string())
+    } else {
+        Some("conditional_branch".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_gate_type_aarch64_branches() {
+        assert_eq!(classify_gate_type("b.eq 0x1000").as_deref(), Some("equality_zero_check"));
+        assert_eq!(classify_gate_type("cbz w0, 0x1000").as_deref(), Some("equality_zero_check"));
+        assert_eq!(classify_gate_type("tbz w0, #0, 0x1000").as_deref(), Some("equality_zero_check"));
+
+        assert_eq!(classify_gate_type("b.ne 0x1000").as_deref(), Some("inequality_nonzero_check"));
+        assert_eq!(classify_gate_type("cbnz w0, 0x1000").as_deref(), Some("inequality_nonzero_check"));
+        assert_eq!(classify_gate_type("tbnz w0, #1, 0x1000").as_deref(), Some("inequality_nonzero_check"));
+
+        assert_eq!(classify_gate_type("b.gt 0x1000").as_deref(), Some("greater_check"));
+        assert_eq!(classify_gate_type("b.ge 0x1000").as_deref(), Some("greater_check"));
+        assert_eq!(classify_gate_type("b.hi 0x1000").as_deref(), Some("greater_check"));
+        assert_eq!(classify_gate_type("b.pl 0x1000").as_deref(), Some("greater_check"));
+
+        assert_eq!(classify_gate_type("b.lt 0x1000").as_deref(), Some("less_check"));
+        assert_eq!(classify_gate_type("b.le 0x1000").as_deref(), Some("less_check"));
+        assert_eq!(classify_gate_type("b.lo 0x1000").as_deref(), Some("less_check"));
+        assert_eq!(classify_gate_type("b.ls 0x1000").as_deref(), Some("less_check"));
+        assert_eq!(classify_gate_type("b.cc 0x1000").as_deref(), Some("less_check"));
+        assert_eq!(classify_gate_type("b.mi 0x1000").as_deref(), Some("less_check"));
+
+        assert_eq!(classify_gate_type("b.cs 0x1000").as_deref(), Some("conditional_branch"));
+        assert_eq!(classify_gate_type("b.vs 0x1000").as_deref(), Some("conditional_branch"));
+        assert_eq!(classify_gate_type("b.vc 0x1000").as_deref(), Some("conditional_branch"));
+    }
+
+    #[test]
+    fn test_classify_gate_type_x86_branches_preserved() {
+        assert_eq!(classify_gate_type("je 0x1000").as_deref(), Some("equality_zero_check"));
+        assert_eq!(classify_gate_type("jz 0x1000").as_deref(), Some("equality_zero_check"));
+        assert_eq!(classify_gate_type("jne 0x1000").as_deref(), Some("inequality_nonzero_check"));
+        assert_eq!(classify_gate_type("jnz 0x1000").as_deref(), Some("inequality_nonzero_check"));
+        assert_eq!(classify_gate_type("jg 0x1000").as_deref(), Some("greater_check"));
+        assert_eq!(classify_gate_type("ja 0x1000").as_deref(), Some("greater_check"));
+        assert_eq!(classify_gate_type("jl 0x1000").as_deref(), Some("less_check"));
+        assert_eq!(classify_gate_type("jb 0x1000").as_deref(), Some("less_check"));
+    }
+
+    #[test]
+    fn test_aarch64_flow_fixture_gates() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sample_aarch64_lib.so");
+        if fixture.exists() {
+            let driver = R2Driver::new(&fixture, None, None, true).expect("Failed to create driver");
+            
+            // 1. auth_gate_check contains b.ne
+            let flow_auth = run_flow(&driver, "auth_gate_check").expect("flow auth_gate_check failed");
+            assert!(!flow_auth.decision_nodes.is_empty());
+            let node0 = &flow_auth.decision_nodes[0];
+            assert_eq!(node0.gate_type.as_deref(), Some("inequality_nonzero_check"));
+
+            // 2. check_zero_and_call contains cbz & cbnz
+            let flow_zero = run_flow(&driver, "check_zero_and_call").expect("flow check_zero_and_call failed");
+            assert!(flow_zero.decision_nodes.len() >= 2);
+            assert!(flow_zero.decision_nodes.iter().any(|n| n.gate_type.as_deref() == Some("equality_zero_check")));
+            assert!(flow_zero.decision_nodes.iter().any(|n| n.gate_type.as_deref() == Some("inequality_nonzero_check")));
+
+            // 3. check_bit_flags contains tbz & tbnz
+            let flow_bit = run_flow(&driver, "check_bit_flags").expect("flow check_bit_flags failed");
+            assert!(flow_bit.decision_nodes.len() >= 2);
+            assert!(flow_bit.decision_nodes.iter().any(|n| n.gate_type.as_deref() == Some("equality_zero_check")));
+            assert!(flow_bit.decision_nodes.iter().any(|n| n.gate_type.as_deref() == Some("inequality_nonzero_check")));
+        }
+    }
 }

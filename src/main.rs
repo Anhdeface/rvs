@@ -1,9 +1,10 @@
 use clap::Parser;
 use std::process::ExitCode;
-use rvs::cli::{AgentCommands, AnalyzeCommands, Cli, Commands, DebugCommands, DynamicCommands, FridaCommands, GraphFormat, OutputFormat, PatchCommands};
+use rvs::cli::{AgentCommands, AnalyzeCommands, ApkCommands, Cli, Commands, DebugCommands, DynamicCommands, FridaCommands, GraphFormat, OutputFormat, PatchCommands};
 use rvs::r2::R2Driver;
 use rvs::response::{ApiError, ApiResponse, AppError};
-use rvs::{agent, analysis, compact, debug, frida, patch};
+use rvs::apk::{ApkPackage, ApkSource, ManifestInfo};
+use rvs::{agent, analysis, apk, compact, debug, frida, patch};
 
 fn make_compact_response<T: serde::Serialize>(
     command: impl Into<String>,
@@ -14,6 +15,15 @@ fn make_compact_response<T: serde::Serialize>(
     resp.format_version = None;
     resp.timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     resp
+}
+
+struct TempFileGuard(Option<std::path::PathBuf>);
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -77,6 +87,12 @@ fn main() -> ExitCode {
             | FridaCommands::MemRead { target, .. }
             | FridaCommands::MemWrite { target, .. } => target.clone(),
         },
+        Commands::Apk(apk_cmd) => match apk_cmd {
+            ApkCommands::Inspect { path }
+            | ApkCommands::Manifest { path }
+            | ApkCommands::Dex { path, .. }
+            | ApkCommands::So { path, .. } => path.display().to_string(),
+        },
         _ => cli.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default(),
     };
     let pretty = cli.pretty;
@@ -132,6 +148,10 @@ fn main() -> ExitCode {
             FridaCommands::MemRead { .. } => "frida mem-read",
             FridaCommands::MemWrite { .. } => "frida mem-write",
         },
+        Commands::Apk(ApkCommands::Inspect { .. }) => "apk inspect",
+        Commands::Apk(ApkCommands::Manifest { .. }) => "apk manifest",
+        Commands::Apk(ApkCommands::Dex { .. }) => "apk dex",
+        Commands::Apk(ApkCommands::So { .. }) => "apk so",
     };
 
     match execute_cli(&cli, command_name, &target_str) {
@@ -162,6 +182,9 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
     }
     if let Commands::Frida(frida_cmd) = &cli.command {
         return frida::handle_frida_command(cli, frida_cmd);
+    }
+    if let Commands::Apk(apk_cmd) = &cli.command {
+        return handle_apk_command(cli, apk_cmd, command_name, target_str);
     }
     let file_path = cli.file.as_ref().ok_or_else(|| {
         AppError::InvalidArgument("Target binary file path is required. Use -f or --file <PATH>.".to_string())
@@ -917,6 +940,495 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
 
         Commands::Frida(frida_cmd) => {
             frida::handle_frida_command(cli, frida_cmd)
+        }
+
+        Commands::Apk(apk_cmd) => {
+            handle_apk_command(cli, apk_cmd, command_name, target_str)
+        }
+    }
+}
+
+fn handle_apk_command(
+    cli: &Cli,
+    apk_cmd: &ApkCommands,
+    command_name: &str,
+    target_str: &str,
+) -> Result<String, AppError> {
+    let pretty = cli.pretty;
+    let format = cli.format;
+    let compact_flag = cli.compact || format == OutputFormat::Agent;
+
+    match apk_cmd {
+        ApkCommands::Inspect { path } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let pkg = ApkPackage::open(path)?;
+
+            // Validate that an unpacked directory contains Android artifacts
+            if let ApkSource::Directory(_) = &pkg.source {
+                if pkg.manifest_data.is_none() && pkg.dex_entries.is_empty() && pkg.native_libraries.is_empty() {
+                    return Err(AppError::InvalidBinary(format!(
+                        "Directory '{}' contains no Android artifacts (AndroidManifest.xml, DEX, or native libraries)",
+                        path.display()
+                    )));
+                }
+            }
+
+            // Standalone validation
+            if let ApkSource::Standalone(_) = &pkg.source {
+                if !pkg.dex_entries.is_empty() {
+                    let bytes = pkg.read_entry(&pkg.dex_entries[0].name)?;
+                    apk::parse_dex_bytes(&bytes, &pkg.dex_entries[0].name)?;
+                } else if !pkg.native_libraries.is_empty() {
+                    let first_lib = pkg.native_libraries.values().flatten().next();
+                    if let Some(entry) = first_lib {
+                        let bytes = pkg.read_entry(&entry.name)?;
+                        apk::parse_native_so_bytes(&bytes, &entry.name)?;
+                    }
+                }
+            }
+
+            let source_type = match &pkg.source {
+                ApkSource::Archive(_) => "archive".to_string(),
+                ApkSource::Directory(_) => "directory".to_string(),
+                ApkSource::Standalone(_) => "standalone".to_string(),
+            };
+
+            let manifest = if let Some(data) = &pkg.manifest_data {
+                Some(ManifestInfo::parse(data, pkg.is_manifest_binary)?)
+            } else {
+                None
+            };
+
+            let package_name = manifest.as_ref().map(|m| m.package_name.clone());
+            let version_name = manifest.as_ref().and_then(|m| m.version_name.clone());
+            let version_code = manifest.as_ref().and_then(|m| m.version_code);
+            let has_manifest = manifest.is_some() || pkg.manifest_data.is_some();
+            let is_manifest_binary = pkg.is_manifest_binary;
+
+            let dex_files = pkg.dex_names();
+            let mut native_libraries = std::collections::HashMap::new();
+            for (abi, entries) in &pkg.native_libraries {
+                let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+                native_libraries.insert(abi.clone(), names);
+            }
+
+            let data = compact::ApkInspectData {
+                source_type,
+                package_name,
+                version_name,
+                version_code,
+                has_manifest,
+                is_manifest_binary,
+                dex_files,
+                native_libraries,
+            };
+
+            if compact_flag {
+                let comp = compact::CompactApkInspectData::from(&data);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, data);
+                resp.to_json(pretty).map_err(Into::into)
+            }
+        }
+
+        ApkCommands::Manifest { path } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let (bytes, is_binary) = if path.is_dir() {
+                let pkg = ApkPackage::open(path)?;
+                match pkg.manifest_data {
+                    Some(d) => (d, pkg.is_manifest_binary),
+                    None => {
+                        return Err(AppError::FileNotFound(format!(
+                            "AndroidManifest.xml not found in directory '{}'",
+                            path.display()
+                        )));
+                    }
+                }
+            } else {
+                let file_bytes = std::fs::read(path)?;
+                let is_zip = file_bytes.len() >= 4 && (&file_bytes[..4] == b"PK\x03\x04" || &file_bytes[..4] == b"PK\x05\x06");
+                if is_zip {
+                    let pkg = ApkPackage::open(path)?;
+                    match pkg.manifest_data {
+                        Some(d) => (d, pkg.is_manifest_binary),
+                        None => {
+                            return Err(AppError::FileNotFound(format!(
+                                "AndroidManifest.xml not found in APK '{}'",
+                                path.display()
+                            )));
+                        }
+                    }
+                } else {
+                    let binary_hint = path.extension().and_then(|s| s.to_str()) == Some("axml")
+                        || apk::is_binary_axml(&file_bytes);
+                    (file_bytes, binary_hint)
+                }
+            };
+
+            let manifest = ManifestInfo::parse(&bytes, is_binary)?;
+
+            if compact_flag {
+                let comp = compact::CompactManifestInfo::from(&manifest);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, manifest);
+                resp.to_json(pretty).map_err(Into::into)
+            }
+        }
+
+        ApkCommands::Dex {
+            path,
+            dex_file,
+            class,
+            method,
+            disasm,
+        } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let file_bytes = if path.is_file() {
+                Some(std::fs::read(path)?)
+            } else {
+                None
+            };
+
+            let is_archive_or_dir = path.is_dir() || file_bytes.as_ref().map(|b| {
+                b.len() >= 4 && (&b[..4] == b"PK\x03\x04" || &b[..4] == b"PK\x05\x06")
+            }).unwrap_or(false);
+
+            let mut _temp_guard = TempFileGuard(None);
+            let mut resolved_dex_path = path.to_path_buf();
+
+            let mut analysis_result = if !is_archive_or_dir {
+                let bytes = file_bytes.unwrap();
+                apk::parse_dex_bytes(&bytes, &path.display().to_string())?
+            } else {
+                let pkg = ApkPackage::open(path)?;
+                if pkg.dex_entries.is_empty() {
+                    return Err(AppError::FileNotFound(format!(
+                        "No DEX files found in '{}'",
+                        path.display()
+                    )));
+                }
+
+                if let Some(target_dex) = &dex_file {
+                    let entry = pkg.dex_entries.iter().find(|e| {
+                        e.name == *target_dex || e.name.ends_with(target_dex)
+                    }).ok_or_else(|| {
+                        AppError::FileNotFound(format!(
+                            "DEX file '{}' not found in package",
+                            target_dex
+                        ))
+                    })?;
+                    if let Some(p) = &entry.path {
+                        if p.is_file() {
+                            resolved_dex_path = p.clone();
+                        }
+                    } else {
+                        let bytes = pkg.read_entry(&entry.name)?;
+                        let t_path = std::env::temp_dir().join(format!("rvs_dex_{}_{}.dex", std::process::id(), entry.name.replace('/', "_")));
+                        std::fs::write(&t_path, &bytes)?;
+                        resolved_dex_path = t_path.clone();
+                        _temp_guard = TempFileGuard(Some(t_path));
+                    }
+                    let bytes = pkg.read_entry(&entry.name)?;
+                    apk::parse_dex_bytes(&bytes, &entry.name)?
+                } else if pkg.dex_entries.len() == 1 {
+                    let entry = &pkg.dex_entries[0];
+                    if let Some(p) = &entry.path {
+                        if p.is_file() {
+                            resolved_dex_path = p.clone();
+                        }
+                    } else {
+                        let bytes = pkg.read_entry(&entry.name)?;
+                        let t_path = std::env::temp_dir().join(format!("rvs_dex_{}_{}.dex", std::process::id(), entry.name.replace('/', "_")));
+                        std::fs::write(&t_path, &bytes)?;
+                        resolved_dex_path = t_path.clone();
+                        _temp_guard = TempFileGuard(Some(t_path));
+                    }
+                    let bytes = pkg.read_entry(&entry.name)?;
+                    apk::parse_dex_bytes(&bytes, &entry.name)?
+                } else {
+                    // Multi-DEX merge
+                    let mut combined_classes = Vec::new();
+                    let mut total_methods = 0;
+                    let mut total_strings = 0;
+                    let mut all_strings = Vec::new();
+
+                    for entry in &pkg.dex_entries {
+                        let bytes = pkg.read_entry(&entry.name)?;
+                        let r = apk::parse_dex_bytes(&bytes, &entry.name)?;
+                        total_methods += r.methods_count;
+                        total_strings += r.strings_count;
+                        if let Some(strs) = r.strings {
+                            all_strings.extend(strs);
+                        }
+                        combined_classes.extend(r.classes);
+                    }
+
+                    // For multi-DEX, point resolved_dex_path to the primary DEX entry
+                    if let Some(first) = pkg.dex_entries.first() {
+                        if let Some(p) = &first.path {
+                            if p.is_file() {
+                                resolved_dex_path = p.clone();
+                            }
+                        } else if let Ok(bytes) = pkg.read_entry(&first.name) {
+                            let t_path = std::env::temp_dir().join(format!("rvs_dex_{}_{}.dex", std::process::id(), first.name.replace('/', "_")));
+                            if std::fs::write(&t_path, &bytes).is_ok() {
+                                resolved_dex_path = t_path.clone();
+                                _temp_guard = TempFileGuard(Some(t_path));
+                            }
+                        }
+                    }
+
+                    apk::DexAnalysisResult {
+                        file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        classes_count: combined_classes.len(),
+                        methods_count: total_methods,
+                        strings_count: total_strings,
+                        classes: combined_classes,
+                        strings: Some(all_strings),
+                        disassembly: None,
+                    }
+                }
+            };
+
+            // Apply class filter if specified
+            if let Some(class_filter) = &class {
+                analysis_result.classes.retain(|c| c.name.contains(class_filter));
+                analysis_result.classes_count = analysis_result.classes.len();
+                analysis_result.methods_count = analysis_result.classes.iter().map(|c| c.methods.len()).sum();
+            }
+
+            // Apply method filter if specified
+            if let Some(method_filter) = &method {
+                for c in &mut analysis_result.classes {
+                    c.methods.retain(|m| m.name.contains(method_filter));
+                }
+                analysis_result.methods_count = analysis_result.classes.iter().map(|c| c.methods.len()).sum();
+            }
+
+            // Wire up --disasm flag: populate Dalvik bytecode disassembly for matched methods
+            if *disasm {
+                let mut all_disasm = Vec::new();
+                if let (Some(c_query), Some(m_query)) = (&class, &method) {
+                    if let Ok(insts) = apk::disassemble_dalvik_method(&resolved_dex_path, c_query, m_query) {
+                        for c in &mut analysis_result.classes {
+                            for m in &mut c.methods {
+                                if (c.name == *c_query || c.name.contains(c_query))
+                                    && (m.name == *m_query || m.name.contains(m_query))
+                                {
+                                    m.disassembly = Some(insts.clone());
+                                }
+                            }
+                        }
+                        all_disasm.extend(insts);
+                    }
+                } else {
+                    for c in &mut analysis_result.classes {
+                        for m in &mut c.methods {
+                            if let Some(code_offset) = m.code_offset {
+                                if let Ok(insts) = apk::disassemble_dalvik_at(&resolved_dex_path, code_offset + 16, 50) {
+                                    m.disassembly = Some(insts.clone());
+                                    all_disasm.extend(insts);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !all_disasm.is_empty() {
+                    analysis_result.disassembly = Some(all_disasm);
+                }
+            }
+
+            if compact_flag {
+                let comp = compact::CompactDexAnalysisResult::from(&analysis_result);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, analysis_result);
+                resp.to_json(pretty).map_err(Into::into)
+            }
+        }
+
+        ApkCommands::So {
+            path,
+            abi,
+            symbol,
+            xrefs,
+        } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let file_bytes = if path.is_file() {
+                Some(std::fs::read(path)?)
+            } else {
+                None
+            };
+
+            let is_archive_or_dir = path.is_dir() || file_bytes.as_ref().map(|b| {
+                b.len() >= 4 && (&b[..4] == b"PK\x03\x04" || &b[..4] == b"PK\x05\x06")
+            }).unwrap_or(false);
+
+            let mut _temp_guard = TempFileGuard(None);
+            let mut resolved_so_path = path.to_path_buf();
+
+            let mut analysis = if !is_archive_or_dir {
+                let bytes = file_bytes.unwrap();
+                apk::parse_native_so_bytes(&bytes, &path.display().to_string())?
+            } else {
+                let pkg = ApkPackage::open(path)?;
+                if pkg.native_libraries.is_empty() {
+                    apk::NativeLibraryAnalysis {
+                        file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        architecture: "unknown".to_string(),
+                        is_64_bit: false,
+                        jni_functions: Vec::new(),
+                        exported_symbols: Vec::new(),
+                        imported_symbols: Vec::new(),
+                        register_natives_detected: false,
+                        xrefs: None,
+                    }
+                } else if let Some(target_abi) = &abi {
+                    // Resolve disk path for target ABI
+                    if let Some(entries) = pkg.native_libraries.get(target_abi) {
+                        if let Some(first) = entries.first() {
+                            if let Some(p) = &first.path {
+                                if p.is_file() {
+                                    resolved_so_path = p.clone();
+                                }
+                            } else if let Ok(bytes) = pkg.read_entry(&first.name) {
+                                let t_path = std::env::temp_dir().join(format!("rvs_so_{}_{}.so", std::process::id(), first.name.replace('/', "_")));
+                                if std::fs::write(&t_path, &bytes).is_ok() {
+                                    resolved_so_path = t_path.clone();
+                                    _temp_guard = TempFileGuard(Some(t_path));
+                                }
+                            }
+                        }
+                    }
+                    pkg.analyze_native_library(target_abi)?
+                } else {
+                    // Resolve disk path for first available native library
+                    if let Some((_, entries)) = pkg.native_libraries.iter().next() {
+                        if let Some(first) = entries.first() {
+                            if let Some(p) = &first.path {
+                                if p.is_file() {
+                                    resolved_so_path = p.clone();
+                                }
+                            } else if let Ok(bytes) = pkg.read_entry(&first.name) {
+                                let t_path = std::env::temp_dir().join(format!("rvs_so_{}_{}.so", std::process::id(), first.name.replace('/', "_")));
+                                if std::fs::write(&t_path, &bytes).is_ok() {
+                                    resolved_so_path = t_path.clone();
+                                    _temp_guard = TempFileGuard(Some(t_path));
+                                }
+                            }
+                        }
+                    }
+
+                    let mut analyses = pkg.analyze_native_libraries()?;
+                    if analyses.is_empty() {
+                        apk::NativeLibraryAnalysis {
+                            file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                            architecture: "unknown".to_string(),
+                            is_64_bit: false,
+                            jni_functions: Vec::new(),
+                            exported_symbols: Vec::new(),
+                            imported_symbols: Vec::new(),
+                            register_natives_detected: false,
+                            xrefs: None,
+                        }
+                    } else if analyses.len() == 1 {
+                        analyses.remove(0)
+                    } else {
+                        let mut combined = analyses.remove(0);
+                        for other in analyses {
+                            combined.jni_functions.extend(other.jni_functions);
+                            combined.exported_symbols.extend(other.exported_symbols);
+                            combined.imported_symbols.extend(other.imported_symbols);
+                            combined.register_natives_detected |= other.register_natives_detected;
+                        }
+                        combined.jni_functions.sort_by(|a, b| a.name.cmp(&b.name));
+                        combined.jni_functions.dedup_by(|a, b| a.name == b.name);
+                        combined.exported_symbols.sort();
+                        combined.exported_symbols.dedup();
+                        combined.imported_symbols.sort();
+                        combined.imported_symbols.dedup();
+                        combined
+                    }
+                }
+            };
+
+            // Apply symbol filter if specified
+            if let Some(sym_filter) = &symbol {
+                analysis.jni_functions.retain(|j| j.name.contains(sym_filter));
+                analysis.exported_symbols.retain(|s| s.contains(sym_filter));
+                analysis.imported_symbols.retain(|s| s.contains(sym_filter));
+            }
+
+            // Wire up --xrefs flag: extract cross references for JNI functions
+            if *xrefs && resolved_so_path.exists() {
+                let mut xrefs_map = std::collections::HashMap::new();
+                for jni in &mut analysis.jni_functions {
+                    if let Ok(resp) = apk::analyze_jni_xrefs(&resolved_so_path, &jni.name) {
+                        jni.xrefs = Some(resp.clone());
+                        xrefs_map.insert(jni.name.clone(), resp);
+                    }
+                }
+                if let Some(sym_filter) = &symbol {
+                    if !xrefs_map.contains_key(sym_filter) {
+                        if let Ok(resp) = apk::analyze_jni_xrefs(&resolved_so_path, sym_filter) {
+                            xrefs_map.insert(sym_filter.clone(), resp);
+                        }
+                    }
+                }
+                if !xrefs_map.is_empty() {
+                    analysis.xrefs = Some(xrefs_map);
+                }
+            }
+
+            if compact_flag {
+                let comp = compact::CompactNativeLibraryAnalysis::from(&analysis);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, analysis);
+                resp.to_json(pretty).map_err(Into::into)
+            }
         }
     }
 }

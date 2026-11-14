@@ -105,6 +105,67 @@ pub enum Commands {
     /// Dynamic runtime instrumentation and live process hooking via r2frida
     #[command(subcommand, alias = "f", alias = "fr")]
     Frida(FridaCommands),
+
+    /// Android APK and binary artifact analysis (manifest, DEX, native .so)
+    #[command(subcommand)]
+    Apk(ApkCommands),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ApkCommands {
+    /// General overview of APK/extracted directory/file (package metadata, manifest summary, list of DEX files with class/method counts, list of native `.so` files grouped by ABI).
+    #[command(alias = "insp")]
+    Inspect {
+        /// Path to APK file, unpacked directory, or standalone DEX/SO file
+        path: PathBuf,
+    },
+
+    /// Full AndroidManifest details (permissions, activities, services, receivers, providers, SDK versions, debuggable).
+    #[command(alias = "man")]
+    Manifest {
+        /// Path to APK file, unpacked directory, or standalone AndroidManifest.xml
+        path: PathBuf,
+    },
+
+    /// Classes, methods, prototypes, strings, and Dalvik disassembly.
+    Dex {
+        /// Path to APK file, unpacked directory, or standalone DEX file
+        path: PathBuf,
+
+        /// Filter or select a specific DEX file in the APK (e.g. classes.dex, classes2.dex)
+        #[arg(short, long)]
+        dex_file: Option<String>,
+
+        /// Filter classes by name substring
+        #[arg(short = 'C', long)]
+        class: Option<String>,
+
+        /// Filter methods by name substring
+        #[arg(short, long)]
+        method: Option<String>,
+
+        /// Disassemble Dalvik bytecode for matched methods
+        #[arg(long)]
+        disasm: bool,
+    },
+
+    /// Native .so libraries, exported symbols, static JNI functions with demangled class/methods, dynamic RegisterNatives detection, and cross-references.
+    So {
+        /// Path to APK file, unpacked directory, or standalone .so file
+        path: PathBuf,
+
+        /// Filter native libraries by ABI (e.g. arm64-v8a, armeabi-v7a, x86, x86_64)
+        #[arg(short = 'A', long)]
+        abi: Option<String>,
+
+        /// Filter symbols or JNI functions by name substring
+        #[arg(short, long)]
+        symbol: Option<String>,
+
+        /// Extract cross-references for detected JNI functions
+        #[arg(long)]
+        xrefs: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1069,6 +1130,52 @@ mod tests {
             assert_eq!(format.as_deref(), Some("x"));
         } else {
             panic!("Expected FridaCommands::Hook");
+        }
+    }
+
+    #[test]
+    fn test_apk_cli_subcommands_parsed() {
+        // inspect
+        let cli1 = Cli::try_parse_from(["rvs", "apk", "inspect", "app.apk"]).unwrap();
+        if let Commands::Apk(ApkCommands::Inspect { path }) = cli1.command {
+            assert_eq!(path, PathBuf::from("app.apk"));
+        } else {
+            panic!("Expected ApkCommands::Inspect");
+        }
+
+        // manifest
+        let cli2 = Cli::try_parse_from(["rvs", "apk", "manifest", "app.apk"]).unwrap();
+        if let Commands::Apk(ApkCommands::Manifest { path }) = cli2.command {
+            assert_eq!(path, PathBuf::from("app.apk"));
+        } else {
+            panic!("Expected ApkCommands::Manifest");
+        }
+
+        // dex
+        let cli3 = Cli::try_parse_from([
+            "rvs", "apk", "dex", "app.apk", "--dex-file", "classes.dex", "--class", "MainActivity", "--disasm",
+        ]).unwrap();
+        if let Commands::Apk(ApkCommands::Dex { path, dex_file, class, method, disasm }) = cli3.command {
+            assert_eq!(path, PathBuf::from("app.apk"));
+            assert_eq!(dex_file.as_deref(), Some("classes.dex"));
+            assert_eq!(class.as_deref(), Some("MainActivity"));
+            assert_eq!(method, None);
+            assert!(disasm);
+        } else {
+            panic!("Expected ApkCommands::Dex");
+        }
+
+        // so
+        let cli4 = Cli::try_parse_from([
+            "rvs", "apk", "so", "app.apk", "--abi", "arm64-v8a", "--symbol", "stringFromJNI", "--xrefs",
+        ]).unwrap();
+        if let Commands::Apk(ApkCommands::So { path, abi, symbol, xrefs }) = cli4.command {
+            assert_eq!(path, PathBuf::from("app.apk"));
+            assert_eq!(abi.as_deref(), Some("arm64-v8a"));
+            assert_eq!(symbol.as_deref(), Some("stringFromJNI"));
+            assert!(xrefs);
+        } else {
+            panic!("Expected ApkCommands::So");
         }
     }
 }

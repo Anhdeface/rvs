@@ -74,7 +74,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.4"
+SERVER_VERSION: str = "0.3.5"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -4023,6 +4023,94 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
         },
         "required": ["file"],
     },
+    {
+        "name": "rvs_apk_info",
+        "description": "General overview of an Android APK package, unpacked directory, or standalone binary (package identity, manifest summary, DEX and native .so listing).",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target APK archive, extracted directory, or standalone DEX/SO file.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_apk_manifest",
+        "description": "Inspect AndroidManifest details (package name, SDK versions, permissions, activities, services, receivers, providers, debuggable).",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target APK archive, extracted directory, or standalone AndroidManifest.xml.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_apk_dex",
+        "description": "Analyze Dalvik DEX bytecode, classes, methods, prototypes, signatures, and strings in an APK or standalone DEX.",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target APK archive, extracted directory, or standalone DEX file.",
+            },
+            "dex_file": {
+                "type": "string",
+                "description": "Optional specific DEX file within the APK (e.g. 'classes.dex', 'classes2.dex').",
+            },
+            "class": {
+                "type": "string",
+                "description": "Optional class name substring filter.",
+            },
+            "method": {
+                "type": "string",
+                "description": "Optional method name substring filter.",
+            },
+            "disasm": {
+                "type": "boolean",
+                "description": "Disassemble Dalvik bytecode for matched methods. Defaults to false.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_apk_native",
+        "description": "Analyze native .so libraries in an APK or standalone .so (architecture, exported symbols, static JNI mappings, RegisterNatives).",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target APK archive, extracted directory, or standalone .so file.",
+            },
+            "abi": {
+                "type": "string",
+                "description": "Filter native libraries by ABI (e.g. 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64').",
+            },
+            "symbol": {
+                "type": "string",
+                "description": "Optional symbol or JNI function name substring filter.",
+            },
+            "xrefs": {
+                "type": "boolean",
+                "description": "Extract cross-references for detected JNI functions. Defaults to false.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
 ]
 
 NO_FILE_REQUIRED_TOOLS: Set[str] = {
@@ -4957,6 +5045,79 @@ class RvsHarness:
         return self.run(args, timeout=timeout, mode="compact")
 
     # -------------------------------------------------------------------------
+    # Android APK Analysis Methods
+    # -------------------------------------------------------------------------
+
+    def apk_info(
+        self,
+        file: Union[str, Path],
+        compact: bool = True,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Inspect APK package metadata, manifest summary, DEX and native .so libraries."""
+        mode: OutputMode = "compact" if compact else "full"
+        args = ["apk", "inspect", str(file)]
+        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+
+    def apk_manifest(
+        self,
+        file: Union[str, Path],
+        compact: bool = True,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Inspect full AndroidManifest details (permissions, components, SDK versions)."""
+        mode: OutputMode = "compact" if compact else "full"
+        args = ["apk", "manifest", str(file)]
+        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+
+    def apk_dex(
+        self,
+        file: Union[str, Path],
+        dex_file: Optional[str] = None,
+        class_name: Optional[str] = None,
+        method: Optional[str] = None,
+        disasm: bool = False,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Analyze DEX bytecode, classes, methods, signatures, and strings."""
+        mode: OutputMode = "compact" if compact else "full"
+        args = ["apk", "dex", str(file)]
+        if dex_file:
+            args.extend(["--dex-file", str(dex_file)])
+        if class_name:
+            args.extend(["--class", str(class_name)])
+        if method:
+            args.extend(["--method", str(method)])
+        if disasm:
+            args.append("--disasm")
+        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+
+    def apk_native(
+        self,
+        file: Union[str, Path],
+        abi: Optional[str] = None,
+        symbol: Optional[str] = None,
+        xrefs: bool = False,
+        compact: bool = True,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Analyze native .so libraries, exported symbols, static JNI, and RegisterNatives."""
+        mode: OutputMode = "compact" if compact else "full"
+        args = ["apk", "so", str(file)]
+        if abi:
+            args.extend(["--abi", str(abi)])
+        if symbol:
+            args.extend(["--symbol", str(symbol)])
+        if xrefs:
+            args.append("--xrefs")
+        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+
+    # -------------------------------------------------------------------------
     # Dynamic RE & ESIL Emulation Methods
     # -------------------------------------------------------------------------
 
@@ -5342,7 +5503,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.3.4",
+                    "format_version": "0.3.5",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6460,7 +6621,7 @@ if (fopenPtr) {
                 suggestion="Pass tool arguments as a key-value JSON object.",
             )
 
-        file = arguments.get("file") or (arguments.get("target") if tool_name in (
+        file = arguments.get("file") or arguments.get("path") or (arguments.get("target") if tool_name in (
             "rvs_triage_crash", "triage_crash",
             "rvs_bypass_decision_gate", "bypass_decision_gate",
             "rvs_dump_decrypted_buffer", "dump_decrypted_buffer",
@@ -7504,6 +7665,37 @@ if (fopenPtr) {
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
                 return self.detect_anti_debug(target=target_bin)
+
+            elif tool_name in ("rvs_apk_info", "apk_info"):
+                target_apk = file or arguments.get("path")
+                return self.apk_info(file=target_apk, compact=compact, budget=budget)
+
+            elif tool_name in ("rvs_apk_manifest", "apk_manifest"):
+                target_apk = file or arguments.get("path")
+                return self.apk_manifest(file=target_apk, compact=compact, budget=budget)
+
+            elif tool_name in ("rvs_apk_dex", "apk_dex"):
+                target_apk = file or arguments.get("path")
+                return self.apk_dex(
+                    file=target_apk,
+                    dex_file=arguments.get("dex_file"),
+                    class_name=arguments.get("class") or arguments.get("class_name"),
+                    method=arguments.get("method"),
+                    disasm=coerce_bool_param(arguments.get("disasm"), False, "disasm"),
+                    compact=compact,
+                    budget=budget,
+                )
+
+            elif tool_name in ("rvs_apk_native", "apk_native"):
+                target_apk = file or arguments.get("path")
+                return self.apk_native(
+                    file=target_apk,
+                    abi=arguments.get("abi"),
+                    symbol=arguments.get("symbol"),
+                    xrefs=coerce_bool_param(arguments.get("xrefs"), False, "xrefs"),
+                    compact=compact,
+                    budget=budget,
+                )
 
             else:
                 return make_error_envelope(

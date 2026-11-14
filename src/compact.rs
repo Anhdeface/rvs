@@ -27,6 +27,7 @@ use crate::analysis::info::BinaryInfo;
 use crate::analysis::strings::{StringEntry, StringsResponse};
 use crate::analysis::symbols::{SymbolEntry, SymbolsResponse};
 use crate::analysis::xrefs::{XrefEntry, XrefsResponse};
+use crate::apk::{DexAnalysisResult, ManifestInfo, NativeLibraryAnalysis};
 
 // ── Compact Instructions & Blocks ──────────────────
 
@@ -1323,6 +1324,261 @@ pub struct CompactFridaScriptResponse {
     pub res: Option<serde_json::Value>,
 }
 
+// ── Compact APK & Android Artifacts ──────────────────
+
+/// Full representation of APK Container inspection payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApkInspectData {
+    pub source_type: String, // "archive", "directory", "standalone"
+    #[serde(default)]
+    pub package_name: Option<String>,
+    #[serde(default)]
+    pub version_name: Option<String>,
+    #[serde(default)]
+    pub version_code: Option<u32>,
+    #[serde(default)]
+    pub has_manifest: bool,
+    #[serde(default)]
+    pub is_manifest_binary: bool,
+    #[serde(default)]
+    pub dex_files: Vec<String>,
+    #[serde(default)]
+    pub native_libraries: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Compact representation of APK inspection data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactApkInspectData {
+    pub src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pkg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ver: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<u32>,
+    pub manifest: bool,
+    pub binary_manifest: bool,
+    pub dex: Vec<String>,
+    pub so: BTreeMap<String, Vec<String>>,
+}
+
+impl From<&ApkInspectData> for CompactApkInspectData {
+    fn from(src: &ApkInspectData) -> Self {
+        let mut so = BTreeMap::new();
+        for (k, v) in &src.native_libraries {
+            so.insert(k.clone(), v.clone());
+        }
+        Self {
+            src: src.source_type.clone(),
+            pkg: src.package_name.clone(),
+            ver: src.version_name.clone(),
+            code: src.version_code,
+            manifest: src.has_manifest,
+            binary_manifest: src.is_manifest_binary,
+            dex: src.dex_files.clone(),
+            so,
+        }
+    }
+}
+
+impl From<ApkInspectData> for CompactApkInspectData {
+    fn from(src: ApkInspectData) -> Self {
+        Self::from(&src)
+    }
+}
+
+/// Compact representation of AndroidManifest details.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactManifestInfo {
+    pub pkg: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ver: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_sdk: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_sdk: Option<u32>,
+    pub debug: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub perms: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub activities: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub receivers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+}
+
+impl From<&ManifestInfo> for CompactManifestInfo {
+    fn from(m: &ManifestInfo) -> Self {
+        Self {
+            pkg: m.package_name.clone(),
+            ver: m.version_name.clone(),
+            code: m.version_code,
+            min_sdk: m.min_sdk_version,
+            target_sdk: m.target_sdk_version,
+            debug: m.debuggable,
+            perms: m.permissions.clone(),
+            activities: m.activities.clone(),
+            services: m.services.clone(),
+            receivers: m.receivers.clone(),
+            providers: m.providers.clone(),
+        }
+    }
+}
+
+impl From<ManifestInfo> for CompactManifestInfo {
+    fn from(m: ManifestInfo) -> Self {
+        Self::from(&m)
+    }
+}
+
+/// Compact representation of DEX method summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactDexMethod {
+    pub name: String,
+    pub sig: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disassembly: Option<Vec<crate::apk::dex::DalvikInstruction>>,
+}
+
+/// Compact representation of DEX class summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactDexClass {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub super_cls: Option<String>,
+    pub methods: Vec<CompactDexMethod>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+/// Compact representation of DEX analysis results.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactDexAnalysisResult {
+    pub file: String,
+    pub classes: usize,
+    pub methods: usize,
+    pub strings: usize,
+    pub class_list: Vec<CompactDexClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub string_pool: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disassembly: Option<Vec<crate::apk::dex::DalvikInstruction>>,
+}
+
+impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
+    fn from(d: &DexAnalysisResult) -> Self {
+        let class_list = d
+            .classes
+            .iter()
+            .map(|c| {
+                let methods = c
+                    .methods
+                    .iter()
+                    .map(|m| CompactDexMethod {
+                        name: m.name.clone(),
+                        sig: m.signature.clone(),
+                        off: m.code_offset.map(|o| format!("0x{:x}", o)),
+                        disassembly: m.disassembly.clone(),
+                    })
+                    .collect();
+                CompactDexClass {
+                    name: c.name.clone(),
+                    super_cls: c.super_class.clone(),
+                    methods,
+                    fields: c.fields.clone(),
+                }
+            })
+            .collect();
+
+        Self {
+            file: d.file_name.clone(),
+            classes: d.classes_count,
+            methods: d.methods_count,
+            strings: d.strings_count,
+            class_list,
+            string_pool: d.strings.clone(),
+            disassembly: d.disassembly.clone(),
+        }
+    }
+}
+
+impl From<DexAnalysisResult> for CompactDexAnalysisResult {
+    fn from(d: DexAnalysisResult) -> Self {
+        Self::from(&d)
+    }
+}
+
+/// Compact representation of JNI function.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactJniFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cls: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    pub addr: String,
+    pub sz: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xrefs: Option<crate::analysis::xrefs::XrefsResponse>,
+}
+
+/// Compact representation of Native Library analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactNativeLibraryAnalysis {
+    pub file: String,
+    pub arch: String,
+    pub is_64: bool,
+    pub jni: Vec<CompactJniFunction>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    pub reg_natives: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xrefs: Option<std::collections::HashMap<String, crate::analysis::xrefs::XrefsResponse>>,
+}
+
+impl From<&NativeLibraryAnalysis> for CompactNativeLibraryAnalysis {
+    fn from(n: &NativeLibraryAnalysis) -> Self {
+        let jni = n
+            .jni_functions
+            .iter()
+            .map(|j| CompactJniFunction {
+                name: j.name.clone(),
+                cls: j.demangled_class.clone(),
+                method: j.demangled_method.clone(),
+                addr: format!("0x{:x}", j.address),
+                sz: j.size,
+                xrefs: j.xrefs.clone(),
+            })
+            .collect();
+
+        Self {
+            file: n.file_name.clone(),
+            arch: n.architecture.clone(),
+            is_64: n.is_64_bit,
+            jni,
+            exports: n.exported_symbols.clone(),
+            imports: n.imported_symbols.clone(),
+            reg_natives: n.register_natives_detected,
+            xrefs: n.xrefs.clone(),
+        }
+    }
+}
+
+impl From<NativeLibraryAnalysis> for CompactNativeLibraryAnalysis {
+    fn from(n: NativeLibraryAnalysis) -> Self {
+        Self::from(&n)
+    }
+}
+
 // ── Tests ──────────────────────────────────────────
 
 #[cfg(test)]
@@ -1640,5 +1896,53 @@ mod tests {
         // "rip" was redundant because after == 4580 (matching addr 4580)
         assert_eq!(compact.trace[0].diff.len(), 1);
         assert_eq!(compact.trace[0].diff[0].reg, "rsp");
+    }
+
+    #[test]
+    fn test_compact_apk_inspect_data_reduction() {
+        let mut native_libs = std::collections::HashMap::new();
+        native_libs.insert("arm64-v8a".to_string(), vec!["libnative.so".to_string()]);
+        let full = ApkInspectData {
+            source_type: "archive".to_string(),
+            package_name: Some("com.example.app".to_string()),
+            version_name: Some("1.0.0".to_string()),
+            version_code: Some(10),
+            has_manifest: true,
+            is_manifest_binary: true,
+            dex_files: vec!["classes.dex".to_string()],
+            native_libraries: native_libs,
+        };
+        let compact = CompactApkInspectData::from(&full);
+        assert_eq!(compact.src, "archive");
+        assert_eq!(compact.pkg.as_deref(), Some("com.example.app"));
+        assert!(compact.manifest);
+        assert!(compact.binary_manifest);
+        let json_full = serde_json::to_string(&full).unwrap();
+        let json_compact = serde_json::to_string(&compact).unwrap();
+        assert!(json_compact.len() < json_full.len());
+    }
+
+    #[test]
+    fn test_compact_manifest_info_reduction() {
+        let full = ManifestInfo {
+            package_name: "com.example.app".to_string(),
+            version_code: Some(1),
+            version_name: Some("1.0".to_string()),
+            min_sdk_version: Some(21),
+            target_sdk_version: Some(33),
+            debuggable: false,
+            permissions: vec!["android.permission.INTERNET".to_string()],
+            activities: vec!["MainActivity".to_string()],
+            services: Vec::new(),
+            receivers: Vec::new(),
+            providers: Vec::new(),
+        };
+        let compact = CompactManifestInfo::from(&full);
+        assert_eq!(compact.pkg, "com.example.app");
+        assert_eq!(compact.perms.len(), 1);
+        let json_full = serde_json::to_string(&full).unwrap();
+        let json_compact = serde_json::to_string(&compact).unwrap();
+        assert!(json_compact.len() < json_full.len());
+        assert!(!json_compact.contains("services"));
     }
 }

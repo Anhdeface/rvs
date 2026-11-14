@@ -51,10 +51,17 @@ pub fn get_binary_info(driver: &R2Driver) -> Result<BinaryInfo, AppError> {
         .unwrap_or("unknown")
         .to_string();
 
-    let arch = bin_obj.get("arch")
-        .and_then(|v| v.as_str())
-        .unwrap_or("x86")
-        .to_string();
+    let arch = if driver.is_aarch64() {
+        bin_obj.get("arch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("arm")
+            .to_string()
+    } else {
+        bin_obj.get("arch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("x86")
+            .to_string()
+    };
 
     let bits = bin_obj.get("bits")
         .and_then(|v| v.as_u64())

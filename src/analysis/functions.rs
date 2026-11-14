@@ -73,7 +73,8 @@ pub fn analyze_functions(
     filter: Option<&str>,
     detail: bool,
 ) -> Result<FunctionsResponse, AppError> {
-    let raw_funcs: Vec<RawR2Function> = driver.cmdj("aa; aflj")?;
+    let cmd = if driver.is_aarch64() { "aaa; aflj" } else { "aa; aflj" };
+    let raw_funcs: Vec<RawR2Function> = driver.cmdj(cmd)?;
 
     let mut functions = Vec::with_capacity(raw_funcs.len());
 

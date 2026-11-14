@@ -569,6 +569,132 @@ pub struct PatchStepResult {
     pub message: Option<String>,
 }
 
+// =============================================================================
+// APK and Android Analysis Payload Structures
+// =============================================================================
+
+/// APK Container inspection payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApkInspectData {
+    #[serde(default)]
+    pub source_type: String, // "archive", "directory", "standalone"
+    #[serde(default)]
+    pub package_name: Option<String>,
+    #[serde(default)]
+    pub version_name: Option<String>,
+    #[serde(default)]
+    pub version_code: Option<u32>,
+    #[serde(default)]
+    pub has_manifest: bool,
+    #[serde(default)]
+    pub is_manifest_binary: bool,
+    #[serde(default)]
+    pub dex_files: Vec<String>,
+    #[serde(default)]
+    pub native_libraries: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// APK Manifest payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestInfoData {
+    #[serde(default)]
+    pub package_name: String,
+    #[serde(default)]
+    pub version_code: Option<u32>,
+    #[serde(default)]
+    pub version_name: Option<String>,
+    #[serde(default)]
+    pub min_sdk_version: Option<u32>,
+    #[serde(default)]
+    pub target_sdk_version: Option<u32>,
+    #[serde(default)]
+    pub debuggable: bool,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub activities: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub receivers: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
+/// DEX analysis payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DexAnalysisData {
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub classes_count: usize,
+    #[serde(default)]
+    pub methods_count: usize,
+    #[serde(default)]
+    pub strings_count: usize,
+    #[serde(default)]
+    pub classes: Vec<DexClassSummaryData>,
+    #[serde(default)]
+    pub strings: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DexClassSummaryData {
+    pub name: String,
+    #[serde(default)]
+    pub super_class: Option<String>,
+    #[serde(default)]
+    pub access_flags: u32,
+    #[serde(default)]
+    pub methods: Vec<DexMethodSummaryData>,
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DexMethodSummaryData {
+    pub name: String,
+    pub signature: String,
+    #[serde(default)]
+    pub access_flags: u32,
+    #[serde(default)]
+    pub code_offset: Option<u64>,
+}
+
+/// Native .so JNI payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeSoData {
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub architecture: String,
+    #[serde(default)]
+    pub is_64_bit: bool,
+    #[serde(default)]
+    pub jni_functions: Vec<JniFunctionData>,
+    #[serde(default)]
+    pub exported_symbols: Vec<String>,
+    #[serde(default)]
+    pub imported_symbols: Vec<String>,
+    #[serde(default)]
+    pub register_natives_detected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JniFunctionData {
+    pub name: String,
+    #[serde(default)]
+    pub demangled_class: Option<String>,
+    #[serde(default)]
+    pub demangled_method: Option<String>,
+    #[serde(default)]
+    pub address: u64,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub is_exported: bool,
+}
+
 /// Helper to get the path to test fixtures
 pub fn fixture_path(name: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -189,6 +189,47 @@ impl std::fmt::Debug for R2Driver {
 
 pub const BATCH_DELIMITER: &str = "===RVS_CMD_BATCH_BOUNDARY_DELIM===";
 
+/// Checks if an ELF binary has machine type EM_AARCH64 (183).
+pub fn is_aarch64_elf(path: &Path) -> bool {
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut header = [0u8; 20];
+        if let Ok(n) = f.read(&mut header) {
+            if n >= 20 && &header[0..4] == b"\x7fELF" {
+                let e_machine = if header[5] == 2 {
+                    u16::from_be_bytes([header[18], header[19]])
+                } else {
+                    u16::from_le_bytes([header[18], header[19]])
+                };
+                return e_machine == 183;
+            }
+        }
+    }
+    false
+}
+
+/// Normalizes architecture and bits for radare2 invocations.
+/// Converts "aarch64" / "arm64" to arch="arm", bits=64.
+/// Also auto-detects AArch64 ELF binaries when architecture is unspecified.
+pub fn normalize_arch_bits(
+    binary_path: &Path,
+    arch: Option<String>,
+    bits: Option<u32>,
+) -> (Option<String>, Option<u32>) {
+    if let Some(ref a) = arch {
+        let a_lower = a.to_lowercase();
+        if a_lower == "aarch64" || a_lower == "arm64" {
+            return (Some("arm".to_string()), Some(64));
+        }
+        if a_lower == "arm" && bits == Some(64) {
+            return (Some("arm".to_string()), Some(64));
+        }
+    } else if is_aarch64_elf(binary_path) {
+        return (Some("arm".to_string()), Some(64));
+    }
+    (arch, bits)
+}
+
 impl R2Driver {
     /// Creates a new `R2Driver` instance after validating the target binary exists.
     pub fn new(
@@ -212,10 +253,11 @@ impl R2Driver {
                 return Err(AppError::ZeroByteFile(path.display().to_string()));
             }
         }
+        let (norm_arch, norm_bits) = normalize_arch_bits(&path, arch, bits);
         Ok(Self {
             binary_path: path,
-            arch,
-            bits,
+            arch: norm_arch,
+            bits: norm_bits,
             quiet,
             timeout: Duration::from_secs(30),
             session: Arc::new(Mutex::new(None)),
@@ -223,8 +265,23 @@ impl R2Driver {
         })
     }
 
+    /// Returns true if this driver targets an AArch64 / ARM64 architecture.
+    pub fn is_aarch64(&self) -> bool {
+        if let Some(ref a) = self.arch {
+            let a_lower = a.to_lowercase();
+            if a_lower == "aarch64" || a_lower == "arm64" {
+                return true;
+            }
+            if a_lower == "arm" && self.bits == Some(64) {
+                return true;
+            }
+        }
+        is_aarch64_elf(&self.binary_path)
+    }
+
     /// Spawns a persistent bidirectional radare2 process using -N -0 -2.
     fn spawn_session(&self) -> Result<R2Session, AppError> {
+        let is_arm64 = self.is_aarch64();
         let mut cmd = Command::new("radare2");
         cmd.arg("-N")
             .arg("-0")
@@ -235,9 +292,15 @@ impl R2Driver {
             .arg("-e").arg("scr.utf8=0")
             .arg("-e").arg("cfg.fortunes=0")
             .arg("-e").arg("cfg.plugins=false")
-            .arg("-e").arg("log.level=0")
-            .arg("-e").arg("bin.relocs.apply=false")
-            .arg("-e").arg("anal.hasnext=false")
+            .arg("-e").arg("log.level=0");
+
+        if is_arm64 {
+            cmd.arg("-e").arg("bin.relocs.apply=true");
+        } else {
+            cmd.arg("-e").arg("bin.relocs.apply=false");
+        }
+
+        cmd.arg("-e").arg("anal.hasnext=false")
             .arg("-e").arg("anal.vars=false");
 
         if let Some(ref a) = self.arch {
@@ -245,6 +308,9 @@ impl R2Driver {
         }
         if let Some(b) = self.bits {
             cmd.arg("-b").arg(b.to_string());
+        }
+        if is_arm64 {
+            cmd.arg("-e").arg("asm.cpu=v8");
         }
 
         cmd.arg(&self.binary_path);
@@ -299,6 +365,7 @@ impl R2Driver {
 
     /// Builds base Command with strict terminal & environment isolation.
     fn build_base_command(&self, write_mode: bool) -> Command {
+        let is_arm64 = self.is_aarch64();
         let mut cmd = Command::new("radare2");
         if write_mode {
             cmd.arg("-w");
@@ -311,9 +378,15 @@ impl R2Driver {
             .arg("-e").arg("scr.utf8=0")
             .arg("-e").arg("cfg.fortunes=0")
             .arg("-e").arg("cfg.plugins=false")
-            .arg("-e").arg("log.level=0")
-            .arg("-e").arg("bin.relocs.apply=false")
-            .arg("-e").arg("anal.hasnext=false")
+            .arg("-e").arg("log.level=0");
+
+        if is_arm64 {
+            cmd.arg("-e").arg("bin.relocs.apply=true");
+        } else {
+            cmd.arg("-e").arg("bin.relocs.apply=false");
+        }
+
+        cmd.arg("-e").arg("anal.hasnext=false")
             .arg("-e").arg("anal.vars=false");
 
         if let Some(ref a) = self.arch {
@@ -321,6 +394,9 @@ impl R2Driver {
         }
         if let Some(b) = self.bits {
             cmd.arg("-b").arg(b.to_string());
+        }
+        if is_arm64 {
+            cmd.arg("-e").arg("asm.cpu=v8");
         }
 
         cmd.env("TERM", "dumb")
@@ -578,7 +654,8 @@ impl R2Driver {
         }
 
         // Check if symbol exists in AFL
-        let funcs: Vec<serde_json::Value> = self.cmdj("aa; aflj").unwrap_or_default();
+        let afl_cmd = if self.is_aarch64() { "aaa; aflj" } else { "aa; aflj" };
+        let funcs: Vec<serde_json::Value> = self.cmdj(afl_cmd).unwrap_or_default();
         {
             let mut cache = self.address_cache.lock().unwrap();
             for f in funcs {
@@ -769,5 +846,40 @@ mod tests {
     fn test_driver_new_validation() {
         assert!(R2Driver::new("/nonexistent/file/path", None, None, false).is_err());
         assert!(R2Driver::new("/tmp", None, None, false).is_err());
+    }
+
+    #[test]
+    fn test_normalize_arch_bits_aarch64_and_arm64() {
+        let dummy = Path::new("/dummy/path");
+        let (a1, b1) = normalize_arch_bits(dummy, Some("aarch64".to_string()), None);
+        assert_eq!(a1.as_deref(), Some("arm"));
+        assert_eq!(b1, Some(64));
+
+        let (a2, b2) = normalize_arch_bits(dummy, Some("arm64".to_string()), None);
+        assert_eq!(a2.as_deref(), Some("arm"));
+        assert_eq!(b2, Some(64));
+
+        let (a3, b3) = normalize_arch_bits(dummy, Some("AARCH64".to_string()), Some(32));
+        assert_eq!(a3.as_deref(), Some("arm"));
+        assert_eq!(b3, Some(64));
+
+        let (a4, b4) = normalize_arch_bits(dummy, Some("x86".to_string()), Some(32));
+        assert_eq!(a4.as_deref(), Some("x86"));
+        assert_eq!(b4, Some(32));
+    }
+
+    #[test]
+    fn test_aarch64_fixture_detection() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sample_aarch64_lib.so");
+        if fixture.exists() {
+            assert!(is_aarch64_elf(&fixture));
+            let driver = R2Driver::new(&fixture, None, None, true).expect("Failed to create driver");
+            assert!(driver.is_aarch64());
+            assert_eq!(driver.arch.as_deref(), Some("arm"));
+            assert_eq!(driver.bits, Some(64));
+        }
     }
 }
