@@ -35,30 +35,6 @@ success() { echo -e "${C_GREEN}[✓]${C_RESET} ${C_BOLD}$*${C_RESET}"; }
 warn()    { echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
 error()   { echo -e "${C_RED}[✗]${C_RESET} ${C_BOLD}$*${C_RESET}" >&2; }
 
-check_and_print_pending_notification() {
-    if [[ -f "$PENDING_UPDATE_FILE" ]]; then
-        local pending_tag
-        pending_tag=$(cat "$PENDING_UPDATE_FILE" 2>/dev/null || true)
-        if [[ -n "$pending_tag" ]]; then
-            local head_tag
-            head_tag=$(git -C "$REPO_DIR" describe --tags --exact-match 2>/dev/null || true)
-            if [[ "$head_tag" == "$pending_tag" ]]; then
-                rm -f "$PENDING_UPDATE_FILE"
-                return 0
-            fi
-            echo -e "${C_YELLOW}🔔 Notice: A new release ${C_BOLD}${pending_tag}${C_RESET}${C_YELLOW} is available on GitHub!${C_RESET}"
-            echo -e "   Select Option 3 (Check GitHub Update) to review and upgrade."
-            echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
-        fi
-    fi
-}
-
-print_banner() {
-    echo -e "${C_BOLD}rvs — AI Agent Setup & Sync${C_RESET}"
-    echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
-    check_and_print_pending_notification
-}
-
 # Portable timeout runner
 run_with_timeout() {
     local duration="$1"
@@ -70,6 +46,96 @@ run_with_timeout() {
     else
         "$@"
     fi
+}
+
+check_repo_sync_status() {
+    cd -- "$REPO_DIR" || return 0
+
+    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+        return 0
+    fi
+
+    if ! git remote get-url origin &>/dev/null; then
+        return 0
+    fi
+
+    local current_branch local_commit
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+    local_commit=$(git rev-parse HEAD 2>/dev/null || true)
+    [[ -z "$local_commit" ]] && return 0
+
+    # 1. Check remote branch status
+    local remote_branch_commit=""
+    if [[ "$current_branch" != "HEAD" ]]; then
+        remote_branch_commit=$(run_with_timeout 4 git ls-remote origin "refs/heads/$current_branch" 2>/dev/null | awk '{print $1}')
+    fi
+
+    # 2. Check latest remote release tag
+    local latest_tag tag_commit=""
+    latest_tag=$(run_with_timeout 4 git ls-remote --tags --sort="v:refname" origin 2>/dev/null | grep -v '\^{}' | tail -n1 | sed 's/.*refs\/tags\///' || true)
+    if [[ -n "$latest_tag" && "$latest_tag" =~ ^v?[0-9]+(\.[0-9]+)*([a-zA-Z0-9._-]+)?$ ]]; then
+        tag_commit=$(run_with_timeout 4 git ls-remote --tags origin "refs/tags/$latest_tag*" 2>/dev/null | tail -n1 | awk '{print $1}')
+    fi
+
+    local is_synced=true
+    local update_reason=""
+
+    # Check if remote branch has new commits not contained in local
+    if [[ -n "$remote_branch_commit" && "$remote_branch_commit" != "$local_commit" ]]; then
+        if ! git merge-base --is-ancestor "$remote_branch_commit" "$local_commit" 2>/dev/null; then
+            is_synced=false
+            update_reason="Branch 'origin/$current_branch' has new updates"
+        fi
+    fi
+
+    # Check if remote has a release tag not contained in local
+    if [[ -n "$tag_commit" && "$tag_commit" != "$local_commit" ]]; then
+        if ! git merge-base --is-ancestor "$tag_commit" "$local_commit" 2>/dev/null; then
+            is_synced=false
+            update_reason="A new release ${latest_tag}"
+        fi
+    fi
+
+    mkdir -p -m 700 "$CACHE_DIR"
+    if [[ "$is_synced" == false ]]; then
+        local temp_pending="${PENDING_UPDATE_FILE}.tmp.$$"
+        echo "${update_reason}" > "$temp_pending"
+        mv -f "$temp_pending" "$PENDING_UPDATE_FILE"
+        chmod 600 "$PENDING_UPDATE_FILE" 2>/dev/null || true
+    else
+        rm -f "$PENDING_UPDATE_FILE"
+    fi
+}
+
+check_and_print_pending_notification() {
+    # Check sync dynamically with rate-limit
+    local now
+    now=$(date +%s)
+    local last=0
+    [[ -f "$LAST_CHECK_FILE" ]] && last=$(cat "$LAST_CHECK_FILE" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+
+    if (( (now - last) >= 300 )) || [[ ! -f "$PENDING_UPDATE_FILE" ]]; then
+        mkdir -p "$CACHE_DIR"
+        echo "$now" > "$LAST_CHECK_FILE"
+        check_repo_sync_status
+    fi
+
+    if [[ -f "$PENDING_UPDATE_FILE" ]]; then
+        local pending_msg
+        pending_msg=$(cat "$PENDING_UPDATE_FILE" 2>/dev/null || true)
+        if [[ -n "$pending_msg" ]]; then
+            echo -e "${C_YELLOW}🔔 Notice: ${pending_msg} is available on GitHub!${C_RESET}"
+            echo -e "   Select Option 3 (Check GitHub Update) to review and sync."
+            echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
+        fi
+    fi
+}
+
+print_banner() {
+    echo -e "${C_BOLD}rvs — AI Agent Setup & Sync${C_RESET}"
+    echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
+    check_and_print_pending_notification
 }
 
 # Prompt user for input with safe default fallback and EOF resilience
@@ -512,51 +578,10 @@ configure_cursor_core() {
 }
 
 # =============================================================================
-# 7. GitHub Release Tag Auto-Update (Notify-Only Detection & On-Demand Upgrade)
+# 7. GitHub Repository Sync & On-Demand Upgrade
 # =============================================================================
 check_update_silent() {
-    cd -- "$REPO_DIR" || return 0
-
-    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
-        return 0
-    fi
-
-    local latest_tag
-    latest_tag=$(run_with_timeout 5 git ls-remote --tags --sort="v:refname" origin 2>/dev/null | grep -v '\^{}' | tail -n1 | sed 's/.*refs\/tags\///' || true)
-
-    if [[ -z "$latest_tag" ]]; then
-        return 0
-    fi
-
-    # Strictly sanitize tag format to prevent command/argument injection
-    if [[ ! "$latest_tag" =~ ^v?[0-9]+(\.[0-9]+)*([a-zA-Z0-9._-]+)?$ ]]; then
-        return 0
-    fi
-
-    local current_commit head_tag
-    current_commit=$(git rev-parse HEAD 2>/dev/null || true)
-    head_tag=$(git describe --tags --exact-match 2>/dev/null || true)
-
-    local is_up_to_date=false
-    if [[ -n "$head_tag" && "$head_tag" == "$latest_tag" ]]; then
-        is_up_to_date=true
-    fi
-
-    local tag_commit
-    tag_commit=$(git rev-list -n 1 "refs/tags/$latest_tag" 2>/dev/null || true)
-    if [[ -n "$tag_commit" && "$current_commit" == "$tag_commit" ]]; then
-        is_up_to_date=true
-    fi
-
-    mkdir -p -m 700 "$CACHE_DIR"
-    if [[ "$is_up_to_date" == false ]]; then
-        local temp_pending="${PENDING_UPDATE_FILE}.tmp.$$"
-        echo "$latest_tag" > "$temp_pending"
-        mv -f "$temp_pending" "$PENDING_UPDATE_FILE"
-        chmod 600 "$PENDING_UPDATE_FILE" 2>/dev/null || true
-    else
-        rm -f "$PENDING_UPDATE_FILE"
-    fi
+    check_repo_sync_status
 }
 
 perform_update() {
@@ -573,55 +598,35 @@ perform_update() {
         return 0
     fi
 
-    [[ "$silent" == false ]] && log "Checking latest release on GitHub..."
+    [[ "$silent" == false ]] && log "Checking repository sync with GitHub..."
 
-    local latest_tag
-    latest_tag=$(run_with_timeout 5 git ls-remote --tags --sort="v:refname" origin 2>/dev/null | grep -v '\^{}' | tail -n1 | sed 's/.*refs\/tags\///' || true)
+    check_repo_sync_status
 
-    if [[ -z "$latest_tag" ]]; then
-        [[ "$silent" == false ]] && warn "Unable to fetch remote tags."
-        return 0
-    fi
-
-    # Strictly sanitize tag format
-    if [[ ! "$latest_tag" =~ ^v?[0-9]+(\.[0-9]+)*([a-zA-Z0-9._-]+)?$ ]]; then
-        [[ "$silent" == false ]] && warn "Untrusted or invalid tag format from remote: $latest_tag"
-        return 0
-    fi
-
-    local current_commit head_tag
+    local current_commit head_tag current_branch
     current_commit=$(git rev-parse HEAD 2>/dev/null || true)
     head_tag=$(git describe --tags --exact-match 2>/dev/null || true)
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
 
-    local is_up_to_date=false
-    if [[ -n "$head_tag" && "$head_tag" == "$latest_tag" ]]; then
-        is_up_to_date=true
-    fi
-
-    local tag_commit
-    tag_commit=$(git rev-list -n 1 "refs/tags/$latest_tag" 2>/dev/null || true)
-    if [[ -n "$tag_commit" && "$current_commit" == "$tag_commit" ]]; then
-        is_up_to_date=true
-    fi
-
-    if [[ "$silent" == false ]]; then
-        echo "  Current: ${head_tag:-$current_commit}"
-        echo "  Latest : $latest_tag"
-    fi
-
-    if [[ "$is_up_to_date" == false ]]; then
+    if [[ -f "$PENDING_UPDATE_FILE" ]]; then
+        local pending_msg
+        pending_msg=$(cat "$PENDING_UPDATE_FILE" 2>/dev/null || true)
         if [[ "$silent" == false ]]; then
+            echo -e "  Current : ${head_tag:-${current_branch} @ ${current_commit:0:7}}"
+            echo -e "  Status  : ${C_YELLOW}${pending_msg} available on GitHub${C_RESET}"
             local do_up="Y"
-            prompt_input "Upgrade to $latest_tag? [Y/n]: " "Y" do_up
+            prompt_input "Synchronize / pull updates from GitHub? [Y/n]: " "Y" do_up
             if [[ ! "$do_up" =~ ^[Yy]$ ]]; then
                 info "Canceled."
                 return 0
             fi
         fi
 
-        [[ "$silent" == false ]] && log "Pulling $latest_tag..."
-        git fetch --tags origin -q 2>/dev/null || return 0
-        git checkout "tags/$latest_tag" -q 2>/dev/null || return 0
+        [[ "$silent" == false ]] && log "Pulling latest updates from GitHub..."
+        if [[ "$current_branch" != "HEAD" ]]; then
+            git pull origin "$current_branch" -q 2>/dev/null || git fetch --tags origin -q 2>/dev/null || return 0
+        else
+            git fetch --tags origin -q 2>/dev/null || return 0
+        fi
 
         # Try fast pre-built binary download first, then cargo --bin rvs
         build_rvs_binary
@@ -638,10 +643,10 @@ perform_update() {
         fi
 
         rm -f "$PENDING_UPDATE_FILE"
-        [[ "$silent" == false ]] && success "Updated to $latest_tag."
+        [[ "$silent" == false ]] && success "Successfully synchronized with GitHub."
     else
         rm -f "$PENDING_UPDATE_FILE"
-        [[ "$silent" == false ]] && success "Already up to date ($latest_tag)."
+        [[ "$silent" == false ]] && success "Already up to date and synchronized with GitHub (${head_tag:-${current_branch} @ ${current_commit:0:7}})."
     fi
 }
 
@@ -834,6 +839,7 @@ run_installation_wizard() {
 
     echo ""
     success "Setup complete."
+    exit 0
 }
 
 # =============================================================================
@@ -843,9 +849,7 @@ interactive_menu() {
     while true; do
         local update_badge=""
         if [[ -f "$PENDING_UPDATE_FILE" ]]; then
-            local pending_tag
-            pending_tag=$(cat "$PENDING_UPDATE_FILE" 2>/dev/null || true)
-            [[ -n "$pending_tag" ]] && update_badge=" ${C_YELLOW}(${pending_tag} available)${C_RESET}"
+            update_badge=" ${C_YELLOW}(update available)${C_RESET}"
         fi
 
         echo ""
@@ -866,8 +870,7 @@ interactive_menu() {
         case "$main_choice" in
             1)
                 run_installation_wizard
-                echo ""
-                prompt_input "Press Enter to return..." "" unused
+                exit 0
                 ;;
             2)
                 export_manual_mcp_config
