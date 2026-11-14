@@ -36,6 +36,12 @@ from tests.fixtures_builder import (
     create_synthetic_apk,
     create_synthetic_dex,
     create_corrupted_apk,
+    synthesize_elf_bytes,
+    create_synthetic_react_native_apk,
+    create_synthetic_flutter_apk,
+    create_synthetic_native_cpp_apk,
+    create_synthetic_java_only_apk,
+    create_synthetic_hybrid_apk,
 )
 from neutral_orchestrator.neutral_representation import (
     NeutralTokenMapper,
@@ -454,6 +460,234 @@ class TestGroupFZeroEphemeralLeakage(BaseMultiTargetIntegrationTest):
         r3 = self.harness.execute_tool("rvs_strings", {"file": str(self.apk_path)})
         self.assertTrue(r3.get("success"))
         self.assertEqual(set(glob.glob(pattern)) - before, set())
+
+
+# =============================================================================
+# Group G: Framework Triage Recommendations & Deduplication (G.1 - G.2)
+# =============================================================================
+
+class TestGroupGFrameworkTriageRecommendations(BaseMultiTargetIntegrationTest):
+    """Group G: Multi-language framework recognition and deduplication in rvs_agent_triage."""
+
+    def test_react_native_triage_recommendations_preserved(self) -> None:
+        """Case G.1: React Native recommendations preserved without collision with DEX in full and compact modes."""
+        rn_apk = self.temp_dir / "rn_triage_test.apk"
+        create_synthetic_react_native_apk(rn_apk)
+
+        # 1. Full mode triage
+        res_full = self.harness.execute_tool("rvs_agent_triage", {"file": str(rn_apk), "compact": False, "neutral": False})
+        self.assertTrue(res_full.get("success"), f"Full triage failed: {res_full}")
+        recs_full = res_full["data"].get("recommendations", [])
+        self.assertTrue(any("react native" in r.lower() for r in recs_full), f"React Native rec missing in full: {recs_full}")
+        self.assertTrue(any("dex" in r.lower() for r in recs_full), f"DEX rec missing in full: {recs_full}")
+
+        # 2. Compact mode triage
+        res_comp = self.harness.execute_tool("rvs_agent_triage", {"file": str(rn_apk), "compact": True, "neutral": False})
+        self.assertTrue(res_comp.get("success"), f"Compact triage failed: {res_comp}")
+        recs_comp = res_comp["data"].get("recommendations", [])
+        self.assertTrue(any("react native" in r.lower() for r in recs_comp), f"React Native rec missing in compact: {recs_comp}")
+        self.assertLessEqual(len(recs_comp), 2)
+
+    def test_flutter_triage_recommendations_preserved(self) -> None:
+        """Case G.2: Flutter / Dart recommendations preserved without collision in full and compact modes."""
+        flutter_apk = self.temp_dir / "flutter_triage_test.apk"
+        create_synthetic_flutter_apk(flutter_apk)
+
+        # 1. Full mode triage
+        res_full = self.harness.execute_tool("rvs_agent_triage", {"file": str(flutter_apk), "compact": False, "neutral": False})
+        self.assertTrue(res_full.get("success"), f"Full triage failed: {res_full}")
+        recs_full = res_full["data"].get("recommendations", [])
+        self.assertTrue(any("flutter" in r.lower() or "dart" in r.lower() for r in recs_full), f"Flutter rec missing in full: {recs_full}")
+
+        # 2. Compact mode triage
+        res_comp = self.harness.execute_tool("rvs_agent_triage", {"file": str(flutter_apk), "compact": True, "neutral": False})
+        self.assertTrue(res_comp.get("success"), f"Compact triage failed: {res_comp}")
+        recs_comp = res_comp["data"].get("recommendations", [])
+        self.assertTrue(any("flutter" in r.lower() or "dart" in r.lower() for r in recs_comp), f"Flutter rec missing in compact: {recs_comp}")
+        self.assertLessEqual(len(recs_comp), 2)
+
+
+# =============================================================================
+# Group H: Multi-Language Framework Recognition in rvs_apk_info (H.1 - H.5)
+# =============================================================================
+
+class TestGroupHMultiLanguageRecognition(BaseMultiTargetIntegrationTest):
+    """Group H: Multi-Language framework recognition in rvs_apk_info across full and compact formats."""
+
+    def test_apk_info_react_native_recognition(self) -> None:
+        """Case H.1: rvs_apk_info recognizes React Native in full and compact modes."""
+        apk_path = self.temp_dir / "test_rn_recog.apk"
+        create_synthetic_react_native_apk(apk_path)
+
+        # Full mode
+        res_full = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": False, "neutral": False})
+        self.assertTrue(res_full.get("success"), f"Failed: {res_full}")
+        languages = res_full.get("data", {}).get("languages", [])
+        lang_names = [l["language"] for l in languages]
+        self.assertIn("React Native", lang_names)
+        self.assertIn("Java", lang_names)
+        self.assertIn("C/C++", lang_names)
+        rn_entry = next(l for l in languages if l["language"] == "React Native")
+        self.assertEqual(rn_entry.get("confidence"), "High")
+        self.assertTrue(any("libreactnativejni.so" in e or "index.android.bundle" in e for e in rn_entry.get("evidence", [])))
+
+        # Compact mode
+        res_comp = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": True, "neutral": False})
+        self.assertTrue(res_comp.get("success"), f"Failed: {res_comp}")
+        langs_comp = res_comp.get("data", {}).get("langs", [])
+        self.assertIn("React Native", langs_comp)
+        self.assertIn("Java", langs_comp)
+
+    def test_apk_info_flutter_recognition(self) -> None:
+        """Case H.2: rvs_apk_info recognizes Flutter / Dart in full and compact modes."""
+        apk_path = self.temp_dir / "test_flutter_recog.apk"
+        create_synthetic_flutter_apk(apk_path)
+
+        # Full mode
+        res_full = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": False, "neutral": False})
+        self.assertTrue(res_full.get("success"), f"Failed: {res_full}")
+        languages = res_full.get("data", {}).get("languages", [])
+        lang_names = [l["language"] for l in languages]
+        self.assertIn("Flutter / Dart", lang_names)
+        flutter_entry = next(l for l in languages if l["language"] == "Flutter / Dart")
+        self.assertEqual(flutter_entry.get("confidence"), "High")
+        self.assertTrue(any("libflutter.so" in e or "kernel_blob.bin" in e for e in flutter_entry.get("evidence", [])))
+
+        # Compact mode
+        res_comp = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": True, "neutral": False})
+        self.assertTrue(res_comp.get("success"), f"Failed: {res_comp}")
+        langs_comp = res_comp.get("data", {}).get("langs", [])
+        self.assertIn("Flutter / Dart", langs_comp)
+
+    def test_apk_info_native_cpp_recognition(self) -> None:
+        """Case H.3: rvs_apk_info recognizes C/C++ without false-positive framework markers."""
+        apk_path = self.temp_dir / "test_cpp_recog.apk"
+        create_synthetic_native_cpp_apk(apk_path)
+
+        res = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": False, "neutral": False})
+        self.assertTrue(res.get("success"), f"Failed: {res}")
+        languages = res.get("data", {}).get("languages", [])
+        lang_names = [l["language"] for l in languages]
+        self.assertIn("Java", lang_names)
+        self.assertIn("C/C++", lang_names)
+        self.assertNotIn("React Native", lang_names)
+        self.assertNotIn("Flutter / Dart", lang_names)
+
+    def test_apk_info_pure_java_recognition(self) -> None:
+        """Case H.4: rvs_apk_info on pure Java APK detects only Java with no native C/C++."""
+        apk_path = self.temp_dir / "test_java_recog.apk"
+        create_synthetic_java_only_apk(apk_path)
+
+        res = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": True, "neutral": False})
+        self.assertTrue(res.get("success"), f"Failed: {res}")
+        langs = res.get("data", {}).get("langs", [])
+        self.assertEqual(langs, ["Java"])
+
+    def test_apk_info_hybrid_recognition(self) -> None:
+        """Case H.5: rvs_apk_info on hybrid APK detects Java, C/C++, and React Native simultaneously."""
+        apk_path = self.temp_dir / "test_hybrid_recog.apk"
+        create_synthetic_hybrid_apk(apk_path)
+
+        res = self.harness.execute_tool("rvs_apk_info", {"file": str(apk_path), "compact": True, "neutral": False})
+        self.assertTrue(res.get("success"), f"Failed: {res}")
+        langs = set(res.get("data", {}).get("langs", []))
+        self.assertTrue({"Java", "C/C++", "React Native"}.issubset(langs))
+
+
+# =============================================================================
+# Group I: Native ELF Shared Library Inspection via rvs_apk_native (I.1 - I.5)
+# =============================================================================
+
+class TestGroupINativeSoExtraction(BaseMultiTargetIntegrationTest):
+    """Group I: Native ELF metadata extraction and library filtering in rvs_apk_native."""
+
+    def test_apk_native_metadata_extraction_arm64(self) -> None:
+        """Case I.1: rvs_apk_native extracts ABI, bits, elf_type, endianness, soname, and DT_NEEDED."""
+        apk_path = self.temp_dir / "test_native_meta.apk"
+        create_synthetic_native_cpp_apk(apk_path)
+
+        res = self.harness.execute_tool(
+            "rvs_apk_native",
+            {"file": str(apk_path), "abi": "arm64-v8a", "compact": False, "neutral": False},
+        )
+        self.assertTrue(res.get("success"), f"Query failed: {res}")
+        data = res.get("data", {})
+        self.assertEqual(data.get("architecture"), "arm64")
+        self.assertEqual(data.get("abi"), "arm64-v8a")
+        self.assertTrue(data.get("is_64_bit"))
+        self.assertEqual(data.get("bits"), 64)
+        self.assertEqual(data.get("elf_type"), "DYN")
+        self.assertEqual(data.get("endianness"), "little")
+        self.assertEqual(data.get("soname"), "libnative.so")
+        self.assertIn("libc.so", data.get("needed_libraries", []))
+        self.assertIn("libstdc++.so", data.get("needed_libraries", []))
+
+    def test_apk_native_jni_unmangling(self) -> None:
+        """Case I.2: rvs_apk_native unmangles static Java_* JNI function exports."""
+        apk_path = self.temp_dir / "test_native_jni.apk"
+        create_synthetic_native_cpp_apk(apk_path)
+
+        res = self.harness.execute_tool("rvs_apk_native", {"file": str(apk_path), "compact": False, "neutral": False})
+        self.assertTrue(res.get("success"), f"Query failed: {res}")
+        jni_funcs = res.get("data", {}).get("jni_functions", [])
+        self.assertGreaterEqual(len(jni_funcs), 2)
+        
+        string_from_jni = next((j for j in jni_funcs if "stringFromJNI" in j.get("name", "")), None)
+        self.assertIsNotNone(string_from_jni)
+        self.assertEqual(string_from_jni.get("demangled_class"), "com.example.nativecpp.MainActivity")
+        self.assertEqual(string_from_jni.get("demangled_method"), "stringFromJNI")
+        self.assertTrue(string_from_jni.get("is_exported"))
+
+    def test_apk_native_library_filter(self) -> None:
+        """Case I.3: rvs_apk_native with library filter targets specified library and detects RegisterNatives."""
+        apk_path = self.temp_dir / "test_native_filter.apk"
+        create_synthetic_hybrid_apk(apk_path)
+
+        # Target libcustom_sec.so
+        res = self.harness.execute_tool(
+            "rvs_apk_native",
+            {"file": str(apk_path), "library": "libcustom_sec.so", "compact": False, "neutral": False},
+        )
+        self.assertTrue(res.get("success"), f"Query failed: {res}")
+        data = res.get("data", {})
+        self.assertIn("libcustom_sec.so", data.get("file_name", ""))
+        self.assertTrue(data.get("register_natives_detected"))
+        self.assertEqual(data.get("soname"), "libcustom_sec.so")
+
+    def test_apk_native_compact_mode(self) -> None:
+        """Case I.4: rvs_apk_native in compact mode emits token-optimized schema."""
+        apk_path = self.temp_dir / "test_native_compact.apk"
+        create_synthetic_hybrid_apk(apk_path)
+
+        res = self.harness.execute_tool(
+            "rvs_apk_native",
+            {"file": str(apk_path), "library": "libcustom_sec.so", "compact": True, "neutral": False},
+        )
+        self.assertTrue(res.get("success"), f"Query failed: {res}")
+        data = res.get("data", {})
+        # Verify compact keys
+        self.assertEqual(data.get("arch"), "arm64")
+        self.assertEqual(data.get("abi"), "arm64-v8a")
+        self.assertTrue(data.get("is_64"))
+        self.assertEqual(data.get("elf_type"), "DYN")
+        self.assertEqual(data.get("endian"), "little")
+        self.assertTrue(data.get("reg_natives"))
+        self.assertIn("deps", data)
+        self.assertIn("jni", data)
+        self.assertIn("exports", data)
+        self.assertIn("imports", data)
+
+    def test_apk_native_missing_so_graceful_handling(self) -> None:
+        """Case I.5: rvs_apk_native gracefully reports absent native libraries on pure Java APK."""
+        apk_path = self.temp_dir / "test_java_no_so.apk"
+        create_synthetic_java_only_apk(apk_path)
+
+        res = self.harness.execute_tool("rvs_apk_native", {"file": str(apk_path), "compact": False, "neutral": False})
+        self.assertTrue(res.get("success"), f"Query should succeed gracefully: {res}")
+        data = res.get("data", {})
+        self.assertEqual(data.get("architecture"), "unknown")
+        self.assertEqual(data.get("needed_libraries"), [])
+        self.assertEqual(data.get("jni_functions"), [])
 
 
 if __name__ == "__main__":

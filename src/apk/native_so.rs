@@ -26,15 +26,38 @@ pub struct JniFunction {
     pub xrefs: Option<crate::analysis::xrefs::XrefsResponse>,
 }
 
+/// Detailed symbol entry from ELF symbol table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSymbol {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demangled_name: Option<String>,
+    pub address: u64,
+    pub size: u64,
+    pub sym_type: String, // "FUNC", "OBJECT", "NOTYPE", "TLS", etc.
+    pub binding: String,  // "GLOBAL", "WEAK", "LOCAL"
+    pub is_import: bool,
+}
+
 /// Analysis result for an Android native `.so` shared library.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLibraryAnalysis {
     pub file_name: String,
     pub architecture: String,
+    pub abi: String,
     pub is_64_bit: bool,
+    pub bits: u32,
+    pub elf_type: String,
+    pub endianness: String,
+    pub entry_point: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soname: Option<String>,
+    pub needed_libraries: Vec<String>,
     pub jni_functions: Vec<JniFunction>,
     pub exported_symbols: Vec<String>,
     pub imported_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub symbols: Vec<NativeSymbol>,
     pub register_natives_detected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xrefs: Option<std::collections::HashMap<String, crate::analysis::xrefs::XrefsResponse>>,
@@ -163,6 +186,27 @@ pub fn unmangle_jni_symbol(symbol: &str) -> (Option<String>, Option<String>) {
     (Some(class), method)
 }
 
+/// Check if a symbol is an ARM mapping symbol or compiler internal that causes token bloat.
+fn is_internal_symbol(name: &str) -> bool {
+    // ARM mapping symbols: $a, $d, $t, $x (and suffixes like $d.0, $x.1)
+    if name == "$a" || name.starts_with("$a.")
+        || name == "$d" || name.starts_with("$d.")
+        || name == "$t" || name.starts_with("$t.")
+        || name == "$x" || name.starts_with("$x.")
+    {
+        return true;
+    }
+    // Compiler internals / exception handling / local labels
+    if name.starts_with("DW.ref.")
+        || name.starts_with("GCC_except_table")
+        || name.starts_with("compiler_builtins")
+        || name.starts_with(".L")
+    {
+        return true;
+    }
+    false
+}
+
 /// Parse raw ELF shared library bytes and extract JNI entry points and metadata.
 pub fn parse_native_so_bytes(bytes: &[u8], file_name: &str) -> Result<NativeLibraryAnalysis, AppError> {
     if bytes.is_empty() {
@@ -189,78 +233,140 @@ pub fn parse_native_so_bytes(bytes: &[u8], file_name: &str) -> Result<NativeLibr
         other => format!("unknown({})", other),
     };
 
+    let abi = match elf.header.e_machine {
+        goblin::elf::header::EM_AARCH64 => "arm64-v8a".to_string(),
+        goblin::elf::header::EM_ARM => "armeabi-v7a".to_string(),
+        goblin::elf::header::EM_X86_64 => "x86_64".to_string(),
+        goblin::elf::header::EM_386 => "x86".to_string(),
+        goblin::elf::header::EM_RISCV => "riscv64".to_string(),
+        goblin::elf::header::EM_MIPS => {
+            if elf.is_64 {
+                "mips64".to_string()
+            } else {
+                "mips".to_string()
+            }
+        }
+        _ => "unknown".to_string(),
+    };
+
     let is_64_bit = elf.is_64;
+    let bits = if elf.is_64 { 64 } else { 32 };
+
+    let elf_type = match elf.header.e_type {
+        goblin::elf::header::ET_DYN => "DYN".to_string(),
+        goblin::elf::header::ET_EXEC => "EXEC".to_string(),
+        goblin::elf::header::ET_REL => "REL".to_string(),
+        goblin::elf::header::ET_CORE => "CORE".to_string(),
+        other => format!("ET_{}", other),
+    };
+
+    let endianness = if elf.little_endian {
+        "little".to_string()
+    } else {
+        "big".to_string()
+    };
+
+    let entry_point = elf.entry;
+    let soname = elf.soname.map(|s| s.to_string());
+    let needed_libraries: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
 
     let mut exported_set = BTreeSet::new();
     let mut imported_set = BTreeSet::new();
     let mut jni_functions = Vec::new();
     let mut seen_jni = HashSet::new();
+    let mut symbols = Vec::new();
+    let mut seen_symbols = HashSet::new();
+
+    let mut process_sym = |sym: &goblin::elf::sym::Sym, name: &str| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let is_import = sym.st_shndx == goblin::elf::section_header::SHN_UNDEF as usize;
+        let is_internal = is_internal_symbol(trimmed);
+
+        if is_import {
+            imported_set.insert(trimmed.to_string());
+        } else if !is_internal {
+            exported_set.insert(trimmed.to_string());
+        }
+
+        if (trimmed.starts_with("Java_") || trimmed.starts_with("_Java_"))
+            && !seen_jni.contains(trimmed)
+        {
+            seen_jni.insert(trimmed.to_string());
+            let (demangled_class, demangled_method) = unmangle_jni_symbol(trimmed);
+            jni_functions.push(JniFunction {
+                name: trimmed.to_string(),
+                demangled_class,
+                demangled_method,
+                address: sym.st_value,
+                size: sym.st_size,
+                is_exported: !is_import,
+                xrefs: None,
+            });
+        }
+
+        if !is_internal {
+            let key = (trimmed.to_string(), is_import);
+            if seen_symbols.insert(key) {
+                let sym_type = match goblin::elf::sym::st_type(sym.st_info) {
+                    goblin::elf::sym::STT_NOTYPE => "NOTYPE",
+                    goblin::elf::sym::STT_OBJECT => "OBJECT",
+                    goblin::elf::sym::STT_FUNC => "FUNC",
+                    goblin::elf::sym::STT_SECTION => "SECTION",
+                    goblin::elf::sym::STT_FILE => "FILE",
+                    goblin::elf::sym::STT_COMMON => "COMMON",
+                    goblin::elf::sym::STT_TLS => "TLS",
+                    _ => "OTHER",
+                }.to_string();
+
+                let binding = match goblin::elf::sym::st_bind(sym.st_info) {
+                    goblin::elf::sym::STB_LOCAL => "LOCAL",
+                    goblin::elf::sym::STB_GLOBAL => "GLOBAL",
+                    goblin::elf::sym::STB_WEAK => "WEAK",
+                    _ => "OTHER",
+                }.to_string();
+
+                let demangled_name = {
+                    let (cls, meth) = unmangle_jni_symbol(trimmed);
+                    match (cls, meth) {
+                        (Some(c), Some(m)) => Some(format!("{c}.{m}")),
+                        (None, Some(m)) => Some(m),
+                        (Some(c), None) => Some(c),
+                        (None, None) => None,
+                    }
+                };
+
+                symbols.push(NativeSymbol {
+                    name: trimmed.to_string(),
+                    demangled_name,
+                    address: sym.st_value,
+                    size: sym.st_size,
+                    sym_type,
+                    binding,
+                    is_import,
+                });
+            }
+        }
+    };
 
     // 1. Process dynamic symbol table (.dynsym) - available even in stripped binaries
     for sym in &elf.dynsyms {
         if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-            let trimmed = name.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let is_import = sym.st_shndx == goblin::elf::section_header::SHN_UNDEF as usize;
-            if is_import {
-                imported_set.insert(trimmed.to_string());
-            } else {
-                exported_set.insert(trimmed.to_string());
-            }
-
-            if (trimmed.starts_with("Java_") || trimmed.starts_with("_Java_"))
-                && !seen_jni.contains(trimmed)
-            {
-                seen_jni.insert(trimmed.to_string());
-                let (demangled_class, demangled_method) = unmangle_jni_symbol(trimmed);
-                jni_functions.push(JniFunction {
-                    name: trimmed.to_string(),
-                    demangled_class,
-                    demangled_method,
-                    address: sym.st_value,
-                    size: sym.st_size,
-                    is_exported: !is_import,
-                    xrefs: None,
-                });
-            }
+            process_sym(&sym, name);
         }
     }
 
     // 2. Process static symbol table (.symtab) if present
     for sym in &elf.syms {
         if let Some(name) = elf.strtab.get_at(sym.st_name) {
-            let trimmed = name.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let is_import = sym.st_shndx == goblin::elf::section_header::SHN_UNDEF as usize;
-            if is_import {
-                imported_set.insert(trimmed.to_string());
-            } else {
-                exported_set.insert(trimmed.to_string());
-            }
-
-            if (trimmed.starts_with("Java_") || trimmed.starts_with("_Java_"))
-                && !seen_jni.contains(trimmed)
-            {
-                seen_jni.insert(trimmed.to_string());
-                let (demangled_class, demangled_method) = unmangle_jni_symbol(trimmed);
-                jni_functions.push(JniFunction {
-                    name: trimmed.to_string(),
-                    demangled_class,
-                    demangled_method,
-                    address: sym.st_value,
-                    size: sym.st_size,
-                    is_exported: !is_import,
-                    xrefs: None,
-                });
-            }
+            process_sym(&sym, name);
         }
     }
+
+    symbols.sort_by(|a, b| (a.address, &a.name).cmp(&(b.address, &b.name)));
 
     // 3. Dynamic RegisterNatives detection
     let register_natives_detected = exported_set.contains("RegisterNatives")
@@ -273,10 +379,18 @@ pub fn parse_native_so_bytes(bytes: &[u8], file_name: &str) -> Result<NativeLibr
     Ok(NativeLibraryAnalysis {
         file_name: file_name.to_string(),
         architecture,
+        abi,
         is_64_bit,
+        bits,
+        elf_type,
+        endianness,
+        entry_point,
+        soname,
+        needed_libraries,
         jni_functions,
         exported_symbols,
         imported_symbols,
+        symbols,
         register_natives_detected,
         xrefs: None,
     })
@@ -319,20 +433,35 @@ impl ApkPackage {
 
     /// Analyze a specific native library by entry name or ABI.
     pub fn analyze_native_library(&self, name_or_abi: &str) -> Result<NativeLibraryAnalysis, AppError> {
-        for (abi, entries) in &self.native_libraries {
-            if abi == name_or_abi {
-                if let Some(first) = entries.first() {
-                    let bytes = self.read_entry(&first.name)?;
-                    return parse_native_so_bytes(&bytes, &first.name);
-                }
-            }
+        // 1. Exact match on entry name (e.g. "lib/arm64-v8a/libnative.so")
+        for entries in self.native_libraries.values() {
             for entry in entries {
-                if entry.name == name_or_abi || entry.name.ends_with(name_or_abi) {
+                if entry.name == name_or_abi {
                     let bytes = self.read_entry(&entry.name)?;
                     return parse_native_so_bytes(&bytes, &entry.name);
                 }
             }
         }
+
+        // 2. Suffix match on entry name (e.g. "libnative.so" matching "lib/arm64-v8a/libnative.so")
+        let target_suffix = format!("/{}", name_or_abi.trim_start_matches('/'));
+        for entries in self.native_libraries.values() {
+            for entry in entries {
+                if entry.name.ends_with(&target_suffix) || entry.name.ends_with(name_or_abi) {
+                    let bytes = self.read_entry(&entry.name)?;
+                    return parse_native_so_bytes(&bytes, &entry.name);
+                }
+            }
+        }
+
+        // 3. Match by ABI name (e.g. "arm64-v8a")
+        if let Some(entries) = self.native_libraries.get(name_or_abi) {
+            if let Some(first) = entries.first() {
+                let bytes = self.read_entry(&first.name)?;
+                return parse_native_so_bytes(&bytes, &first.name);
+            }
+        }
+
         Err(AppError::FileNotFound(format!(
             "Native library '{}' not found in package",
             name_or_abi
@@ -407,6 +536,17 @@ mod tests {
         let analysis = parse_native_so_bytes(&bytes, "sample_aarch64_lib.so").unwrap();
         assert!(analysis.is_64_bit, "Must be 64-bit ELF");
         assert_eq!(analysis.architecture, "arm64");
+        assert_eq!(analysis.abi, "arm64-v8a");
+        assert_eq!(analysis.bits, 64);
+        assert_eq!(analysis.elf_type, "DYN");
+        assert_eq!(analysis.endianness, "little");
+        assert!(!analysis.symbols.is_empty(), "Symbols list should be populated");
+
+        // Verify ARM mapping symbols ($d, $x) and compiler internals are filtered
+        assert!(!analysis.exported_symbols.contains(&"$d".to_string()));
+        assert!(!analysis.exported_symbols.contains(&"$x".to_string()));
+        assert!(!analysis.exported_symbols.iter().any(|s| s.starts_with("DW.ref.")));
+        assert!(!analysis.exported_symbols.iter().any(|s| s.starts_with("GCC_except_table")));
 
         // Verify JNI functions
         assert!(!analysis.jni_functions.is_empty());

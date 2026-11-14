@@ -561,6 +561,14 @@ fn execute_cli(cli: &Cli, command_name: &str, target_str: &str) -> Result<String
                     for f in &data.top_functions {
                         md.push_str(&format!("| {} | {} | {} | {} |\n", f.name, f.addr_hex, f.complexity.unwrap_or(0), f.num_blocks.unwrap_or(0)));
                     }
+                    if let Some(ref langs) = data.detected_languages {
+                        if !langs.is_empty() {
+                            md.push_str("\n### Detected Languages & Frameworks\n| Language | Confidence | Evidence |\n|---|---|---|\n");
+                            for l in langs {
+                                md.push_str(&format!("| {} | {} | {} |\n", l.language, l.confidence, l.evidence.join("; ")));
+                            }
+                        }
+                    }
                     Ok(md)
                 }
                 OutputFormat::Jsonl => serde_json::to_string(&data).map_err(Into::into),
@@ -1021,6 +1029,8 @@ fn handle_apk_command(
                 native_libraries.insert(abi.clone(), names);
             }
 
+            let languages = pkg.detect_languages();
+
             let data = compact::ApkInspectData {
                 source_type,
                 package_name,
@@ -1030,6 +1040,7 @@ fn handle_apk_command(
                 is_manifest_binary,
                 dex_files,
                 native_libraries,
+                languages,
             };
 
             if compact_flag {
@@ -1282,6 +1293,7 @@ fn handle_apk_command(
         ApkCommands::So {
             path,
             abi,
+            library,
             symbol,
             xrefs,
         } => {
@@ -1317,31 +1329,82 @@ fn handle_apk_command(
                     apk::NativeLibraryAnalysis {
                         file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
                         architecture: "unknown".to_string(),
+                        abi: "unknown".to_string(),
                         is_64_bit: false,
+                        bits: 0,
+                        elf_type: "NONE".to_string(),
+                        endianness: "little".to_string(),
+                        entry_point: 0,
+                        soname: None,
+                        needed_libraries: Vec::new(),
                         jni_functions: Vec::new(),
                         exported_symbols: Vec::new(),
                         imported_symbols: Vec::new(),
+                        symbols: Vec::new(),
                         register_natives_detected: false,
                         xrefs: None,
                     }
-                } else if let Some(target_abi) = &abi {
-                    // Resolve disk path for target ABI
-                    if let Some(entries) = pkg.native_libraries.get(target_abi) {
-                        if let Some(first) = entries.first() {
-                            if let Some(p) = &first.path {
-                                if p.is_file() {
-                                    resolved_so_path = p.clone();
-                                }
-                            } else if let Ok(bytes) = pkg.read_entry(&first.name) {
-                                let t_path = std::env::temp_dir().join(format!("rvs_so_{}_{}.so", std::process::id(), first.name.replace('/', "_")));
-                                if std::fs::write(&t_path, &bytes).is_ok() {
-                                    resolved_so_path = t_path.clone();
-                                    _temp_guard = TempFileGuard(Some(t_path));
-                                }
+                } else if library.is_some() || abi.is_some() {
+                    let target_entry = if let Some(target_abi) = &abi {
+                        let entries = pkg.native_libraries.get(target_abi).ok_or_else(|| {
+                            AppError::FileNotFound(format!("ABI '{}' not found in package", target_abi))
+                        })?;
+                        if let Some(target_lib) = &library {
+                            entries
+                                .iter()
+                                .find(|e| {
+                                    e.name == *target_lib
+                                        || e.name.ends_with(&format!("/{}", target_lib.trim_start_matches('/')))
+                                        || e.name.ends_with(target_lib)
+                                })
+                                .ok_or_else(|| {
+                                    AppError::FileNotFound(format!(
+                                        "Library '{}' not found for ABI '{}'",
+                                        target_lib, target_abi
+                                    ))
+                                })?
+                        } else {
+                            entries.first().ok_or_else(|| {
+                                AppError::FileNotFound(format!("No native libraries found for ABI '{}'", target_abi))
+                            })?
+                        }
+                    } else {
+                        // abi is None, library is Some
+                        let target_lib = library.as_ref().unwrap();
+                        let mut found = None;
+                        for entries in pkg.native_libraries.values() {
+                            if let Some(entry) = entries.iter().find(|e| {
+                                e.name == *target_lib
+                                    || e.name.ends_with(&format!("/{}", target_lib.trim_start_matches('/')))
+                                    || e.name.ends_with(target_lib)
+                            }) {
+                                found = Some(entry);
+                                break;
                             }
                         }
+                        found.ok_or_else(|| {
+                            AppError::FileNotFound(format!("Library '{}' not found in package", target_lib))
+                        })?
+                    };
+
+                    if let Some(p) = &target_entry.path {
+                        if p.is_file() {
+                            resolved_so_path = p.clone();
+                        }
+                    } else if let Ok(bytes) = pkg.read_entry(&target_entry.name) {
+                        let t_path = std::env::temp_dir().join(format!(
+                            "rvs_so_{}_{}.so",
+                            std::process::id(),
+                            target_entry.name.replace('/', "_")
+                        ));
+                        if std::fs::write(&t_path, &bytes).is_ok() {
+                            resolved_so_path = t_path.clone();
+                            _temp_guard = TempFileGuard(Some(t_path));
+                        }
                     }
-                    pkg.analyze_native_library(target_abi)?
+
+                    let bytes = pkg.read_entry(&target_entry.name)?;
+                    apk::parse_native_so_bytes(&bytes, &target_entry.name)?
                 } else {
                     // Resolve disk path for first available native library
                     if let Some((_, entries)) = pkg.native_libraries.iter().next() {
@@ -1351,7 +1414,11 @@ fn handle_apk_command(
                                     resolved_so_path = p.clone();
                                 }
                             } else if let Ok(bytes) = pkg.read_entry(&first.name) {
-                                let t_path = std::env::temp_dir().join(format!("rvs_so_{}_{}.so", std::process::id(), first.name.replace('/', "_")));
+                                let t_path = std::env::temp_dir().join(format!(
+                                    "rvs_so_{}_{}.so",
+                                    std::process::id(),
+                                    first.name.replace('/', "_")
+                                ));
                                 if std::fs::write(&t_path, &bytes).is_ok() {
                                     resolved_so_path = t_path.clone();
                                     _temp_guard = TempFileGuard(Some(t_path));
@@ -1365,10 +1432,18 @@ fn handle_apk_command(
                         apk::NativeLibraryAnalysis {
                             file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
                             architecture: "unknown".to_string(),
+                            abi: "unknown".to_string(),
                             is_64_bit: false,
+                            bits: 0,
+                            elf_type: "NONE".to_string(),
+                            endianness: "little".to_string(),
+                            entry_point: 0,
+                            soname: None,
+                            needed_libraries: Vec::new(),
                             jni_functions: Vec::new(),
                             exported_symbols: Vec::new(),
                             imported_symbols: Vec::new(),
+                            symbols: Vec::new(),
                             register_natives_detected: false,
                             xrefs: None,
                         }
@@ -1380,6 +1455,8 @@ fn handle_apk_command(
                             combined.jni_functions.extend(other.jni_functions);
                             combined.exported_symbols.extend(other.exported_symbols);
                             combined.imported_symbols.extend(other.imported_symbols);
+                            combined.needed_libraries.extend(other.needed_libraries);
+                            combined.symbols.extend(other.symbols);
                             combined.register_natives_detected |= other.register_natives_detected;
                         }
                         combined.jni_functions.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1388,6 +1465,10 @@ fn handle_apk_command(
                         combined.exported_symbols.dedup();
                         combined.imported_symbols.sort();
                         combined.imported_symbols.dedup();
+                        combined.needed_libraries.sort();
+                        combined.needed_libraries.dedup();
+                        combined.symbols.sort_by(|a, b| (a.address, &a.name).cmp(&(b.address, &b.name)));
+                        combined.symbols.dedup_by(|a, b| a.name == b.name && a.is_import == b.is_import);
                         combined
                     }
                 }
@@ -1398,6 +1479,7 @@ fn handle_apk_command(
                 analysis.jni_functions.retain(|j| j.name.contains(sym_filter));
                 analysis.exported_symbols.retain(|s| s.contains(sym_filter));
                 analysis.imported_symbols.retain(|s| s.contains(sym_filter));
+                analysis.symbols.retain(|s| s.name.contains(sym_filter) || s.demangled_name.as_ref().map(|d| d.contains(sym_filter)).unwrap_or(false));
             }
 
             // Wire up --xrefs flag: extract cross references for JNI functions

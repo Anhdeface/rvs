@@ -956,3 +956,272 @@ fn test_tier1_cli_apk_so_xrefs_flag() {
 
     assert!(has_xrefs, "apk so --xrefs must return cross-references in JSON output");
 }
+
+// =============================================================================
+// Milestone 2 & 3: Multi-Language Recognition and Native .so Extraction Tests
+// =============================================================================
+
+// --- Multi-Language Recognition (Tier 1) ---
+
+#[test]
+fn test_tier1_inspect_languages_java_and_cpp_in_raw_apk() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success(), "Inspect command should succeed");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let lang_names: Vec<&str> = data.languages.iter().map(|l| l.language.as_str()).collect();
+    assert!(lang_names.contains(&"Java"), "Expected Java in raw APK, got {:?}", lang_names);
+    assert!(lang_names.contains(&"C/C++"), "Expected C/C++ in raw APK, got {:?}", lang_names);
+
+    let java_lang = data.languages.iter().find(|l| l.language == "Java").unwrap();
+    assert_eq!(java_lang.confidence, "High");
+    assert!(!java_lang.evidence.is_empty());
+
+    let cpp_lang = data.languages.iter().find(|l| l.language == "C/C++").unwrap();
+    assert_eq!(cpp_lang.confidence, "High");
+    assert!(!cpp_lang.evidence.is_empty());
+}
+
+#[test]
+fn test_tier1_inspect_languages_react_native() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("synthetic_rn.apk")
+        .with_react_native()
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let rn = data.languages.iter().find(|l| l.language == "React Native");
+    assert!(rn.is_some(), "Expected React Native detected in synthetic RN APK, got {:?}", data.languages);
+    let rn = rn.unwrap();
+    assert_eq!(rn.confidence, "High");
+    assert!(rn.evidence.iter().any(|e| e.contains("index.android.bundle") || e.contains("libreactnativejni.so")));
+}
+
+#[test]
+fn test_tier1_inspect_languages_flutter_dart() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("synthetic_flutter.apk")
+        .with_flutter()
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let flutter = data.languages.iter().find(|l| l.language == "Flutter / Dart");
+    assert!(flutter.is_some(), "Expected Flutter / Dart detected, got {:?}", data.languages);
+    let flutter = flutter.unwrap();
+    assert_eq!(flutter.confidence, "High");
+    assert!(flutter.evidence.iter().any(|e| e.contains("kernel_blob.bin") || e.contains("libflutter.so")));
+}
+
+#[test]
+fn test_tier1_inspect_languages_hybrid() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("synthetic_hybrid.apk")
+        .with_manifest("com.example.hybrid")
+        .with_dex_markers(
+            "classes.dex",
+            &["Lcom/facebook/react/ReactActivity;", "Lio/flutter/embedding/android/FlutterActivity;"],
+        )
+        .with_asset("index.android.bundle", b"var __BUNDLE__ = true;")
+        .with_asset("flutter_assets/kernel_blob.bin", b"FLUTTER_SNAPSHOT")
+        .with_native_so("arm64-v8a", "libreactnativejni.so", b"\x7fELF_libreactnativejni")
+        .with_native_so("arm64-v8a", "libflutter.so", b"\x7fELF_libflutter")
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let lang_names: Vec<&str> = data.languages.iter().map(|l| l.language.as_str()).collect();
+    assert!(lang_names.contains(&"Java"));
+    assert!(lang_names.contains(&"C/C++"));
+    assert!(lang_names.contains(&"React Native"));
+    assert!(lang_names.contains(&"Flutter / Dart"));
+}
+
+#[test]
+fn test_tier1_inspect_languages_zero_dex_native() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("synthetic_zero_dex.apk")
+        .with_manifest("com.example.zerodex")
+        .with_native_so("arm64-v8a", "libnative.so", b"\x7fELF_libnative")
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let lang_names: Vec<&str> = data.languages.iter().map(|l| l.language.as_str()).collect();
+    assert!(lang_names.contains(&"C/C++"));
+    assert!(!lang_names.contains(&"Java"), "Zero-DEX APK should not detect Java");
+}
+
+// --- Native .so Extraction (Tier 1) ---
+
+#[test]
+fn test_tier1_so_abi_and_elf_metadata() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<NativeSoData>(&["apk", "so", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let so = resp.data.expect("NativeSoData expected");
+    assert_eq!(so.architecture, "arm64");
+    assert_eq!(so.abi.as_deref(), Some("arm64-v8a"));
+    assert!(so.is_64_bit);
+    assert_eq!(so.bits, Some(64));
+    assert_eq!(so.elf_type.as_deref(), Some("DYN"));
+    assert_eq!(so.endianness.as_deref(), Some("little"));
+}
+
+#[test]
+fn test_tier1_so_dependencies_and_soname() {
+    let so_path = aarch64_so_fixture();
+    let so_str = so_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<NativeSoData>(&["apk", "so", so_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let so = resp.data.expect("NativeSoData expected");
+    assert_eq!(so.abi.as_deref(), Some("arm64-v8a"));
+    assert!(so.jni_functions.iter().any(|j| j.demangled_class.as_deref() == Some("com.example.app.MainActivity")));
+}
+
+#[test]
+fn test_tier1_so_mapping_symbols_filtered() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<NativeSoData>(&["apk", "so", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let so = resp.data.expect("NativeSoData expected");
+    for sym in &so.exported_symbols {
+        assert!(!sym.starts_with("$d") && !sym.starts_with("$x"), "Mapping symbol found in exports: {}", sym);
+        assert!(!sym.contains("DW.ref."), "Compiler ref symbol found: {}", sym);
+    }
+    for sym in &so.symbols {
+        assert!(!sym.name.starts_with("$d") && !sym.name.starts_with("$x"), "Mapping symbol found in symbols: {}", sym.name);
+    }
+}
+
+#[test]
+fn test_tier1_so_library_filter_flag() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<NativeSoData>(&["apk", "so", apk_str, "--library", "libnative.so"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let so = resp.data.expect("NativeSoData expected");
+    assert!(so.file_name.contains("libnative.so"));
+}
+
+#[test]
+fn test_tier1_so_abi_filter_flag() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<NativeSoData>(&["apk", "so", apk_str, "--abi", "arm64-v8a"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let so = resp.data.expect("NativeSoData expected");
+    assert_eq!(so.abi.as_deref(), Some("arm64-v8a"));
+}
+
+// --- Boundary Tests (Tier 2) ---
+
+#[test]
+fn test_tier2_fake_flutter_asset_does_not_trigger() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("fake_flutter.apk")
+        .with_manifest("com.example.fake")
+        .with_dex_markers("classes.dex", &["Lcom/example/fake/MainActivity;"])
+        .with_asset("flutter_assets_fake.txt", b"not flutter")
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let has_flutter = data.languages.iter().any(|l| l.language == "Flutter / Dart");
+    assert!(!has_flutter, "Fake flutter asset should not trigger Flutter / Dart");
+}
+
+#[test]
+fn test_tier2_generic_bundle_does_not_trigger_react_native() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("generic_bundle.apk")
+        .with_manifest("com.example.generic")
+        .with_dex_markers("classes.dex", &["Lcom/example/generic/MainActivity;"])
+        .with_asset("data.bundle", b"generic bundle")
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let has_rn = data.languages.iter().any(|l| l.language == "React Native");
+    assert!(!has_rn, "Generic bundle should not trigger React Native");
+}
+
+#[test]
+fn test_tier2_undelimited_package_name_does_not_trigger() {
+    let (_dir, apk_path) = SyntheticApkBuilder::new("undelimited.apk")
+        .with_manifest("com.test.reactions")
+        .with_dex_markers("classes.dex", &["Lcom/test/reactions/Main;"])
+        .build();
+    let apk_str = apk_path.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    let has_rn = data.languages.iter().any(|l| l.language == "React Native");
+    assert!(!has_rn, "Package 'reactions' should not trigger React Native");
+}
+
+// --- Compact Mode Parity (Tier 3 & 4) ---
+
+#[test]
+fn test_tier1_compact_apk_inspect_payload() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<CompactApkInspectData>(&["-c", "apk", "inspect", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("CompactApkInspectData expected");
+    assert_eq!(data.src, "archive");
+    assert!(data.manifest);
+    assert!(data.binary_manifest);
+    assert_eq!(data.dex.len(), 1);
+    assert!(data.langs.contains(&"Java".to_string()));
+    assert!(data.langs.contains(&"C/C++".to_string()));
+}
+
+#[test]
+fn test_tier1_compact_apk_so_payload() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<CompactNativeSoData>(&["-c", "apk", "so", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("CompactNativeSoData expected");
+    assert_eq!(data.arch, "arm64");
+    assert_eq!(data.abi, "arm64-v8a");
+    assert!(data.is_64);
+    assert_eq!(data.elf_type, "DYN");
+    assert_eq!(data.endian, "little");
+    assert!(data.jni.iter().any(|j| j.cls.as_deref() == Some("com.example.app.MainActivity") && j.method.as_deref() == Some("stringFromJNI")));
+}

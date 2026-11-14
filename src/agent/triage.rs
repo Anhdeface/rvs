@@ -21,6 +21,8 @@ pub struct AgentTriageData {
     pub top_functions: Vec<TriageFunctionSummary>,
     pub interesting_strings: Vec<String>,
     pub recommendations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_languages: Option<Vec<crate::apk::container::LanguageDetection>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,33 +151,106 @@ pub fn run_triage(driver: &R2Driver) -> Result<AgentTriageData, AppError> {
         }
     }
 
-    // Generate recommendations
+    // Check if the target is an Android APK package or container
+    let mut detected_languages = None;
+    let mut apk_format_override = None;
+    let mut apk_arch_override = None;
+    let mut is_apk = false;
+    let mut apk_recommendations = Vec::new();
+
+    if let Ok(pkg) = crate::apk::container::ApkPackage::open(&driver.binary_path) {
+        let is_archive_or_dir = matches!(
+            pkg.source,
+            crate::apk::container::ApkSource::Archive(_)
+                | crate::apk::container::ApkSource::Directory(_)
+        );
+        is_apk = is_archive_or_dir
+            && (pkg.manifest_data.is_some()
+                || !pkg.dex_entries.is_empty()
+                || !pkg.native_libraries.is_empty()
+                || !pkg.asset_entries.is_empty());
+        if is_apk {
+            let langs = pkg.detect_languages();
+            for lang in &langs {
+                match lang.language.as_str() {
+                    "Java" => {
+                        apk_recommendations.push("Dalvik DEX bytecode detected: analyze classes, methods, and strings via 'rvs apk dex'.".to_string());
+                    }
+                    "C/C++" => {
+                        apk_recommendations.push("Native C/C++ libraries detected: analyze JNI exports and symbol tables via 'rvs apk so'.".to_string());
+                    }
+                    "React Native" => {
+                        apk_recommendations.push("React Native framework detected: analyze JavaScript bundle in assets/ or Hermes bytecode via 'rvs apk inspect'.".to_string());
+                    }
+                    "Flutter / Dart" => {
+                        apk_recommendations.push("Flutter / Dart framework detected: inspect libapp.so AOT snapshot and flutter_assets via 'rvs apk so'.".to_string());
+                    }
+                    _ => {}
+                }
+            }
+            if !langs.is_empty() {
+                detected_languages = Some(langs);
+            }
+            apk_format_override = Some("APK".to_string());
+            if !pkg.native_libraries.is_empty() {
+                let abis = pkg.abis();
+                apk_arch_override = Some(abis.join("/"));
+            }
+        }
+    }
+
+    // Generate recommendations: prioritize APK framework recommendations for APK targets
     let mut recommendations = Vec::new();
+    recommendations.extend(apk_recommendations);
 
-    if info.security.stripped {
-        recommendations.push("Binary is stripped: use string cross-references and entrypoint tracing to locate verification functions.".to_string());
-    }
-    if info.security.pic {
-        recommendations.push("Position Independent Executable (PIE) enabled: use relative offsets for static patch calculations.".to_string());
-    }
-    if !info.security.nx {
-        recommendations.push("NX bit disabled: stack/heap pages may be executable.".to_string());
+    if !is_apk {
+        if info.security.stripped {
+            recommendations.push("Binary is stripped: use string cross-references and entrypoint tracing to locate verification functions.".to_string());
+        }
+        if info.security.pic {
+            recommendations.push("Position Independent Executable (PIE) enabled: use relative offsets for static patch calculations.".to_string());
+        }
+        if !info.security.nx {
+            recommendations.push("NX bit disabled: stack/heap pages may be executable.".to_string());
+        }
+
+        if let Some(first_func) = top_functions.first() {
+            recommendations.push(format!(
+                "Inspect control flow for primary function '{}' via 'rvs agent flow {}'.",
+                first_func.name, first_func.name
+            ));
+        }
+
+        if !interesting_strings.is_empty() {
+            recommendations.push("Trace cross-references to key strings using 'rvs analyze xrefs <string_addr>' to locate validation logic.".to_string());
+        }
+    } else if recommendations.is_empty() {
+        recommendations.push("APK container package: inspect manifest and package layout via 'rvs apk inspect'.".to_string());
     }
 
-    if let Some(first_func) = top_functions.first() {
-        recommendations.push(format!(
-            "Inspect control flow for primary function '{}' via 'rvs agent flow {}'.",
-            first_func.name, first_func.name
-        ));
-    }
+    let format = if let Some(fmt) = apk_format_override {
+        if info.format.is_empty() || info.format == "raw" || info.format == "zip" {
+            fmt
+        } else {
+            info.format
+        }
+    } else {
+        info.format
+    };
 
-    if !interesting_strings.is_empty() {
-        recommendations.push("Trace cross-references to key strings using 'rvs analyze xrefs <string_addr>' to locate validation logic.".to_string());
-    }
+    let arch = if let Some(a) = apk_arch_override {
+        if info.arch.is_empty() {
+            a
+        } else {
+            info.arch
+        }
+    } else {
+        info.arch
+    };
 
     Ok(AgentTriageData {
-        format: info.format,
-        arch: info.arch,
+        format,
+        arch,
         bits: info.bits,
         endian: info.endian,
         entry_point: Some(info.entry_point),
@@ -186,5 +261,6 @@ pub fn run_triage(driver: &R2Driver) -> Result<AgentTriageData, AppError> {
         top_functions,
         interesting_strings,
         recommendations,
+        detected_languages,
     })
 }

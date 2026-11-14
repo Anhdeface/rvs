@@ -573,6 +573,15 @@ pub struct PatchStepResult {
 // APK and Android Analysis Payload Structures
 // =============================================================================
 
+/// Language detection entry in inspect payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageDetectionData {
+    pub language: String,
+    pub confidence: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
 /// APK Container inspection payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApkInspectData {
@@ -592,6 +601,31 @@ pub struct ApkInspectData {
     pub dex_files: Vec<String>,
     #[serde(default)]
     pub native_libraries: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub languages: Vec<LanguageDetectionData>,
+}
+
+/// Compact APK Container inspection payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactApkInspectData {
+    #[serde(default)]
+    pub src: String,
+    #[serde(default)]
+    pub pkg: Option<String>,
+    #[serde(default)]
+    pub ver: Option<String>,
+    #[serde(default)]
+    pub code: Option<u32>,
+    #[serde(default)]
+    pub manifest: bool,
+    #[serde(default)]
+    pub binary_manifest: bool,
+    #[serde(default)]
+    pub dex: Vec<String>,
+    #[serde(default)]
+    pub so: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub langs: Vec<String>,
 }
 
 /// APK Manifest payload
@@ -669,13 +703,29 @@ pub struct NativeSoData {
     #[serde(default)]
     pub architecture: String,
     #[serde(default)]
+    pub abi: Option<String>,
+    #[serde(default)]
     pub is_64_bit: bool,
+    #[serde(default)]
+    pub bits: Option<u32>,
+    #[serde(default)]
+    pub elf_type: Option<String>,
+    #[serde(default)]
+    pub endianness: Option<String>,
+    #[serde(default)]
+    pub entry_point: Option<u64>,
+    #[serde(default)]
+    pub soname: Option<String>,
+    #[serde(default)]
+    pub needed_libraries: Vec<String>,
     #[serde(default)]
     pub jni_functions: Vec<JniFunctionData>,
     #[serde(default)]
     pub exported_symbols: Vec<String>,
     #[serde(default)]
     pub imported_symbols: Vec<String>,
+    #[serde(default)]
+    pub symbols: Vec<NativeSymbolData>,
     #[serde(default)]
     pub register_natives_detected: bool,
 }
@@ -693,6 +743,153 @@ pub struct JniFunctionData {
     pub size: u64,
     #[serde(default)]
     pub is_exported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSymbolData {
+    pub name: String,
+    #[serde(default)]
+    pub demangled_name: Option<String>,
+    pub address: u64,
+    pub size: u64,
+    pub sym_type: String,
+    pub binding: String,
+    pub is_import: bool,
+}
+
+/// Compact JNI function payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactJniFunctionData {
+    pub name: String,
+    #[serde(default)]
+    pub cls: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    pub addr: String,
+    pub sz: u64,
+}
+
+/// Compact Native .so payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactNativeSoData {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub abi: String,
+    #[serde(default)]
+    pub is_64: bool,
+    #[serde(default)]
+    pub elf_type: String,
+    #[serde(default)]
+    pub endian: String,
+    #[serde(default)]
+    pub entry: String,
+    #[serde(default)]
+    pub soname: Option<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    #[serde(default)]
+    pub jni: Vec<CompactJniFunctionData>,
+    #[serde(default)]
+    pub exports: Vec<String>,
+    #[serde(default)]
+    pub imports: Vec<String>,
+    #[serde(default)]
+    pub reg_natives: bool,
+}
+
+/// Fluent builder for synthetic APK containers for integration testing.
+pub struct SyntheticApkBuilder {
+    temp_dir: TempDir,
+    apk_path: PathBuf,
+    entries: Vec<(String, Vec<u8>)>,
+}
+
+impl SyntheticApkBuilder {
+    pub fn new(name: &str) -> Self {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir for synthetic APK");
+        let apk_path = temp_dir.path().join(name);
+        Self {
+            temp_dir,
+            apk_path,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn with_file(mut self, path: &str, content: &[u8]) -> Self {
+        self.entries.push((path.to_string(), content.to_vec()));
+        self
+    }
+
+    pub fn with_manifest(self, package: &str) -> Self {
+        let manifest = format!("<manifest package=\"{}\" />", package);
+        self.with_file("AndroidManifest.xml", manifest.as_bytes())
+    }
+
+    pub fn with_dex(self, dex_name: &str, dex_bytes: &[u8]) -> Self {
+        self.with_file(dex_name, dex_bytes)
+    }
+
+    pub fn with_dex_markers(self, dex_name: &str, markers: &[&str]) -> Self {
+        let mut content = b"dex\n035\0".to_vec();
+        for m in markers {
+            content.extend_from_slice(m.as_bytes());
+            content.push(0);
+        }
+        self.with_file(dex_name, &content)
+    }
+
+    pub fn with_asset(self, asset_path: &str, content: &[u8]) -> Self {
+        let path = if asset_path.starts_with("assets/") {
+            asset_path.to_string()
+        } else {
+            format!("assets/{}", asset_path)
+        };
+        self.with_file(&path, content)
+    }
+
+    pub fn with_native_so(self, abi: &str, lib_name: &str, elf_bytes: &[u8]) -> Self {
+        let path = format!("lib/{}/{}", abi, lib_name);
+        self.with_file(&path, elf_bytes)
+    }
+
+    pub fn with_react_native(self) -> Self {
+        self.with_manifest("com.example.reactnative")
+            .with_dex_markers(
+                "classes.dex",
+                &["Lcom/facebook/react/ReactActivity;", "com.facebook.react.ReactPackage"],
+            )
+            .with_asset("index.android.bundle", b"var __BUNDLE__ = true;")
+            .with_native_so("arm64-v8a", "libreactnativejni.so", b"\x7fELF_libreactnativejni")
+            .with_native_so("arm64-v8a", "libhermes.so", b"\x7fELF_libhermes")
+    }
+
+    pub fn with_flutter(self) -> Self {
+        self.with_manifest("com.example.flutter")
+            .with_dex_markers(
+                "classes.dex",
+                &["Lio/flutter/embedding/android/FlutterActivity;", "io.flutter.embedding.engine.FlutterEngine"],
+            )
+            .with_asset("flutter_assets/kernel_blob.bin", b"FLUTTER_SNAPSHOT_KERNEL")
+            .with_native_so("arm64-v8a", "libflutter.so", b"\x7fELF_libflutter")
+            .with_native_so("arm64-v8a", "libapp.so", b"\x7fELF_libapp")
+    }
+
+    pub fn build(self) -> (TempDir, PathBuf) {
+        use std::io::Write;
+        let file = fs::File::create(&self.apk_path).expect("Failed to create apk file");
+        let mut zip = zip::ZipWriter::new(file);
+        let opt = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in &self.entries {
+            zip.start_file(name, opt).expect("Failed to start zip file");
+            zip.write_all(content).expect("Failed to write zip content");
+        }
+        zip.finish().expect("Failed to finish zip file");
+        (self.temp_dir, self.apk_path)
+    }
 }
 
 /// Helper to get the path to test fixtures

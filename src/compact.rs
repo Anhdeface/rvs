@@ -576,6 +576,8 @@ pub struct CompactAgentTriageData {
     pub interesting_strings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recommendations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub langs: Option<Vec<String>>,
 }
 
 impl From<&AgentTriageData> for CompactAgentTriageData {
@@ -600,7 +602,41 @@ impl From<&AgentTriageData> for CompactAgentTriageData {
         }).collect();
 
         let interesting_strings = src.interesting_strings.iter().take(10).cloned().collect();
-        let recommendations = src.recommendations.iter().take(2).cloned().collect();
+        let recommendations = if src.format == "APK" {
+            let mut recs: Vec<String> = src
+                .recommendations
+                .iter()
+                .filter(|r| {
+                    r.contains("rvs apk")
+                        || r.contains("rvs_apk")
+                        || r.contains("DEX")
+                        || r.contains("Native C/C++")
+                        || r.contains("React Native")
+                        || r.contains("Flutter")
+                })
+                .cloned()
+                .collect();
+            recs.sort_by_key(|r| {
+                if r.contains("React Native") || r.contains("Flutter") {
+                    0
+                } else {
+                    1
+                }
+            });
+            if recs.len() < 2 {
+                for r in &src.recommendations {
+                    if !recs.contains(r) {
+                        recs.push(r.clone());
+                    }
+                }
+            }
+            recs.into_iter().take(2).collect()
+        } else {
+            src.recommendations.iter().take(2).cloned().collect()
+        };
+        let langs = src.detected_languages.as_ref().map(|list| {
+            list.iter().map(|l| l.language.clone()).collect()
+        });
 
         Self {
             format: src.format.clone(),
@@ -613,6 +649,7 @@ impl From<&AgentTriageData> for CompactAgentTriageData {
             top_functions,
             interesting_strings,
             recommendations,
+            langs,
         }
     }
 }
@@ -639,7 +676,41 @@ impl From<AgentTriageData> for CompactAgentTriageData {
         }).collect();
 
         let interesting_strings = src.interesting_strings.into_iter().take(10).collect();
-        let recommendations = src.recommendations.into_iter().take(2).collect();
+        let recommendations = if src.format == "APK" {
+            let mut recs: Vec<String> = src
+                .recommendations
+                .iter()
+                .filter(|r| {
+                    r.contains("rvs apk")
+                        || r.contains("rvs_apk")
+                        || r.contains("DEX")
+                        || r.contains("Native C/C++")
+                        || r.contains("React Native")
+                        || r.contains("Flutter")
+                })
+                .cloned()
+                .collect();
+            recs.sort_by_key(|r| {
+                if r.contains("React Native") || r.contains("Flutter") {
+                    0
+                } else {
+                    1
+                }
+            });
+            if recs.len() < 2 {
+                for r in &src.recommendations {
+                    if !recs.contains(r) {
+                        recs.push(r.clone());
+                    }
+                }
+            }
+            recs.into_iter().take(2).collect()
+        } else {
+            src.recommendations.into_iter().take(2).collect()
+        };
+        let langs = src.detected_languages.as_ref().map(|list| {
+            list.iter().map(|l| l.language.clone()).collect()
+        });
 
         Self {
             format: src.format,
@@ -652,6 +723,7 @@ impl From<AgentTriageData> for CompactAgentTriageData {
             top_functions,
             interesting_strings,
             recommendations,
+            langs,
         }
     }
 }
@@ -1344,6 +1416,8 @@ pub struct ApkInspectData {
     pub dex_files: Vec<String>,
     #[serde(default)]
     pub native_libraries: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub languages: Vec<crate::apk::container::LanguageDetection>,
 }
 
 /// Compact representation of APK inspection data.
@@ -1360,6 +1434,8 @@ pub struct CompactApkInspectData {
     pub binary_manifest: bool,
     pub dex: Vec<String>,
     pub so: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub langs: Vec<String>,
 }
 
 impl From<&ApkInspectData> for CompactApkInspectData {
@@ -1368,6 +1444,7 @@ impl From<&ApkInspectData> for CompactApkInspectData {
         for (k, v) in &src.native_libraries {
             so.insert(k.clone(), v.clone());
         }
+        let langs = src.languages.iter().map(|l| l.language.clone()).collect();
         Self {
             src: src.source_type.clone(),
             pkg: src.package_name.clone(),
@@ -1377,6 +1454,7 @@ impl From<&ApkInspectData> for CompactApkInspectData {
             binary_manifest: src.is_manifest_binary,
             dex: src.dex_files.clone(),
             so,
+            langs,
         }
     }
 }
@@ -1384,6 +1462,51 @@ impl From<&ApkInspectData> for CompactApkInspectData {
 impl From<ApkInspectData> for CompactApkInspectData {
     fn from(src: ApkInspectData) -> Self {
         Self::from(&src)
+    }
+}
+
+impl From<&crate::apk::container::ApkPackage> for ApkInspectData {
+    fn from(pkg: &crate::apk::container::ApkPackage) -> Self {
+        let source_type = match &pkg.source {
+            crate::apk::container::ApkSource::Archive(_) => "archive".to_string(),
+            crate::apk::container::ApkSource::Directory(_) => "directory".to_string(),
+            crate::apk::container::ApkSource::Standalone(_) => "standalone".to_string(),
+        };
+
+        let manifest = pkg.manifest_info().ok().flatten();
+        let package_name = manifest.as_ref().map(|m| m.package_name.clone());
+        let version_name = manifest.as_ref().and_then(|m| m.version_name.clone());
+        let version_code = manifest.as_ref().and_then(|m| m.version_code);
+        let has_manifest = manifest.is_some() || pkg.manifest_data.is_some();
+        let is_manifest_binary = pkg.is_manifest_binary;
+
+        let dex_files = pkg.dex_names();
+        let mut native_libraries = std::collections::HashMap::new();
+        for (abi, entries) in &pkg.native_libraries {
+            let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+            native_libraries.insert(abi.clone(), names);
+        }
+
+        let languages = pkg.detect_languages();
+
+        Self {
+            source_type,
+            package_name,
+            version_name,
+            version_code,
+            has_manifest,
+            is_manifest_binary,
+            dex_files,
+            native_libraries,
+            languages,
+        }
+    }
+}
+
+impl From<&crate::apk::container::ApkPackage> for CompactApkInspectData {
+    fn from(pkg: &crate::apk::container::ApkPackage) -> Self {
+        let full = ApkInspectData::from(pkg);
+        CompactApkInspectData::from(&full)
     }
 }
 
@@ -1534,7 +1657,15 @@ pub struct CompactJniFunction {
 pub struct CompactNativeLibraryAnalysis {
     pub file: String,
     pub arch: String,
+    pub abi: String,
     pub is_64: bool,
+    pub elf_type: String,
+    pub endian: String,
+    pub entry: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soname: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<String>,
     pub jni: Vec<CompactJniFunction>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exports: Vec<String>,
@@ -1563,7 +1694,13 @@ impl From<&NativeLibraryAnalysis> for CompactNativeLibraryAnalysis {
         Self {
             file: n.file_name.clone(),
             arch: n.architecture.clone(),
+            abi: n.abi.clone(),
             is_64: n.is_64_bit,
+            elf_type: n.elf_type.clone(),
+            endian: n.endianness.clone(),
+            entry: format!("0x{:x}", n.entry_point),
+            soname: n.soname.clone(),
+            deps: n.needed_libraries.clone(),
             jni,
             exports: n.exported_symbols.clone(),
             imports: n.imported_symbols.clone(),
@@ -1911,12 +2048,25 @@ mod tests {
             is_manifest_binary: true,
             dex_files: vec!["classes.dex".to_string()],
             native_libraries: native_libs,
+            languages: vec![
+                crate::apk::container::LanguageDetection {
+                    language: "Java".to_string(),
+                    confidence: "High".to_string(),
+                    evidence: vec!["Dalvik DEX bytecode present".to_string()],
+                },
+                crate::apk::container::LanguageDetection {
+                    language: "C/C++".to_string(),
+                    confidence: "High".to_string(),
+                    evidence: vec!["Native shared libraries present".to_string()],
+                },
+            ],
         };
         let compact = CompactApkInspectData::from(&full);
         assert_eq!(compact.src, "archive");
         assert_eq!(compact.pkg.as_deref(), Some("com.example.app"));
         assert!(compact.manifest);
         assert!(compact.binary_manifest);
+        assert_eq!(compact.langs, vec!["Java", "C/C++"]);
         let json_full = serde_json::to_string(&full).unwrap();
         let json_compact = serde_json::to_string(&compact).unwrap();
         assert!(json_compact.len() < json_full.len());
@@ -1944,5 +2094,56 @@ mod tests {
         let json_compact = serde_json::to_string(&compact).unwrap();
         assert!(json_compact.len() < json_full.len());
         assert!(!json_compact.contains("services"));
+    }
+
+    #[test]
+    fn test_compact_native_library_analysis_fields_and_reduction() {
+        let full = crate::apk::NativeLibraryAnalysis {
+            file_name: "lib/arm64-v8a/libnative.so".to_string(),
+            architecture: "arm64".to_string(),
+            abi: "arm64-v8a".to_string(),
+            is_64_bit: true,
+            bits: 64,
+            elf_type: "DYN".to_string(),
+            endianness: "little".to_string(),
+            entry_point: 0x1000,
+            soname: Some("libnative.so".to_string()),
+            needed_libraries: vec!["libc.so".to_string(), "libm.so".to_string()],
+            jni_functions: vec![crate::apk::JniFunction {
+                name: "Java_com_example_app_MainActivity_stringFromJNI".to_string(),
+                demangled_class: Some("com.example.app.MainActivity".to_string()),
+                demangled_method: Some("stringFromJNI".to_string()),
+                address: 0x109f4,
+                size: 12,
+                is_exported: true,
+                xrefs: None,
+            }],
+            exported_symbols: vec!["JNI_OnLoad".to_string()],
+            imported_symbols: vec!["malloc".to_string()],
+            symbols: vec![crate::apk::native_so::NativeSymbol {
+                name: "JNI_OnLoad".to_string(),
+                demangled_name: None,
+                address: 0x10900,
+                size: 40,
+                sym_type: "FUNC".to_string(),
+                binding: "GLOBAL".to_string(),
+                is_import: false,
+            }],
+            register_natives_detected: false,
+            xrefs: None,
+        };
+        let compact = CompactNativeLibraryAnalysis::from(&full);
+        assert_eq!(compact.file, "lib/arm64-v8a/libnative.so");
+        assert_eq!(compact.arch, "arm64");
+        assert_eq!(compact.abi, "arm64-v8a");
+        assert_eq!(compact.entry, "0x1000");
+        assert_eq!(compact.elf_type, "DYN");
+        assert_eq!(compact.endian, "little");
+        assert_eq!(compact.soname.as_deref(), Some("libnative.so"));
+        assert_eq!(compact.deps, vec!["libc.so", "libm.so"]);
+        assert_eq!(compact.jni.len(), 1);
+        let json_full = serde_json::to_string(&full).unwrap();
+        let json_compact = serde_json::to_string(&compact).unwrap();
+        assert!(json_compact.len() < json_full.len());
     }
 }

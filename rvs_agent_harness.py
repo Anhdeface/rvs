@@ -74,7 +74,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.5"
+SERVER_VERSION: str = "0.3.6"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -156,6 +156,75 @@ def find_rvs_binary(custom_path: Optional[Union[str, Path]] = None) -> Path:
 
     # Default fallback
     return script_dir / "target" / "debug" / "rvs"
+
+
+def load_harness_config(custom_path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+    """
+    Loads rvs harness configuration from custom path, RVS_CONFIG env var,
+    local rvs.json in CWD, or ~/.config/rvs/config.json. Returns empty dict if not found.
+    """
+    candidates: List[Path] = []
+    if custom_path:
+        candidates.append(Path(custom_path))
+    if "RVS_CONFIG" in os.environ and os.environ["RVS_CONFIG"].strip():
+        candidates.append(Path(os.environ["RVS_CONFIG"].strip()))
+    candidates.append(Path.cwd() / "rvs.json")
+    try:
+        candidates.append(Path.home() / ".config" / "rvs" / "config.json")
+    except Exception:
+        pass
+
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+            if resolved.is_file():
+                with open(resolved, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    if isinstance(cfg, dict):
+                        return cfg
+        except Exception:
+            continue
+    return {}
+
+
+def resolve_harness_defaults(
+    explicit_neutral: Optional[bool] = None,
+    explicit_compact: Optional[bool] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, bool]:
+    """
+    Resolves effective defaults for neutral and compact modes.
+    Precedence: Explicit argument / CLI flag > Environment variable > Configuration file > Built-in defaults (True).
+    """
+    cfg = config or {}
+
+    # 1. Neutral mode resolution
+    if explicit_neutral is not None:
+        eff_neutral = bool(explicit_neutral)
+    elif "RVS_NO_NEUTRAL" in os.environ and os.environ["RVS_NO_NEUTRAL"].strip().lower() not in ("0", "false", "no", "off"):
+        eff_neutral = False
+    elif "RVS_NEUTRAL" in os.environ:
+        eff_neutral = os.environ["RVS_NEUTRAL"].strip().lower() in ("1", "true", "yes", "on", "t")
+    elif "neutral" in cfg:
+        eff_neutral = bool(cfg["neutral"])
+    else:
+        eff_neutral = True  # Requirement R1: Default True
+
+    # 2. Compact mode resolution
+    if explicit_compact is not None:
+        eff_compact = bool(explicit_compact)
+    elif ("RVS_NO_COMPACT" in os.environ and os.environ["RVS_NO_COMPACT"].strip().lower() not in ("0", "false", "no", "off")) or os.environ.get("RVS_MODE", "").strip().lower() == "full":
+        eff_compact = False
+    elif "RVS_COMPACT" in os.environ:
+        eff_compact = os.environ["RVS_COMPACT"].strip().lower() in ("1", "true", "yes", "on", "t")
+    elif "compact" in cfg:
+        eff_compact = bool(cfg["compact"])
+    elif cfg.get("mode") == "full":
+        eff_compact = False
+    else:
+        eff_compact = True  # Requirement R1: Default True
+
+    return eff_neutral, eff_compact
 
 
 _CONTROL_CHAR_TRANSLATE_TABLE: Dict[int, Optional[int]] = {
@@ -2791,6 +2860,60 @@ def _neutralize_data_recursive(payload: Any, mapper: Any) -> Any:
     return payload
 
 
+def _merge_apk_recommendations(target_data: Dict[str, Any], apk_recs: List[str], compact: bool = False) -> None:
+    """Merge and deduplicate APK framework recommendations between Rust core and Python harness."""
+    if not isinstance(target_data, dict):
+        return
+    existing_recs = target_data.setdefault("recommendations", [])
+    if not isinstance(existing_recs, list):
+        existing_recs = list(existing_recs)
+        target_data["recommendations"] = existing_recs
+
+    def _rec_intent(rec_text: str) -> str:
+        r = str(rec_text).lower()
+        if "react native" in r:
+            return "react_native"
+        if "flutter" in r or "dart" in r:
+            return "flutter"
+        if "dex" in r:
+            return "dex"
+        if "native c/c++" in r or "jni" in r or "symbol table" in r:
+            return "native"
+        norm = r.replace("rvs apk ", "rvs_apk_").replace(" ", "")
+        return "".join(c for c in norm if c.isalnum())
+
+    intent_map = {}
+    for idx, ex in enumerate(existing_recs):
+        intent = _rec_intent(ex)
+        if intent not in intent_map:
+            intent_map[intent] = idx
+
+    for r in (apk_recs or []):
+        intent = _rec_intent(r)
+        if intent in intent_map:
+            idx = intent_map[intent]
+            if "rvs_apk_" in r and "rvs apk " in str(existing_recs[idx]):
+                existing_recs[idx] = r
+        else:
+            existing_recs.append(r)
+            intent_map[intent] = len(existing_recs) - 1
+
+    framework_intents = {"dex", "native", "react_native", "flutter"}
+    fw_recs = []
+    other_recs = []
+    for r in existing_recs:
+        if _rec_intent(r) in framework_intents:
+            fw_recs.append(r)
+        else:
+            other_recs.append(r)
+    fw_recs.sort(key=lambda x: 0 if _rec_intent(x) in ("react_native", "flutter") else 1)
+    merged = fw_recs + other_recs
+    if compact:
+        target_data["recommendations"] = merged[:2]
+    else:
+        target_data["recommendations"] = merged
+
+
 # =============================================================================
 # Canonical Tool Catalog & Schema Exporter (R2)
 # =============================================================================
@@ -2814,7 +2937,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -2858,7 +2981,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -2898,7 +3021,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -2930,7 +3053,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -2962,7 +3085,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -3008,7 +3131,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -3048,7 +3171,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -3088,7 +3211,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -3201,7 +3324,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "neutral": {
                 "type": "boolean",
-                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.",
+                "description": "Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.",
             },
             "component_type": {
                 "type": "string",
@@ -4096,6 +4219,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "string",
                 "description": "Filter native libraries by ABI (e.g. 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64').",
             },
+            "library": {
+                "type": "string",
+                "description": "Optional native library file name filter (e.g. 'libnative.so').",
+            },
             "symbol": {
                 "type": "string",
                 "description": "Optional symbol or JNI function name substring filter.",
@@ -4370,10 +4497,27 @@ class RvsHarness:
         rvs_bin: Optional[Union[str, Path]] = None,
         default_timeout: float = DEFAULT_TIMEOUT_SECONDS,
         default_mode: OutputMode = "compact",
+        default_neutral: Optional[bool] = None,
+        default_compact: Optional[bool] = None,
+        config_path: Optional[Union[str, Path]] = None,
     ) -> None:
-        self.rvs_bin = find_rvs_binary(custom_path=rvs_bin)
-        self.default_timeout = default_timeout
-        self.default_mode = default_mode
+        self.config = load_harness_config(config_path)
+        self.rvs_bin = find_rvs_binary(custom_path=rvs_bin or self.config.get("rvs_bin"))
+        self.default_timeout = float(self.config.get("timeout", default_timeout))
+
+        if default_compact is None and default_mode == "full":
+            resolved_explicit_compact: Optional[bool] = False
+        else:
+            resolved_explicit_compact = default_compact
+
+        eff_neutral, eff_compact = resolve_harness_defaults(
+            explicit_neutral=default_neutral,
+            explicit_compact=resolved_explicit_compact,
+            config=self.config,
+        )
+        self.default_neutral = eff_neutral
+        self.default_compact = eff_compact
+        self.default_mode = "compact" if eff_compact else (default_mode if default_mode != "compact" else "full")
         self._lock = threading.Lock()
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._most_recent_session_id: Optional[str] = None
@@ -4543,32 +4687,34 @@ class RvsHarness:
     def info(
         self,
         target: Union[str, Path],
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Inspect binary metadata, architecture, format, and security mitigations."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_info",
                     {
                         "file": str(target),
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
                 )
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(["-f", str(target), "info"], timeout=timeout, mode=mode, budget=budget)
 
     def functions(
@@ -4578,20 +4724,22 @@ class RvsHarness:
         detail: bool = False,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Enumerate functions with addresses, sizes, signatures, and cyclomatic complexity."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_functions",
                     {
@@ -4600,9 +4748,9 @@ class RvsHarness:
                         "detail": detail,
                         "limit": limit,
                         "offset": offset,
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
@@ -4612,7 +4760,7 @@ class RvsHarness:
             args.extend(["--filter", filter])
         if detail:
             args.append("--detail")
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(
             args, timeout=timeout, mode=mode, limit=limit, offset=offset or 0, budget=budget
         )
@@ -4623,20 +4771,22 @@ class RvsHarness:
         function_or_addr: str,
         disasm: bool = True,
         max_instructions: Optional[int] = None,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Disassemble basic blocks and instructions for target function or address."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_disasm",
                     {
@@ -4644,9 +4794,9 @@ class RvsHarness:
                         "target": str(function_or_addr),
                         "disasm": disasm,
                         "max_instructions": max_instructions,
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
@@ -4654,7 +4804,7 @@ class RvsHarness:
         args = ["-f", str(target), "analyze", "blocks", str(function_or_addr)]
         if not disasm:
             args.append("--disasm=false")
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         resp = self.run(args, timeout=timeout, mode=mode, budget=budget)
         if max_instructions is not None and resp.get("success") and isinstance(resp.get("data"), dict):
             # Enforce max_instructions truncation
@@ -4668,33 +4818,35 @@ class RvsHarness:
         self,
         target: Union[str, Path],
         function: str,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Generate pseudo-C decompilation, call graph, and referenced strings."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_decompile",
                     {
                         "file": str(target),
                         "function": str(function),
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
                 )
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(
             ["-f", str(target), "--format", "json", "agent", "decompile", str(function)],
             timeout=timeout,
@@ -4706,33 +4858,35 @@ class RvsHarness:
         self,
         target: Union[str, Path],
         function: str,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Analyze control-flow branch gates, conditional checks, and loop back-edges."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_flow",
                     {
                         "file": str(target),
                         "function": str(function),
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
                 )
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(
             ["-f", str(target), "--format", "json", "agent", "flow", str(function)],
             timeout=timeout,
@@ -4747,20 +4901,22 @@ class RvsHarness:
         direction: Literal["all", "to", "from"] = "all",
         kind: Optional[Literal["call", "code", "data", "string", "read", "write"]] = None,
         limit: Optional[int] = None,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Extract cross-references to and/or from a symbol or address."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_xrefs",
                     {
@@ -4769,9 +4925,9 @@ class RvsHarness:
                         "direction": direction,
                         "kind": kind,
                         "limit": limit,
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
@@ -4779,7 +4935,7 @@ class RvsHarness:
         args = ["-f", str(target), "analyze", "xrefs", str(symbol_or_addr), "--type", direction]
         if kind:
             args.extend(["--kind", kind])
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(args, timeout=timeout, mode=mode, limit=limit, budget=budget)
 
     def strings(
@@ -4788,20 +4944,22 @@ class RvsHarness:
         min_len: int = 4,
         filter: Optional[str] = None,
         limit: Optional[int] = None,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """Scan binary data sections for ASCII/UTF-8 strings."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_strings",
                     {
@@ -4809,15 +4967,15 @@ class RvsHarness:
                         "min_len": min_len,
                         "filter": filter,
                         "limit": limit,
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
                 )
         args = ["-f", str(target), "strings", "--min-len", str(min_len)]
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         resp = self.run(args, timeout=timeout, mode=mode, limit=limit, budget=budget)
         if filter and resp.get("success") and isinstance(resp.get("data"), dict):
             # Apply filter substring
@@ -4833,20 +4991,22 @@ class RvsHarness:
         filter: Optional[str] = None,
         limit: Optional[int] = 50,
         offset: int = 0,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         abi: Optional[str] = None,
-        neutral: bool = False,
+        neutral: Optional[bool] = None,
         component_type: Optional[str] = None,
         budget: Optional[int] = None,
         _from_orchestrator: bool = False,
     ) -> ApiResponseDict:
         """List binary symbols, PLT imports, and virtual addresses."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        eff_neutral = neutral if neutral is not None else getattr(self, "default_neutral", True)
         in_orch = _from_orchestrator or self._is_in_orchestration()
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_symbols",
                     {
@@ -4854,9 +5014,9 @@ class RvsHarness:
                         "filter": filter,
                         "limit": limit,
                         "offset": offset,
-                        "compact": compact,
+                        "compact": eff_compact,
                         "abi": abi,
-                        "neutral": neutral,
+                        "neutral": eff_neutral,
                         "component_type": component_type,
                         "budget": budget,
                     },
@@ -4864,7 +5024,7 @@ class RvsHarness:
         args = ["-f", str(target), "symbols"]
         if filter:
             args.extend(["--filter", filter])
-        mode: OutputMode = "compact" if compact else "full"
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(args, timeout=timeout, mode=mode, limit=limit, offset=offset, budget=budget)
 
     # -------------------------------------------------------------------------
@@ -4973,11 +5133,13 @@ class RvsHarness:
     def triage(
         self,
         target: Union[str, Path],
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
+        neutral: Optional[bool] = None,
     ) -> ApiResponseDict:
         """Autonomous binary triage, security evaluation, and RE next steps."""
-        mode: OutputMode = "compact" if compact else "full"
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
         return self.run(
             ["-f", str(target), "--format", "json", "agent", "triage"],
             timeout=timeout,
@@ -5051,24 +5213,45 @@ class RvsHarness:
     def apk_info(
         self,
         file: Union[str, Path],
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
     ) -> ApiResponseDict:
         """Inspect APK package metadata, manifest summary, DEX and native .so libraries."""
-        mode: OutputMode = "compact" if compact else "full"
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
         args = ["apk", "inspect", str(file)]
-        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+        res = self.run(args, timeout=timeout, mode=mode, budget=budget)
+        if res.get("success") and isinstance(res.get("data"), dict):
+            data = res["data"]
+            langs = data.get("langs")
+            if not langs and "languages" in data:
+                langs = [l.get("language") for l in data["languages"] if isinstance(l, dict)]
+            if langs and "recommendations" not in data:
+                recs = []
+                for lang in langs:
+                    if "React Native" in lang:
+                        recs.append("React Native framework detected: analyze JavaScript bundle in assets/ or Hermes bytecode via 'rvs_apk_info'/'rvs_apk_dex'.")
+                    elif "Flutter" in lang or "Dart" in lang:
+                        recs.append("Flutter/Dart framework detected: inspect libapp.so AOT snapshot and flutter_assets/ via 'rvs_apk_native'.")
+                    elif "C/C++" in lang:
+                        recs.append("Native C/C++ libraries detected: analyze JNI exports and symbol tables via 'rvs_apk_native'.")
+                    elif "Java" in lang:
+                        recs.append("Dalvik DEX bytecode detected: analyze classes, methods, and strings via 'rvs_apk_dex'.")
+                if recs:
+                    data["recommendations"] = recs
+        return res
 
     def apk_manifest(
         self,
         file: Union[str, Path],
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
     ) -> ApiResponseDict:
         """Inspect full AndroidManifest details (permissions, components, SDK versions)."""
-        mode: OutputMode = "compact" if compact else "full"
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
         args = ["apk", "manifest", str(file)]
         return self.run(args, timeout=timeout, mode=mode, budget=budget)
 
@@ -5079,12 +5262,13 @@ class RvsHarness:
         class_name: Optional[str] = None,
         method: Optional[str] = None,
         disasm: bool = False,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
     ) -> ApiResponseDict:
         """Analyze DEX bytecode, classes, methods, signatures, and strings."""
-        mode: OutputMode = "compact" if compact else "full"
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
         args = ["apk", "dex", str(file)]
         if dex_file:
             args.extend(["--dex-file", str(dex_file)])
@@ -5100,17 +5284,21 @@ class RvsHarness:
         self,
         file: Union[str, Path],
         abi: Optional[str] = None,
+        library: Optional[str] = None,
         symbol: Optional[str] = None,
         xrefs: bool = False,
-        compact: bool = True,
+        compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
     ) -> ApiResponseDict:
         """Analyze native .so libraries, exported symbols, static JNI, and RegisterNatives."""
-        mode: OutputMode = "compact" if compact else "full"
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
         args = ["apk", "so", str(file)]
         if abi:
             args.extend(["--abi", str(abi)])
+        if library:
+            args.extend(["--library", str(library)])
         if symbol:
             args.extend(["--symbol", str(symbol)])
         if xrefs:
@@ -5503,7 +5691,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.3.5",
+                    "format_version": "0.3.6",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6640,12 +6828,14 @@ if (fopenPtr) {
             )
 
         try:
-            compact = coerce_bool_param(arguments.get("compact"), True, "compact")
+            compact_default = getattr(self, "default_compact", True)
+            neutral_default = getattr(self, "default_neutral", True)
+            compact = coerce_bool_param(arguments.get("compact"), compact_default, "compact")
             budget = coerce_int_param(arguments.get("budget") or arguments.get("budget_tokens"), None, "budget", allow_negative=False)
             abi = arguments.get("abi")
             if isinstance(abi, str):
                 abi = abi.strip().lower()
-            neutral = coerce_bool_param(arguments.get("neutral"), False, "neutral")
+            neutral = coerce_bool_param(arguments.get("neutral"), neutral_default, "neutral")
             component_type = arguments.get("component_type")
             if isinstance(component_type, str):
                 component_type = component_type.strip().lower()
@@ -6852,6 +7042,23 @@ if (fopenPtr) {
                             comp = orch.unified_target.components[0]
                         active_path = comp.path if comp else file
                         res = self.triage(active_path, compact=compact)
+                        if is_apk and isinstance(res.get("data"), dict):
+                            if "format" in res["data"] and res["data"]["format"] != "APK":
+                                res["data"]["component_format"] = res["data"]["format"]
+                            res["data"]["format"] = "APK"
+                            apk_res = self.apk_info(file, compact=compact)
+                            if apk_res.get("success") and isinstance(apk_res.get("data"), dict):
+                                apk_data = apk_res["data"]
+                                if "languages" in apk_data:
+                                    res["data"]["detected_languages"] = apk_data["languages"]
+                                if "langs" in apk_data:
+                                    res["data"]["langs"] = apk_data["langs"]
+                                elif "languages" in apk_data:
+                                    res["data"]["langs"] = [
+                                        l.get("language") for l in apk_data["languages"] if isinstance(l, dict)
+                                    ]
+                                apk_recs = apk_data.get("recommendations", [])
+                                _merge_apk_recommendations(res["data"], apk_recs, compact=compact)
                         if neutral and res.get("success"):
                             from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
                             mapper = orch.token_mapper
@@ -6878,7 +7085,7 @@ if (fopenPtr) {
                     _ORCHESTRATION_CONTEXT.active = prev_ctx
 
             if tool_name == "rvs_info":
-                return self.info(file, compact=compact, budget=budget)
+                return self.info(file, compact=compact, budget=budget, neutral=neutral, _from_orchestrator=True)
 
             elif tool_name == "rvs_functions":
                 detail = coerce_bool_param(arguments.get("detail"), False, "detail")
@@ -6892,6 +7099,8 @@ if (fopenPtr) {
                     offset=offset,
                     compact=compact,
                     budget=budget,
+                    neutral=neutral,
+                    _from_orchestrator=True,
                 )
 
             elif tool_name == "rvs_disasm":
@@ -6917,6 +7126,8 @@ if (fopenPtr) {
                     max_instructions=max_instructions,
                     compact=compact,
                     budget=budget,
+                    neutral=neutral,
+                    _from_orchestrator=True,
                 )
 
             elif tool_name == "rvs_decompile":
@@ -6931,7 +7142,7 @@ if (fopenPtr) {
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass function='main' or function address.",
                     )
-                return self.decompile(file, function=str(function), compact=compact, budget=budget)
+                return self.decompile(file, function=str(function), compact=compact, budget=budget, neutral=neutral, _from_orchestrator=True)
 
             elif tool_name == "rvs_flow":
                 function = arguments.get("function")
@@ -6945,7 +7156,7 @@ if (fopenPtr) {
                         exit_code=EXIT_INVALID_ARGUMENT,
                         suggestion="Pass function='main' or function address.",
                     )
-                return self.flow(file, function=str(function), compact=compact, budget=budget)
+                return self.flow(file, function=str(function), compact=compact, budget=budget, neutral=neutral, _from_orchestrator=True)
 
             elif tool_name == "rvs_xrefs":
                 target = arguments.get("target")
@@ -6968,6 +7179,8 @@ if (fopenPtr) {
                     limit=limit,
                     compact=compact,
                     budget=budget,
+                    neutral=neutral,
+                    _from_orchestrator=True,
                 )
 
             elif tool_name == "rvs_strings":
@@ -6982,6 +7195,8 @@ if (fopenPtr) {
                     limit=limit,
                     compact=compact,
                     budget=budget,
+                    neutral=neutral,
+                    _from_orchestrator=True,
                 )
 
             elif tool_name in ("rvs_symbols", "symbols"):
@@ -6994,6 +7209,8 @@ if (fopenPtr) {
                     offset=offset,
                     compact=compact,
                     budget=budget,
+                    neutral=neutral,
+                    _from_orchestrator=True,
                 )
 
             elif tool_name == "rvs_patch_instruction":
@@ -7063,6 +7280,23 @@ if (fopenPtr) {
 
             elif tool_name == "rvs_agent_triage":
                 res = self.triage(file, compact=compact)
+                if is_apk and isinstance(res.get("data"), dict):
+                    if "format" in res["data"] and res["data"]["format"] != "APK":
+                        res["data"]["component_format"] = res["data"]["format"]
+                    res["data"]["format"] = "APK"
+                    apk_res = self.apk_info(file, compact=compact)
+                    if apk_res.get("success") and isinstance(apk_res.get("data"), dict):
+                        apk_data = apk_res["data"]
+                        if "languages" in apk_data:
+                            res["data"]["detected_languages"] = apk_data["languages"]
+                        if "langs" in apk_data:
+                            res["data"]["langs"] = apk_data["langs"]
+                        elif "languages" in apk_data:
+                            res["data"]["langs"] = [
+                                l.get("language") for l in apk_data["languages"] if isinstance(l, dict)
+                            ]
+                        apk_recs = apk_data.get("recommendations", [])
+                        _merge_apk_recommendations(res["data"], apk_recs, compact=compact)
                 if budget is not None:
                     res = transform_response(res, mode=res.get("mode", "compact"), budget=budget)
                 return res
@@ -7691,6 +7925,7 @@ if (fopenPtr) {
                 return self.apk_native(
                     file=target_apk,
                     abi=arguments.get("abi"),
+                    library=arguments.get("library"),
                     symbol=arguments.get("symbol"),
                     xrefs=coerce_bool_param(arguments.get("xrefs"), False, "xrefs"),
                     compact=compact,
@@ -7983,51 +8218,30 @@ class RvsAgentHarness(RvsHarness):
 def main() -> None:
     args = sys.argv[1:]
 
-    # Check for MCP server invocation
-    if "--mcp" in args or "--serve-mcp" in args or (len(args) > 0 and args[0] == "mcp"):
-        if hasattr(sys.stdin, "reconfigure"):
-            try:
-                sys.stdin.reconfigure(errors="replace")
-            except Exception:
-                pass
-        if hasattr(sys.stdout, "reconfigure"):
-            try:
-                sys.stdout.reconfigure(errors="replace")
-            except Exception:
-                pass
-        harness = RvsHarness()
-        harness.serve_mcp()
-        sys.exit(EXIT_SUCCESS)
-
-    # Check for Tool Schemas export flag
+    # Early check for custom configuration file
+    config_file_val: Optional[str] = None
     for i, a in enumerate(args):
-        if a in ("--export-tools", "--tools") and i + 1 < len(args):
-            fmt = args[i + 1]
-            try:
-                schemas = get_tool_schemas(fmt)  # type: ignore
-                print(json.dumps(schemas, indent=2))
-                sys.exit(EXIT_SUCCESS)
-            except ValueError as e:
-                print(str(e), file=sys.stderr)
-                sys.exit(EXIT_INVALID_ARGUMENT)
-        elif a.startswith("--export-tools=") or a.startswith("--tools="):
-            fmt = a.split("=", 1)[1]
-            try:
-                schemas = get_tool_schemas(fmt)  # type: ignore
-                print(json.dumps(schemas, indent=2))
-                sys.exit(EXIT_SUCCESS)
-            except ValueError as e:
-                print(str(e), file=sys.stderr)
-                sys.exit(EXIT_INVALID_ARGUMENT)
+        if a == "--config" and i + 1 < len(args):
+            config_file_val = args[i + 1]
+            break
+        elif a.startswith("--config="):
+            config_file_val = a.split("=", 1)[1]
+            break
 
-    # Extract harness-specific flags
-    timeout = DEFAULT_TIMEOUT_SECONDS
-    custom_rvs = None
+    cfg = load_harness_config(config_file_val)
+
+    # Initialize configuration defaults from config file or system defaults
+    timeout: float = float(cfg.get("timeout", DEFAULT_TIMEOUT_SECONDS))
+    custom_rvs: Optional[str] = cfg.get("rvs_bin")
     explicit_mode: Optional[OutputMode] = None
+    explicit_neutral: Optional[bool] = None
+    explicit_compact: Optional[bool] = None
+    is_mcp: bool = False
+    export_tools_fmt: Optional[str] = None
+
     limit_val: Optional[int] = None
     offset_val: int = 0
     abi_val: Optional[str] = None
-    neutral_flag: bool = False
     comp_type_val: Optional[str] = None
     filter_val: Optional[str] = None
     min_len_val: Optional[int] = None
@@ -8038,7 +8252,23 @@ def main() -> None:
     idx = 0
     while idx < len(args):
         arg = args[idx]
-        if arg == "--timeout" and idx + 1 < len(args):
+        if arg == "--config" and idx + 1 < len(args):
+            idx += 2
+        elif arg.startswith("--config="):
+            idx += 1
+        elif arg in ("--mcp", "--serve-mcp"):
+            is_mcp = True
+            idx += 1
+        elif arg == "mcp" and idx == 0:
+            is_mcp = True
+            idx += 1
+        elif arg in ("--export-tools", "--tools") and idx + 1 < len(args):
+            export_tools_fmt = args[idx + 1]
+            idx += 2
+        elif arg.startswith("--export-tools=") or arg.startswith("--tools="):
+            export_tools_fmt = arg.split("=", 1)[1]
+            idx += 1
+        elif arg == "--timeout" and idx + 1 < len(args):
             try:
                 timeout = float(args[idx + 1])
             except ValueError:
@@ -8060,11 +8290,43 @@ def main() -> None:
             mode_str = args[idx + 1].lower()
             if mode_str in ("compact", "summary", "full"):
                 explicit_mode = mode_str  # type: ignore
+                if mode_str == "full":
+                    explicit_compact = False
+                elif mode_str in ("compact", "summary"):
+                    explicit_compact = True
             idx += 2
         elif arg.startswith("--mode="):
             mode_str = arg.split("=", 1)[1].lower()
             if mode_str in ("compact", "summary", "full"):
                 explicit_mode = mode_str  # type: ignore
+                if mode_str == "full":
+                    explicit_compact = False
+                elif mode_str in ("compact", "summary"):
+                    explicit_compact = True
+            idx += 1
+        elif arg == "--compact":
+            explicit_compact = True
+            idx += 1
+        elif arg.startswith("--compact="):
+            v = arg.split("=", 1)[1].lower()
+            explicit_compact = v in ("true", "1", "yes", "t", "on")
+            if not explicit_compact and (explicit_mode is None or explicit_mode == "compact"):
+                explicit_mode = "full"
+            idx += 1
+        elif arg == "--no-compact":
+            explicit_compact = False
+            if explicit_mode is None or explicit_mode == "compact":
+                explicit_mode = "full"
+            idx += 1
+        elif arg == "--neutral":
+            explicit_neutral = True
+            idx += 1
+        elif arg.startswith("--neutral="):
+            v = arg.split("=", 1)[1].lower()
+            explicit_neutral = v in ("true", "1", "yes", "t", "on")
+            idx += 1
+        elif arg == "--no-neutral":
+            explicit_neutral = False
             idx += 1
         elif arg in ("--budget", "--budget-tokens") and idx + 1 < len(args):
             try:
@@ -8108,16 +8370,6 @@ def main() -> None:
         elif arg.startswith("--abi="):
             abi_val = arg.split("=", 1)[1]
             idx += 1
-        elif arg == "--neutral":
-            neutral_flag = True
-            idx += 1
-        elif arg.startswith("--neutral="):
-            v = arg.split("=", 1)[1].lower()
-            neutral_flag = v in ("true", "1", "yes", "t")
-            idx += 1
-        elif arg == "--no-neutral":
-            neutral_flag = False
-            idx += 1
         elif arg in ("--component-type", "--comp-type") and idx + 1 < len(args):
             comp_type_val = args[idx + 1]
             idx += 2
@@ -8149,9 +8401,53 @@ def main() -> None:
             cleaned_args.append(arg)
             idx += 1
 
-    rvs_bin = find_rvs_binary(custom_rvs)
+    # Resolve effective defaults following 4-tier precedence
+    eff_neutral, eff_compact = resolve_harness_defaults(
+        explicit_neutral=explicit_neutral,
+        explicit_compact=explicit_compact,
+        config=cfg,
+    )
+    neutral_flag: bool = eff_neutral
+    compact_flag: bool = eff_compact
+    if explicit_mode is None:
+        explicit_mode = "compact" if compact_flag else "full"
 
-    # Extract target file for error reporting if present
+    # MCP server invocation
+    if is_mcp:
+        if hasattr(sys.stdin, "reconfigure"):
+            try:
+                sys.stdin.reconfigure(errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except Exception:
+                pass
+        harness = RvsHarness(
+            rvs_bin=custom_rvs,
+            default_timeout=timeout,
+            default_mode=explicit_mode,
+            default_neutral=neutral_flag,
+            default_compact=compact_flag,
+            config_path=config_file_val,
+        )
+        harness.serve_mcp()
+        sys.exit(EXIT_SUCCESS)
+
+    # Tool schemas export flag
+    if export_tools_fmt is not None:
+        try:
+            schemas = get_tool_schemas(export_tools_fmt)  # type: ignore
+            print(json.dumps(schemas, indent=2))
+            sys.exit(EXIT_SUCCESS)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(EXIT_INVALID_ARGUMENT)
+
+    rvs_bin = find_rvs_binary(custom_rvs or cfg.get("rvs_bin"))
+
+    # Extract target file for error reporting / orchestration routing
     target_str = ""
     for i, a in enumerate(cleaned_args):
         if a in ("-f", "--file") and i + 1 < len(cleaned_args):
@@ -8166,8 +8462,13 @@ def main() -> None:
 
     is_apk = _is_apk_target(target_str)
     is_dex = _is_dex_target(target_str)
+    is_help_or_version = any(h in cleaned_args for h in ("--help", "-h", "--version", "-V"))
 
-    needs_orchestration = (is_apk or is_dex or neutral_flag or abi_val is not None or comp_type_val is not None)
+    needs_orchestration = bool(
+        target_str
+        and not is_help_or_version
+        and (is_apk or is_dex or neutral_flag or abi_val is not None or comp_type_val is not None)
+    )
 
     if needs_orchestration:
         # Extract command tokens from cleaned_args
@@ -8194,12 +8495,11 @@ def main() -> None:
         tool_name = "rvs_info"
         tool_args: Dict[str, Any] = {
             "file": target_str,
-            "compact": (explicit_mode != "full"),
+            "compact": compact_flag,
+            "neutral": neutral_flag,
         }
         if abi_val:
             tool_args["abi"] = abi_val
-        if neutral_flag:
-            tool_args["neutral"] = neutral_flag
         if comp_type_val:
             tool_args["component_type"] = comp_type_val
         if limit_val is not None:
@@ -8246,11 +8546,21 @@ def main() -> None:
         elif cmd_tokens[0] == "triage" or (cmd_tokens[0] == "agent" and len(cmd_tokens) > 1 and cmd_tokens[1] == "triage"):
             tool_name = "rvs_agent_triage"
 
-        harness = RvsHarness(rvs_bin=rvs_bin, default_timeout=timeout)
+        harness = RvsHarness(
+            rvs_bin=rvs_bin,
+            default_timeout=timeout,
+            default_mode=explicit_mode,
+            default_neutral=neutral_flag,
+            default_compact=compact_flag,
+            config_path=config_file_val,
+        )
         resp = harness.execute_tool(tool_name, tool_args)
         print(json.dumps(resp))
         raw_code = EXIT_SUCCESS if resp.get("success") else (resp.get("error", {}).get("exit_code") or EXIT_ANALYSIS_ERROR)
         sys.exit(normalize_exit_code(raw_code))
+
+    if compact_flag and "-c" not in cleaned_args and "--compact" not in cleaned_args:
+        cleaned_args = ["-c"] + cleaned_args
 
     code, stdout, stderr, duration = execute_rvs_subprocess(
         cleaned_args,

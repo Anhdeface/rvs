@@ -1,6 +1,6 @@
 ---
 name: rvs-reverse-engineering
-description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, and deterministic binary patching using rvs v0.3.5 and its 40+ tool MCP agent harness.
+description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, deterministic binary patching, Android APK & multi-language analysis using rvs v0.3.6 and its 48 canonical tool MCP agent harness.
 compatibility: Antigravity CLI, Claude Code, Google Gemini CLI, GitHub Copilot CLI, Cursor
 version: 2.2.0
 ---
@@ -57,6 +57,7 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
      - Crash diagnosis: `rvs_triage_crash`
      - In-memory CPU simulation: `rvs_dynamic_emulate`
      - Deterministic patching: `rvs_patch_instruction`, `rvs_patch_string`, `rvs_patch_bytes`, `rvs_agent_patch_plan`
+     - Android APK & multi-language analysis: `rvs_apk_info`, `rvs_apk_manifest`, `rvs_apk_dex`, `rvs_apk_native`
 
 ### 🚫 Anti-Pattern Prohibition Matrix
 
@@ -70,6 +71,50 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
 | **In-Memory Buffer Extraction** | Injecting scripts to dump `/proc/<pid>/mem` or attaching GDB to dump memory regions | Complex process race conditions; ptrace permission denials; uncompressed hex dumps flood context. | `rvs_dump_decrypted_buffer`, `rvs_dynamic_emulate(read_mem=...)`, `rvs_frida_mem_read` | Autonomous breakpointing after decryption loops; extracts plaintext string, hex, and byte arrays safely. |
 | **Binary Patching** | Writing Python scripts with `open(file, "r+b")` seeking and writing raw bytes, or using `dd` | Bypasses atomic `.bak` backup creation; lacks dry-run verification; risks irreversible binary corruption. | `rvs_patch_instruction`, `rvs_patch_string`, `rvs_patch_bytes`, `rvs_agent_patch_plan` | Automatic timestamped `.bak` creation; `dry_run=True` simulation; architecture-aware byte alignment. |
 | **Interactive Debugging** | Launching raw command-line GDB or LLDB sessions in bash subprocesses | Shell stdin/stdout deadlocks; terminal prompts block agent execution; unparsed output exhausts tokens. | `rvs_debug_spawn`, `rvs_debug_breakpoint`, `rvs_debug_continue`, `rvs_debug_registers` | Daemon-backed UDS session management; structured register inspection with diffing support. |
+| **Android APK & Native .so Analysis** | Unzipping APKs manually with `unzip`, invoking external tools (`apktool`, `baksmali`, `aapt`), or running `readelf -Ws` on extracted `.so` files | Slow, token-inefficient, pollutes filesystem with unpacked directories, lacks unified multi-language detection and JNI unmangling. | `rvs_apk_info`, `rvs_apk_manifest`, `rvs_apk_dex`, `rvs_apk_native` | **90% token savings**; direct in-memory extraction of DEX, JNI exports, architecture, and multi-language markers (Java, C/C++, React Native, Flutter). |
+
+---
+
+## ⚖️ Strict Data Neutrality & Grounded Investigation Directives
+
+All AI agents operating `rvs` via Model Context Protocol (MCP) or the Python harness MUST adhere strictly to the following four inviolable operating directives:
+
+### 1. Data Neutrality by Default
+- **Harness & MCP Server Defaults**: The `rvs` Python agent harness and stdio MCP server enforce **neutral mode** (`neutral=True`) and **compact mode** (`compact=True`) by default across all operations. Neutral and compact modes are activated automatically at initialization.
+- **Bijective Codebook Anonymization**: All sensitive or semantic identifiers (function names, strings, symbols, gates, memory addresses) are dynamically mapped to neutral synthetic tokens (`FUNC_001`, `STR_001`, `GATE_001`, `DATA_001`, `SYM_001`, `ADDR_001`) via an in-memory bijective codebook.
+- **Sanitized Telemetry & Provenance**: Response envelopes include structured telemetry (`telemetry`) and codebook state (`codebook`), providing deterministic traceability, target classification, and execution timing without leaking un-anonymized identifiers into the model context.
+- **Reverse De-anonymization**: When reporting final answers or requesting verification, agents use the bijective reverse map provided in the response codebook to resolve tokens back to their original names deterministically.
+
+### 2. Prohibition of Context Speculation & Hallucination
+- **Grounded Fact-Based Reasoning**: AI agents MUST ground every finding, hypothesis, classification, and remediation proposal strictly and exclusively in verifiable facts and concrete tool output. Never assume or fabricate unverified facts.
+- **Strict Prohibition on Intent Speculation**: Agents MUST NEVER infer, assume, or speculate on author intent, threat actor attribution, business logic rationale, or application purpose without explicit, verifiable evidence in the disassembled bytecode, decompiled AST, or runtime memory.
+- **Zero Hallucinated Addresses or Symbols**: Never fabricate function names, virtual addresses, offsets, or instruction sequences. If an address, condition flag, or cross-reference is needed, execute the appropriate tool (`rvs_disasm`, `rvs_flow`, `rvs_xrefs`) to extract the actual value.
+- **Unverified Hypothesis Quarantine**: Any preliminary hypothesis must be explicitly tagged as unverified and confirmed via deterministic dynamic emulation (`rvs_dynamic_emulate`), interactive stepping (`rvs_debug_step`), or runtime inspection (`rvs_frida_hook`).
+
+### 3. Mandatory Tool-First Workflow
+- **Strict Exclusive Utilization of 48 Built-In Tools**: All reverse engineering, static analysis, dynamic emulation, interactive debugging, Frida instrumentation, APK package reconnaissance, and binary patching operations MUST use the 48 canonical `rvs` MCP tools.
+- **Strict Prohibition on Ad-Hoc Scripts**: Agents MUST NOT author, compile, or execute ad-hoc Python scripts (e.g. standalone scripts importing `frida`, `ctypes`, `open(..., "r+b")`, `struct`, or raw `subprocess`) or custom bash scripts when an `rvs` tool or CLI command exists for that task.
+- **Strict Prohibition on Raw Shell Pipes**: Agents MUST NOT invoke raw CLI utilities via bash pipes (`strings`, `objdump`, `readelf`, `nm`, `ltrace`, `strace`, `gdb`, `dd`, `sed`, `awk`). Such commands bypass subprocess isolation, flood the context window with thousands of uncompressed tokens, and bypass the bijective codebook.
+- **Approved Chaining Workflow**: Compose multi-step investigations exclusively through native `rvs` MCP tool calls or the `rvs_agent_harness.py` API:
+  - Binary profiling & triage: `rvs_agent_triage`
+  - Function disassembly & CFG: `rvs_flow` -> `rvs_disasm` -> `rvs_decompile`
+  - Dynamic simulation: `rvs_dynamic_emulate` -> `rvs_dynamic_trace`
+  - Interactive debugging: `rvs_debug_spawn` -> `rvs_debug_breakpoint` -> `rvs_debug_continue` -> `rvs_debug_registers`
+  - Live runtime instrumentation: `rvs_frida_attach` / `rvs_frida_spawn` -> `rvs_frida_hook` -> `rvs_frida_hook_return`
+  - Android APK & multi-language inspection: `rvs_apk_info` -> `rvs_apk_manifest` -> `rvs_apk_dex` -> `rvs_apk_native`
+  - Binary patching: `rvs_patch_instruction` -> `rvs_patch_bytes` -> `rvs_agent_patch_plan`
+
+### 4. Neutral and Compact Mode Configuration & Explicit Overrides
+- **Default State**: Both neutral mode and compact mode are activated automatically. No flags are required to enable them.
+- **Explicit CLI Flags**:
+  - `--no-neutral` (or `--neutral=false`): Disables bijective codebook mapping and returns un-anonymized raw identifier strings.
+  - `--no-compact` (or `--compact=false` / `--full`): Emits full verbose data structures rather than token-optimized compact JSON.
+- **Environment Variable Overrides**:
+  - `RVS_NO_NEUTRAL=1` (or `RVS_NEUTRAL=0` / `RVS_NEUTRAL=false`): Disables neutral mode globally across all CLI and harness invocations.
+  - `RVS_NO_COMPACT=1` (or `RVS_COMPACT=0` / `RVS_COMPACT=false`): Disables compact mode globally across all CLI and harness invocations.
+- **Programmatic & MCP Parameter Overrides**:
+  - In tool calls, pass `"neutral": false` or `"compact": false` in the arguments dictionary to override defaults for a specific invocation.
+- **Operating Directive for Agents**: Agents MUST keep neutral mode and compact mode enabled at all times unless the human user explicitly issues an unambiguous instruction requesting un-anonymized or verbose raw output.
 
 ---
 
@@ -162,7 +207,7 @@ Agents should select native `rvs` tools according to these scenario-specific ope
 
 ---
 
-## 🔄 6-Phase Reverse Engineering Operational Playbook
+## 🔄 7-Phase Reverse Engineering Operational Playbook
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -196,6 +241,12 @@ Agents should select native `rvs` tools according to these scenario-specific ope
 │  Phase 6: Binary Patching & Verification               │
 │  rvs_patch_instruction ──> rvs_agent_patch_plan        │
 │  ──> Verify via rvs_dynamic_emulate or rvs_debug_spawn │
+└───────────────────────────┬────────────────────────────┘
+                            │
+┌───────────────────────────▼────────────────────────────┐
+│  Phase 7: Android APK & Multi-Language Analysis        │
+│  rvs_apk_info ──> rvs_apk_manifest ──> rvs_apk_dex     │
+│  ──> rvs_apk_native (architecture, JNI, symbols)       │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -250,6 +301,12 @@ Agents should select native `rvs` tools according to these scenario-specific ope
    - Raw bytes: `rvs_patch_bytes(file=..., addr="0x40117a", hex_bytes="9090909090")`.
 3. **Verification**: Verify patched executable behavior using `rvs_dynamic_emulate` or `rvs_debug_spawn`.
 
+### Phase 7: Android APK & Multi-Language Analysis
+1. **APK Overview & Language Detection**: Call `rvs_apk_info(file="app.apk", compact=True)` to extract package identity, manifest metadata, DEX file listing, native `.so` inventory, and automated multi-language detection (identifying Java, C/C++, React Native, and Dart/Flutter via runtime signatures, native libraries, and DEX markers).
+2. **Manifest Deep-Dive**: Call `rvs_apk_manifest(file="app.apk", compact=True)` to inspect package declarations, SDK versions, requested permissions, activities, services, receivers, content providers, and debuggable flags.
+3. **Dalvik Bytecode Analysis**: Call `rvs_apk_dex(file="app.apk", class="com.example.MainActivity", method="checkLicense", disasm=True, compact=True)` to analyze Dalvik bytecode instructions, class hierarchies, method signatures, string references, and native method declarations.
+4. **Embedded Native `.so` & JNI Analysis**: Call `rvs_apk_native(file="app.apk", abi="arm64-v8a", library="libnative.so", xrefs=True, compact=True)` to extract ELF machine architecture, endianness, bitness, SONAME, DT_NEEDED dependencies, static `Java_*` JNI exports with demangled class/method names, and dynamic `RegisterNatives` bindings directly from embedded `.so` libraries without running external CLI tools or unzipping archives.
+
 ---
 
 ## ⚡ Token Conservation Directives
@@ -258,7 +315,7 @@ AI agent context windows are finite. Conformance with these directives is mandat
 
 | Directive | Specification | Impact |
 |---|---|---|
-| **1. Always Use Compact Mode** | Ensure `compact=True` (or `-c` CLI flag). Enabled by default across all 44 tools. | **70%–90% token reduction** |
+| **1. Always Use Compact Mode** | Ensure `compact=True` (or `-c` CLI flag). Enabled by default across all 48 tools. | **70%–90% token reduction** |
 | **2. Enforce Endpoint Pagination** | Large endpoints enforce strict pagination defaults: `symbols` (default: 50), `classes` (default: 50), `modules` (default: 30). Use `limit` and `offset`. | Eliminates 10k+ line JSON dumps |
 | **3. Prefer Register Diffs** | Read `register_diff` / `data.diff` instead of full architectural dumps. Unchanged registers are excluded. | Eliminates 95% redundant register tokens |
 | **4. Strict Trace Step Budgets** | Restrict `rvs_dynamic_trace` to 15–30 steps and `rvs_dynamic_emulate` to 50–100 steps. Use `until` to halt at specific gates. | Prevents runaway trace dumps |
@@ -305,7 +362,7 @@ All commands and MCP tools map runtime results to standard exit codes (0–6):
 
 ---
 
-## 🛠️ Complete 44-Tool Canonical MCP Catalog
+## 🛠️ Complete 48-Tool Canonical MCP Catalog
 
 ### Phase 1: Static Reconnaissance & Triage
 *Initial binary profiling, architecture classification, security mitigations, symbols, strings, and automated triage.*
@@ -317,7 +374,7 @@ Inspect binary file metadata, architecture, bitness, endianness, OS, entry point
 - `file` (`string`, **required**): Path to the target binary executable.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_functions`
@@ -331,7 +388,7 @@ List analyzed functions in the binary with memory offsets, sizes, signatures, an
 - `offset` (`integer`, optional): Pagination offset index into the function list.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_disasm`
@@ -344,7 +401,7 @@ Extract basic blocks and disassembled machine instructions for a specific functi
 - `max_instructions` (`integer`, optional): Maximum number of instructions to disassemble (truncation limit).
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_decompile`
@@ -355,7 +412,7 @@ Generate high-level pseudo-C decompilation for a function, along with call graph
 - `function` (`string`, **required**): Target function name (e.g. 'main') or virtual address (e.g. '0x11e0').
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_flow`
@@ -366,7 +423,7 @@ Analyze control flow decision gates, condition/branch instructions (e.g. jz, jne
 - `function` (`string`, **required**): Target function name or virtual memory address.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_xrefs`
@@ -380,7 +437,7 @@ Extract cross-references (callers, callees, code references, data references, st
 - `limit` (`integer`, optional): Maximum number of cross-references to return.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_strings`
@@ -393,7 +450,7 @@ Extract ASCII and UTF-8 strings from binary data and text sections with virtual 
 - `limit` (`integer`, optional): Maximum number of strings to return.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_symbols`
@@ -406,7 +463,7 @@ List binary symbols, PLT imports, exported symbols, bindings, and virtual addres
 - `offset` (`integer`, optional): Starting index offset for pagination. Defaults to 0.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 #### `rvs_agent_triage`
@@ -416,7 +473,7 @@ Perform full autonomous binary reconnaissance: security mitigations, top complex
 - `file` (`string`, **required**): Path to the binary file to triage.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 - `abi` (`string`, optional): Target ABI architecture when analyzing APK packages (e.g. 'x86_64', 'arm64-v8a', 'armeabi-v7a', 'x86'). Defaults to 'x86_64'.
-- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to false.
+- `neutral` (`boolean`, optional): Enable neutral technical representation: sanitize sensitive tokens, attach bijective codebook, and include execution telemetry. Defaults to true.
 - `component_type` (`string`, optional): Component type to analyze within multi-component targets like APKs ('elf_so' or 'dex'). Defaults to 'elf_so'.
 
 ---
@@ -774,6 +831,44 @@ Validate, dry-run simulate, or atomically apply a multi-step patch plan to the t
 
 ---
 
+### Phase 7: Android APK & Multi-Language Analysis
+*Android package inspection, AndroidManifest decomposition, Dalvik DEX bytecode analysis, native .so library analysis, and multi-language framework detection (Java, C/C++, React Native, Dart/Flutter).*
+
+#### `rvs_apk_info`
+General overview of an Android APK package, unpacked directory, or standalone binary (package identity, manifest summary, DEX and native .so listing).
+
+**Parameters:**
+- `file` (`string`, **required**): Path to the target APK archive, extracted directory, or standalone DEX/SO file.
+- `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+
+#### `rvs_apk_manifest`
+Inspect AndroidManifest details (package name, SDK versions, permissions, activities, services, receivers, providers, debuggable).
+
+**Parameters:**
+- `file` (`string`, **required**): Path to the target APK archive, extracted directory, or standalone AndroidManifest.xml.
+- `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+
+#### `rvs_apk_dex`
+Analyze Dalvik DEX bytecode, classes, methods, prototypes, signatures, and strings in an APK or standalone DEX.
+
+**Parameters:**
+- `file` (`string`, **required**): Path to the target APK archive, extracted directory, or standalone DEX file.
+- `dex_file` (`string`, optional): Optional specific DEX file within the APK (e.g. 'classes.dex', 'classes2.dex').
+- `class` (`string`, optional): Optional class name substring filter.
+- `method` (`string`, optional): Optional method name substring filter.
+- `disasm` (`boolean`, optional): Disassemble Dalvik bytecode for matched methods. Defaults to false.
+- `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+
+#### `rvs_apk_native`
+Analyze native .so libraries in an APK or standalone .so (architecture, exported symbols, static JNI mappings, RegisterNatives).
+
+**Parameters:**
+- `file` (`string`, **required**): Path to the target APK archive, extracted directory, or standalone .so file.
+- `abi` (`string`, optional): Filter native libraries by ABI (e.g. 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64').
+- `library` (`string`, optional): Optional native library file name filter (e.g. 'libnative.so').
+- `symbol` (`string`, optional): Optional symbol or JNI function name substring filter.
+- `xrefs` (`boolean`, optional): Extract cross-references for detected JNI functions. Defaults to false.
+- `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 
 ---
 
@@ -921,6 +1016,25 @@ rvs_frida_hook_return(target="license_checker", addr="sym.validate_key", retval=
 
 ---
 
+### Recipe 6: Android APK Multi-Language Reconnaissance & Native .so JNI Analysis
+**Goal**: Inspect an Android APK package, detect embedded programming languages/frameworks, analyze Dalvik bytecode, and extract JNI exports from embedded native `.so` libraries.
+
+```python
+# 1. Package overview & multi-language detection (Java, C/C++, React Native, Dart/Flutter)
+apk_overview = rvs_apk_info(file="target_app.apk", compact=True)
+
+# 2. Inspect AndroidManifest.xml permissions, activities, and debuggable flag
+manifest = rvs_apk_manifest(file="target_app.apk", compact=True)
+
+# 3. Analyze Dalvik DEX bytecode and find native method declarations
+dex_analysis = rvs_apk_dex(file="target_app.apk", dex_file="classes.dex", method="checkLicense", disasm=False, compact=True)
+
+# 4. Extract native .so architecture, JNI exports, and symbols without external tools
+so_analysis = rvs_apk_native(file="target_app.apk", abi="arm64-v8a", library="libnative.so", symbol="Java_", xrefs=False, compact=True)
+```
+
+---
+
 ## 🎯 Verification Checklist for Agents
 
 Before completing any reverse engineering assignment:
@@ -929,3 +1043,5 @@ Before completing any reverse engineering assignment:
 3. **Backup Verification**: Ensure `.bak` files are created whenever modifying binaries.
 4. **Token Budgeting**: Always pass `compact=True` (or omit to accept default `True`). Limit symbol and string queries.
 5. **Native Tool Prescription**: Verify that no standalone Python or custom shell scripts were created. Confirm all dynamic hooking, register evaluation, and gate bypass operations utilized native `rvs_frida_*` or composite `rvs_*` tools.
+6. **Data Neutrality & Grounding Compliance**: Ensure neutral mode (`neutral=True`) and compact mode (`compact=True`) are preserved. Verify all conclusions are strictly grounded in concrete tool output with zero unverified speculation.
+7. **Android APK & Multi-Language Verification**: For Android APK targets, ensure package identity, embedded languages (Java, C/C++, React Native, Dart/Flutter), and native `.so` JNI functions are extracted via `rvs_apk_*` tools rather than external unzipping utilities.

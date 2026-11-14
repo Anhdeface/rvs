@@ -158,6 +158,10 @@ pub enum ApkCommands {
         #[arg(short = 'A', long)]
         abi: Option<String>,
 
+        /// Filter native library by specific file name (e.g. libnative.so or lib/arm64-v8a/libnative.so)
+        #[arg(short = 'l', long = "library")]
+        library: Option<String>,
+
         /// Filter symbols or JNI functions by name substring
         #[arg(short, long)]
         symbol: Option<String>,
@@ -1167,11 +1171,12 @@ mod tests {
 
         // so
         let cli4 = Cli::try_parse_from([
-            "rvs", "apk", "so", "app.apk", "--abi", "arm64-v8a", "--symbol", "stringFromJNI", "--xrefs",
+            "rvs", "apk", "so", "app.apk", "--abi", "arm64-v8a", "--library", "libnative.so", "--symbol", "stringFromJNI", "--xrefs",
         ]).unwrap();
-        if let Commands::Apk(ApkCommands::So { path, abi, symbol, xrefs }) = cli4.command {
+        if let Commands::Apk(ApkCommands::So { path, abi, library, symbol, xrefs }) = cli4.command {
             assert_eq!(path, PathBuf::from("app.apk"));
             assert_eq!(abi.as_deref(), Some("arm64-v8a"));
+            assert_eq!(library.as_deref(), Some("libnative.so"));
             assert_eq!(symbol.as_deref(), Some("stringFromJNI"));
             assert!(xrefs);
         } else {
