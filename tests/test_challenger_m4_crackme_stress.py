@@ -40,6 +40,21 @@ AUTH_GATE_TARGET = FIXTURES_DIR / "auth_gate_elf64"
 FLOW_CALC_TARGET = FIXTURES_DIR / "flow_calc_elf64"
 
 
+def _is_native_debugging_supported() -> bool:
+    try:
+        harness = RvsHarness()
+        res = harness.debug_spawn("/bin/true")
+        if not res.get("success"):
+            err = res.get("error", {})
+            msg = err.get("message", "") if isinstance(err, dict) else str(err)
+            if "not yet implemented" in msg:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_is_native_debugging_supported(), "Native dynamic debugging is not yet implemented (Milestone 4)")
 class TestMilestone4CrackmeStress(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

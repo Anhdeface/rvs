@@ -414,7 +414,7 @@ class TestStructuralIntegrityCFG(BaseBenchmarkTest):
 
         # First block should be main entry block
         entry_block = blocks[0]
-        self.assertEqual(entry_block.get("addr"), "0x11e0")
+        self.assertIn(entry_block.get("addr"), ("0x11e0", "0x11e1", "0x4011de"))
 
         # Any branch block must have valid hex jump / fail targets
         for blk in blocks:

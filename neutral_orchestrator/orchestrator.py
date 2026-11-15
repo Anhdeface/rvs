@@ -15,7 +15,9 @@ from __future__ import annotations
 import enum
 import json
 import os
+import re
 import struct
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -111,11 +113,19 @@ class DalvikMetadataExtractor:
     Pure-Python parser for Dalvik Executable (DEX) files (v035-v039).
     Parses the 112-byte header, Adler32 checksum, SHA-1 signature,
     endianness, and ULEB128-encoded string tables without external dependencies.
+    Supports lazy string table parsing and in-memory metadata caching.
     """
+    _cache: Dict[str, Dict[str, Any]] = {}
 
-    @staticmethod
-    def extract_metadata(dex_path: Union[str, Path]) -> Dict[str, Any]:
+    @classmethod
+    def extract_metadata(cls, dex_path: Union[str, Path], parse_strings: bool = True) -> Dict[str, Any]:
         p = Path(dex_path)
+        cache_key = str(p.resolve()) if p.exists() else str(p)
+        if cache_key in cls._cache:
+            cached = cls._cache[cache_key]
+            if not parse_strings or cached.get("strings_parsed", False):
+                return dict(cached)
+
         if not p.exists() or p.stat().st_size < 112:
             return {
                 "format": "dex",
@@ -146,10 +156,10 @@ class DalvikMetadataExtractor:
         class_defs_size, class_defs_off = struct.unpack_from("<II", data, 0x60)
         data_size, data_off = struct.unpack_from("<II", data, 0x68)
 
-        # Parse string table
+        # Parse string table lazily
         strings: List[Dict[str, Any]] = []
         raw_strings: List[str] = []
-        if 0 < string_ids_off < len(data) and string_ids_size > 0:
+        if parse_strings and 0 < string_ids_off < len(data) and string_ids_size > 0:
             for i in range(min(string_ids_size, 5000)):
                 if string_ids_off + i * 4 + 4 > len(data):
                     break
@@ -183,7 +193,7 @@ class DalvikMetadataExtractor:
                 raw_strings.append(s)
                 strings.append({"string": s, "offset": soff, "length": length})
 
-        return {
+        meta_result = {
             "format": "dex",
             "arch": "dalvik",
             "bits": 32,
@@ -202,8 +212,86 @@ class DalvikMetadataExtractor:
             "class_count": class_defs_size,
             "strings": strings,
             "raw_strings": raw_strings,
+            "strings_parsed": parse_strings,
             "valid": True,
         }
+        cls._cache[cache_key] = meta_result
+        return dict(meta_result)
+
+
+def auto_register_sensitive_tokens(data: Any, mapper: Any) -> None:
+    """
+    Universally registers discovered sensitive symbols and strings across all
+    endpoint responses (decompile, flow, symbols, strings, functions, xrefs, triage).
+    """
+    if not isinstance(data, dict) or mapper is None:
+        return
+
+    # 1. Functions & Symbols
+    for key in ("functions", "symbols", "imported_symbols", "top_functions", "key_functions"):
+        val = data.get(key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("symbol") or item.get("flagname")
+                    if name and isinstance(name, str):
+                        cat = classify_token(name)
+                        if cat != TokenCategory.GENERAL:
+                            mapper.sanitize_symbol(name, category=cat)
+                elif isinstance(item, str) and item:
+                    cat = classify_token(item)
+                    if cat != TokenCategory.GENERAL:
+                        mapper.sanitize_symbol(item, category=cat)
+
+    # 2. Strings & Interesting Strings
+    for key in ("strings", "interesting_strings", "raw_strings"):
+        val = data.get(key)
+        if isinstance(val, list):
+            for item in val:
+                st = item.get("string") if isinstance(item, dict) else (item if isinstance(item, str) else "")
+                if st and isinstance(st, str):
+                    cat = classify_token(st)
+                    if cat != TokenCategory.GENERAL:
+                        mapper.sanitize_string(st, category=cat)
+
+    # 3. Disassembly & nested blocks in flow
+    instructions: List[Dict[str, Any]] = []
+    if isinstance(data.get("instructions"), list):
+        instructions.extend(data["instructions"])
+    blocks = data.get("blocks")
+    if isinstance(blocks, list):
+        for b in blocks:
+            if isinstance(b, dict) and isinstance(b.get("instructions"), list):
+                instructions.extend(b["instructions"])
+    for inst in instructions:
+        if isinstance(inst, dict):
+            op_str = inst.get("operands", "") or inst.get("asm", "") or inst.get("disasm", "") or ""
+            if isinstance(op_str, str) and op_str:
+                for part in re.findall(r"(?:sym\.|str\.)?([a-zA-Z0-9_]{3,})", op_str):
+                    cat = classify_token(part)
+                    if cat != TokenCategory.GENERAL:
+                        mapper.sanitize_symbol(part, category=cat)
+
+    # 4. Decompilation & pseudo-C code
+    for code_key in ("decompilation", "code", "pseudo_c"):
+        code_text = data.get(code_key)
+        if isinstance(code_text, str) and code_text:
+            for token_candidate in re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", code_text):
+                cat = classify_token(token_candidate)
+                if cat != TokenCategory.GENERAL:
+                    mapper.sanitize_symbol(token_candidate, category=cat)
+
+    # 5. Cross-references (xrefs)
+    xrefs = data.get("xrefs")
+    if isinstance(xrefs, list):
+        for xref in xrefs:
+            if isinstance(xref, dict):
+                for field in ("function_name", "target", "symbol", "name"):
+                    v = xref.get(field)
+                    if isinstance(v, str) and v:
+                        cat = classify_token(v)
+                        if cat != TokenCategory.GENERAL:
+                            mapper.sanitize_symbol(v, category=cat)
 
 
 # ==============================================================================
@@ -260,6 +348,7 @@ class NeutralBinaryOrchestrator:
             self.harness._in_orchestration = True
 
         self._closed = False
+        self._lock = threading.RLock()
 
     @property
     def target(self) -> Optional[UnifiedTarget]:
@@ -297,8 +386,8 @@ class NeutralBinaryOrchestrator:
             self._closed = True
             if self.unified_target is not None:
                 self.unified_target.cleanup()
-            if self.harness is not None:
-                self.harness.clear_session()
+            if self._owns_harness and self.harness is not None:
+                self.harness.clear_session(self.target_path)
 
     def cleanup(self) -> None:
         """Alias for close()."""
@@ -308,6 +397,10 @@ class NeutralBinaryOrchestrator:
         """
         Executes binary analysis command and returns structured NeutralResponseEnvelope.
         """
+        with self._lock:
+            return self._query_locked(command, **kwargs)
+
+    def _query_locked(self, command: str, **kwargs: Any) -> Dict[str, Any]:
         if self._closed:
             raise RuntimeError("NeutralBinaryOrchestrator session has already been closed")
 
@@ -319,20 +412,18 @@ class NeutralBinaryOrchestrator:
         try:
             # 1. Validate requested operation
             if normalized_cmd not in self.SUPPORTED_OPERATIONS:
-                elapsed = max(0.0, round(time.perf_counter() - start_time, 4))
+                elapsed = max(0.0, round(time.perf_counter() - start_time, 3))
                 return _sanitize_for_json({
                     "success": False,
                     "command": normalized_cmd,
                     "target": self.target_path,
                     "target_type": target_type_str,
                     "active_component": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "data": {},
-                    "codebook": self.token_mapper.export_codebook(),
+                    "codebook": self.token_mapper.export_codebook(lean=True),
                     "telemetry": {
                         "execution_time_seconds": elapsed,
-                        "target_type": target_type_str,
-                        "active_component": None,
                     },
                     "error": {
                         "code": "INVALID_COMMAND",
@@ -370,7 +461,7 @@ class NeutralBinaryOrchestrator:
             # If component could not be resolved (either explicit ABI/type not found,
             # or container has no analyzable components, or target is malformed/empty):
             if comp is None:
-                elapsed = max(0.0, round(time.perf_counter() - start_time, 4))
+                elapsed = max(0.0, round(time.perf_counter() - start_time, 3))
                 is_empty = False
                 try:
                     is_empty = os.path.exists(self.target_path) and os.path.getsize(self.target_path) == 0
@@ -396,13 +487,11 @@ class NeutralBinaryOrchestrator:
                     "target": self.target_path,
                     "target_type": target_type_str,
                     "active_component": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "data": {},
-                    "codebook": self.token_mapper.export_codebook(),
+                    "codebook": self.token_mapper.export_codebook(lean=True),
                     "telemetry": {
                         "execution_time_seconds": elapsed,
-                        "target_type": target_type_str,
-                        "active_component": None,
                     },
                     "error": {
                         "code": err_code,
@@ -429,40 +518,36 @@ class NeutralBinaryOrchestrator:
             else:
                 res_data, error, success = self._route_native(normalized_cmd, active_path, **kwargs)
 
-            elapsed = max(0.0, round(time.perf_counter() - start_time, 4))
+            elapsed = max(0.0, round(time.perf_counter() - start_time, 3))
             envelope = {
                 "success": success,
                 "command": normalized_cmd,
                 "target": self.target_path,
                 "target_type": target_type_str,
                 "active_component": active_comp_str,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "data": res_data,
-                "codebook": self.token_mapper.export_codebook(),
+                "codebook": self.token_mapper.export_codebook(lean=True),
                 "telemetry": {
                     "execution_time_seconds": elapsed,
-                    "target_type": target_type_str,
-                    "active_component": active_comp_str,
                 },
                 "error": error if not success else None,
             }
             return _sanitize_for_json(envelope)
 
         except Exception as e:
-            elapsed = max(0.0, round(time.perf_counter() - start_time, 4))
+            elapsed = max(0.0, round(time.perf_counter() - start_time, 3))
             err_envelope = {
                 "success": False,
                 "command": normalized_cmd,
                 "target": self.target_path,
                 "target_type": target_type_str,
                 "active_component": active_comp_str,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "data": {},
-                "codebook": self.token_mapper.export_codebook() if hasattr(self, "token_mapper") else None,
+                "codebook": self.token_mapper.export_codebook(lean=True) if hasattr(self, "token_mapper") else None,
                 "telemetry": {
                     "execution_time_seconds": elapsed,
-                    "target_type": target_type_str,
-                    "active_component": active_comp_str,
                 },
                 "error": {
                     "code": "INTERNAL_ERROR",
@@ -480,7 +565,8 @@ class NeutralBinaryOrchestrator:
         **kwargs: Any,
     ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
         """Routes DEX component queries to Dalvik metadata extractor."""
-        meta = DalvikMetadataExtractor.extract_metadata(dex_path)
+        parse_strings = (command != "info")
+        meta = DalvikMetadataExtractor.extract_metadata(dex_path, parse_strings=parse_strings)
         if not meta.get("valid", True):
             return {}, {
                 "code": "ANALYSIS_ERROR",
@@ -719,17 +805,27 @@ class NeutralBinaryOrchestrator:
         if not isinstance(data, dict):
             data = {"result": data} if data is not None else {}
 
-        # 5. Critical Invariant Post-Processing: Flatten instructions for disasm
+        # 5. Critical Invariant Post-Processing: Flatten instructions for disasm (deduplicating in compact mode)
         if command == "disasm" and success:
+            compact_mode = kwargs.get("compact", False)
             instructions: List[Dict[str, Any]] = []
             blocks = data.get("blocks", [])
+            has_block_instructions = False
             if isinstance(blocks, list):
                 for b in blocks:
                     if isinstance(b, dict):
-                        instructions.extend(b.get("instructions", []))
+                        b_insts = b.get("instructions", [])
+                        if b_insts:
+                            has_block_instructions = True
+                            instructions.extend(b_insts)
             if not instructions and "instructions" in data and isinstance(data["instructions"], list):
                 instructions = data["instructions"]
-            data["instructions"] = instructions
+
+            if compact_mode and has_block_instructions:
+                # Deduplicate: omit duplicate instructions array in compact mode since blocks already have them
+                data.pop("instructions", None)
+            else:
+                data["instructions"] = instructions
 
         # 6. Critical Invariant Post-Processing: Populate blocks for flow
         if command == "flow" and success:
@@ -759,24 +855,9 @@ class NeutralBinaryOrchestrator:
                 blocks = synth_blocks
             data["blocks"] = blocks
 
-        # 7. Auto-register discovered sensitive symbols and strings in session token mapper
+        # 7. Universal Auto-register discovered sensitive symbols and strings in session token mapper
         if success:
-            if command == "functions":
-                for fn in data.get("functions", []):
-                    if isinstance(fn, dict):
-                        name = fn.get("name", "")
-                        if name:
-                            cat = classify_token(name)
-                            if cat != TokenCategory.GENERAL:
-                                self.token_mapper.sanitize_symbol(name, category=cat)
-            elif command == "strings":
-                for s in data.get("strings", []):
-                    if isinstance(s, dict):
-                        text = s.get("string", "")
-                        if text:
-                            cat = classify_token(text)
-                            if cat != TokenCategory.GENERAL:
-                                self.token_mapper.sanitize_string(text, category=cat)
+            auto_register_sensitive_tokens(data, self.token_mapper)
 
         return data, error, success
 

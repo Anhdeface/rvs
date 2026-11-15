@@ -61,6 +61,14 @@ class TestRvsHarnessBase(unittest.TestCase):
         cls.rvs_bin = find_rvs_binary()
         cls.harness = RvsHarness(rvs_bin=cls.rvs_bin)
         cls.legacy_harness = RvsAgentHarness(rvs_bin=cls.rvs_bin)
+        s_resp = cls.harness.strings(cls.crackme_path, min_len=4, compact=True)
+        s_list = [s.get("string", "") for s in s_resp.get("data", {}).get("strings", [])] if s_resp.get("success") else []
+        cls._has_serial = any("Enter serial" in s or "Valid serial" in s for s in s_list)
+        cls._patch_addr = "0x13d2" if cls._has_serial else "0x11e5"
+        cls._patch_nop_bytes = 6 if cls._has_serial else 4
+        cls._patch_hex = "e9a200000090" if cls._has_serial else "90909090"
+        cls._old_str = "Enter serial:" if cls._has_serial else "STATUS_SYSTEM_LOCKED"
+        cls._new_str = "Input key:   " if cls._has_serial else "STATUS_SYSTEM_ACTIVE"
 
     def create_temp_crackme(self) -> Path:
         """Creates an isolated temporary copy of the crackme binary for mutation tests."""
@@ -150,7 +158,7 @@ class TestAllCommands(TestRvsHarnessBase):
         self.assertTrue(resp.get("success"), f"strings failed: {resp}")
         data = resp.get("data", {})
         strings = data.get("strings", [])
-        self.assertTrue(any("Valid serial" in s.get("string", "") for s in strings))
+        self.assertTrue(any("Valid serial" in s.get("string", "") or "STATUS_SYSTEM" in s.get("string", "") for s in strings))
 
     def test_cmd_08_symbols(self):
         resp = self.harness.symbols(self.crackme_path, filter="puts", compact=True)
@@ -161,18 +169,18 @@ class TestAllCommands(TestRvsHarnessBase):
 
     def test_cmd_09_patch_instruction(self):
         temp_bin = self.create_temp_crackme()
-        resp = self.harness.patch_instruction(temp_bin, addr="0x13d2", nop_bytes=6, backup=True)
+        resp = self.harness.patch_instruction(temp_bin, addr=self._patch_addr, nop_bytes=self._patch_nop_bytes, backup=True)
         self.assertTrue(resp.get("success"), f"patch_instruction failed: {resp}")
         data = resp.get("data", {})
         self.assertTrue(data.get("verified"))
-        self.assertEqual(data.get("bytes"), 6)
+        self.assertEqual(data.get("bytes"), self._patch_nop_bytes)
 
     def test_cmd_10_patch_string(self):
         temp_bin = self.create_temp_crackme()
         resp = self.harness.patch_string(
             temp_bin,
-            old_string="Enter serial:",
-            new_string="Input key:   ",
+            old_string=self._old_str,
+            new_string=self._new_str,
             pad_null=True,
             strict_length=True,
             backup=True,
@@ -183,11 +191,11 @@ class TestAllCommands(TestRvsHarnessBase):
 
     def test_cmd_11_patch_bytes(self):
         temp_bin = self.create_temp_crackme()
-        resp = self.harness.patch_bytes(temp_bin, addr="0x13d2", hex_bytes="e9a200000090", backup=True)
+        resp = self.harness.patch_bytes(temp_bin, addr=self._patch_addr, hex_bytes=self._patch_hex, backup=True)
         self.assertTrue(resp.get("success"), f"patch_bytes failed: {resp}")
         data = resp.get("data", {})
         self.assertTrue(data.get("verified"))
-        self.assertEqual(data.get("new"), "e9a200000090")
+        self.assertEqual(data.get("new"), self._patch_hex)
 
     def test_cmd_12_triage(self):
         resp = self.harness.triage(self.crackme_path, compact=True)
@@ -205,8 +213,8 @@ class TestAllCommands(TestRvsHarnessBase):
             "steps": [
                 {
                     "type": "bytes",
-                    "addr": "0x13d2",
-                    "hex": "e9a200000090",
+                    "addr": self._patch_addr,
+                    "hex": self._patch_hex,
                 }
             ],
         }
@@ -226,8 +234,8 @@ class TestAllCommands(TestRvsHarnessBase):
             "steps": [
                 {
                     "type": "bytes",
-                    "addr": "0x13d2",
-                    "hex": "909090909090",
+                    "addr": self._patch_addr,
+                    "hex": self._patch_hex,
                 }
             ],
         }
@@ -243,7 +251,7 @@ class TestAllCommands(TestRvsHarnessBase):
         orig_bytes = temp_bin.read_bytes()
         plan_str = json.dumps({
             "name": "str_dry_run_plan",
-            "steps": [{"type": "bytes", "addr": "0x13d2", "hex": "909090909090"}],
+            "steps": [{"type": "bytes", "addr": self._patch_addr, "hex": self._patch_hex}],
         })
         resp = self.harness.patch_plan(temp_bin, plan=plan_str, dry_run=True)
         self.assertTrue(resp.get("success"), f"patch_plan failed: {resp}")
@@ -256,7 +264,7 @@ class TestAllCommands(TestRvsHarnessBase):
         temp_bin = self.create_temp_crackme()
         plan_str = json.dumps({
             "name": "str_apply_plan",
-            "steps": [{"type": "bytes", "addr": "0x13d2", "hex": "909090909090"}],
+            "steps": [{"type": "bytes", "addr": self._patch_addr, "hex": self._patch_hex}],
         })
         resp = self.harness.patch_plan(temp_bin, plan=plan_str, dry_run=False)
         self.assertTrue(resp.get("success"), f"patch_plan failed: {resp}")
@@ -270,7 +278,7 @@ class TestAllCommands(TestRvsHarnessBase):
         tmp_plan = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
         json.dump({
             "name": "file_plan",
-            "steps": [{"type": "bytes", "addr": "0x13d2", "hex": "909090909090"}],
+            "steps": [{"type": "bytes", "addr": self._patch_addr, "hex": self._patch_hex}],
         }, tmp_plan)
         tmp_plan.close()
         plan_path = Path(tmp_plan.name)
@@ -283,7 +291,7 @@ class TestAllCommands(TestRvsHarnessBase):
         self.assertFalse(resp_dry["data"].get("applied"))
         self.assertEqual(temp_bin.read_bytes(), orig_bytes)
 
-        # Apply via file
+    # Apply via file
         resp_apply = self.harness.patch_plan(temp_bin, plan=plan_path, dry_run=False)
         self.assertTrue(resp_apply.get("success"), f"patch_plan file apply failed: {resp_apply}")
         self.assertFalse(resp_apply["data"].get("dry_run"))

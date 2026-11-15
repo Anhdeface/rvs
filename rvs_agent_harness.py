@@ -74,7 +74,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.6"
+SERVER_VERSION: str = "0.3.7"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -1068,24 +1068,36 @@ class KnapsackOptimizer:
         weights: List[int] = []
         values: List[float] = []
 
-        fn_id = id(weight_func)
-        for idx, item in enumerate(items):
-            item_key = KnapsackOptimizer._compute_item_key(item)
-            cache_k = (fn_id, item_key)
-            w = KnapsackOptimizer._WEIGHT_CACHE.get(cache_k)
-            if w is None:
-                w = max(1, weight_func(item))
-                if len(KnapsackOptimizer._WEIGHT_CACHE) > 10000:
-                    KnapsackOptimizer._WEIGHT_CACHE.clear()
-                KnapsackOptimizer._WEIGHT_CACHE[cache_k] = w
-            weights.append(w)
-            v = max(0.1, value_fn(item, idx, total_items))
-            values.append(v)
-            is_mand = mandatory_fn(item, idx, total_items) if mandatory_fn else False
-            if is_mand:
-                mandatory_indices.append(idx)
-            else:
-                optional_indices.append(idx)
+        if item_weight_fn is not None:
+            for idx, item in enumerate(items):
+                w = max(1, item_weight_fn(item))
+                weights.append(w)
+                v = max(0.1, value_fn(item, idx, total_items))
+                values.append(v)
+                is_mand = mandatory_fn(item, idx, total_items) if mandatory_fn else False
+                if is_mand:
+                    mandatory_indices.append(idx)
+                else:
+                    optional_indices.append(idx)
+        else:
+            fn_id = id(weight_func)
+            for idx, item in enumerate(items):
+                item_key = KnapsackOptimizer._compute_item_key(item)
+                cache_k = (fn_id, item_key)
+                w = KnapsackOptimizer._WEIGHT_CACHE.get(cache_k)
+                if w is None:
+                    w = max(1, weight_func(item))
+                    if len(KnapsackOptimizer._WEIGHT_CACHE) > 10000:
+                        KnapsackOptimizer._WEIGHT_CACHE.clear()
+                    KnapsackOptimizer._WEIGHT_CACHE[cache_k] = w
+                weights.append(w)
+                v = max(0.1, value_fn(item, idx, total_items))
+                values.append(v)
+                is_mand = mandatory_fn(item, idx, total_items) if mandatory_fn else False
+                if is_mand:
+                    mandatory_indices.append(idx)
+                else:
+                    optional_indices.append(idx)
 
         used_weight = sum(weights[i] for i in mandatory_indices)
         selected_set: Set[int] = set()
@@ -1171,6 +1183,16 @@ def prune_info(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
         "entry": entry_hex,
         "security": sec_compact,
     }
+    if data.get("valid") is not None:
+        res["valid"] = data.get("valid")
+    if "string_count" in data:
+        res["string_count"] = data["string_count"]
+    if "class_count" in data:
+        res["class_count"] = data["class_count"]
+    if "method_count" in data:
+        res["method_count"] = data["method_count"]
+    if "version" in data:
+        res["version"] = data["version"]
     if data.get("endian") and data.get("endian") != "little":
         res["endian"] = data.get("endian")
     if data.get("os") and data.get("os") != "linux":
@@ -2459,6 +2481,8 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                 if lk in data and isinstance(data[lk], list):
                     collapsed[lk] = []
             env["data"] = collapsed
+            if "original_tokens" in env:
+                del env["original_tokens"]
             env["token_estimate"] = TokenEstimator.estimate_obj(env)
             return env
 
@@ -2544,8 +2568,18 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                                     if TokenEstimator.estimate_obj(env) <= budget:
                                         break
 
-                        # If still exceeding budget, drop entry block as last resort
+                        if TokenEstimator.estimate_obj(env) > budget and "instructions" in b0 and not b0["instructions"]:
+                            del b0["instructions"]
+
                         if TokenEstimator.estimate_obj(env) > budget:
+                            for opt_data_field in ("remaining", "total"):
+                                if opt_data_field in data:
+                                    del data[opt_data_field]
+                                    if TokenEstimator.estimate_obj(env) <= budget:
+                                        break
+
+                        # If still exceeding budget, drop entry block as last resort (preserving entry anchor down to B=200)
+                        if budget < 200 and TokenEstimator.estimate_obj(env) > budget:
                             items.pop()
                     elif len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
                         while items and TokenEstimator.estimate_obj(env) > budget:
@@ -2594,13 +2628,18 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
             if TokenEstimator.estimate_obj(env) > budget and lines_clean:
                 data["pseudo_c"] = "// [budget truncated: 0 tokens]"
 
-        # 3. If still exceeding budget, collapse data to minimal marker
-        if TokenEstimator.estimate_obj(env) > budget:
+        # 3. If still exceeding budget, collapse data to minimal marker (preserving entry block anchor down to B=200)
+        if budget < 200 and TokenEstimator.estimate_obj(env) > budget:
             collapsed = {"truncated": True, "note": "Budget exhausted"}
             for lk in ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]:
                 if lk in data and isinstance(data[lk], list):
                     collapsed[lk] = []
             env["data"] = collapsed
+
+        # 4. If envelope still exceeds budget, trim non-critical metadata to respect budget
+        if TokenEstimator.estimate_obj(env) > budget:
+            if "original_tokens" in env:
+                del env["original_tokens"]
 
     env["token_estimate"] = TokenEstimator.estimate_obj(env)
     return env
@@ -2700,7 +2739,10 @@ def _transform_single_budget(
         "execution_time_seconds": resp_envelope.get("execution_time_seconds", 0.0),
         "token_estimate": TokenEstimator.estimate_obj(transformed_data),
     }
-    if mode != "compact":
+    for extra_key in ("target_type", "active_component", "codebook", "telemetry", "timestamp"):
+        if extra_key in resp_envelope:
+            result_env[extra_key] = resp_envelope[extra_key]
+    if mode is not None:
         result_env["mode"] = mode
     warnings = list(resp_envelope.get("warnings", []))
     if warnings:
@@ -4481,6 +4523,139 @@ def coerce_reg_set_param(val: Any) -> Optional[List[str]]:
     return [str(val)]
 
 
+class IngestedTargetCache:
+    """
+    Session-level cache for persistent NeutralBinaryOrchestrator instances and
+    ephemeral ingested targets across multi-turn queries.
+    Keyed by (canonical_path, mtime, size).
+    Supports reference counting across concurrent queries and session persistence.
+    """
+    def __init__(self) -> None:
+        self._cache: Dict[Tuple[str, float, int], Any] = {}
+        self._refcounts: Dict[int, int] = {}  # id(orch) -> refcount
+        self._cleared_active: Dict[int, Any] = {}  # id(orch) -> orch
+        self._lock = threading.RLock()
+
+    def _get_key(self, target_path: Union[str, Path]) -> Optional[Tuple[str, float, int]]:
+        try:
+            p = Path(target_path).resolve()
+            if not p.exists():
+                return None
+            stat = p.stat()
+            return (str(p), stat.st_mtime, stat.st_size)
+        except Exception:
+            return None
+
+    def get_or_create(
+        self,
+        target_path: Union[str, Path],
+        default_abi: str,
+        harness: Any,
+        orchestrator_cls: Any,
+        acquire: bool = False,
+    ) -> Any:
+        key = self._get_key(target_path)
+        with self._lock:
+            if key and key in self._cache:
+                orch = self._cache[key]
+                if getattr(orch, "_closed", False):
+                    self._cache.pop(key, None)
+                    self._refcounts.pop(id(orch), None)
+                else:
+                    if acquire:
+                        self._refcounts[id(orch)] = self._refcounts.get(id(orch), 0) + 1
+                    return orch
+            orch = orchestrator_cls(target_path, default_abi=default_abi, harness=harness)
+            if key:
+                self._cache[key] = orch
+                if acquire:
+                    self._refcounts[id(orch)] = 1
+                else:
+                    self._refcounts[id(orch)] = 0
+            return orch
+
+    def acquire(self, orch: Any) -> None:
+        with self._lock:
+            oid = id(orch)
+            self._refcounts[oid] = self._refcounts.get(oid, 0) + 1
+
+    def release(self, orch_or_path: Any, persist: bool = False) -> None:
+        with self._lock:
+            if hasattr(orch_or_path, "_closed"):
+                orch = orch_or_path
+            else:
+                orch = self.get(orch_or_path)
+            if orch is None:
+                return
+            oid = id(orch)
+            current_ref = max(0, self._refcounts.get(oid, 1) - 1)
+            self._refcounts[oid] = current_ref
+            is_ephemeral = getattr(getattr(orch, "unified_target", None), "is_ephemeral", False)
+            if current_ref <= 0:
+                if oid in self._cleared_active:
+                    self._cleared_active.pop(oid, None)
+                    self._refcounts.pop(oid, None)
+                    try:
+                        orch.close()
+                    except Exception:
+                        pass
+                elif not persist and is_ephemeral:
+                    for key, cached_orch in list(self._cache.items()):
+                        if id(cached_orch) == oid:
+                            self._cache.pop(key, None)
+                            break
+                    self._refcounts.pop(oid, None)
+                    try:
+                        orch.close()
+                    except Exception:
+                        pass
+
+    def __contains__(self, target_path: Union[str, Path]) -> bool:
+        key = self._get_key(target_path)
+        with self._lock:
+            return key is not None and key in self._cache
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    def get(self, target_path: Union[str, Path]) -> Optional[Any]:
+        key = self._get_key(target_path)
+        with self._lock:
+            return self._cache.get(key) if key else None
+
+    def clear(self, target_path: Optional[Union[str, Path]] = None) -> None:
+        with self._lock:
+            if target_path:
+                key = self._get_key(target_path)
+                if key and key in self._cache:
+                    orch = self._cache.pop(key)
+                    oid = id(orch)
+                    ref = self._refcounts.get(oid, 0)
+                    if ref <= 0:
+                        self._refcounts.pop(oid, None)
+                        try:
+                            orch.close()
+                        except Exception:
+                            pass
+                    else:
+                        self._cleared_active[oid] = orch
+            else:
+                active_entries = list(self._cache.values())
+                self._cache.clear()
+                for orch in active_entries:
+                    oid = id(orch)
+                    ref = self._refcounts.get(oid, 0)
+                    if ref <= 0:
+                        self._refcounts.pop(oid, None)
+                        try:
+                            orch.close()
+                        except Exception:
+                            pass
+                    else:
+                        self._cleared_active[oid] = orch
+
+
 # =============================================================================
 # Ergonomic Python API: RvsHarness & RvsAgentHarness (R2 & R3)
 # =============================================================================
@@ -4520,11 +4695,12 @@ class RvsHarness:
         self.default_mode = "compact" if eff_compact else (default_mode if default_mode != "compact" else "full")
         self._lock = threading.Lock()
         self._session_cache: Dict[str, Dict[str, Any]] = {}
+        self._ingested_target_cache = IngestedTargetCache()
         self._most_recent_session_id: Optional[str] = None
         self._active_debug_sessions: set[str] = set()
 
     def close(self) -> None:
-        """Terminate and clean up any remaining active debug sessions."""
+        """Terminate and clean up any remaining active debug sessions and target caches."""
         with self._lock:
             sessions = list(self._active_debug_sessions)
         for sid in sessions:
@@ -4532,6 +4708,7 @@ class RvsHarness:
                 self.debug_kill(target="", session=sid)
             except Exception:
                 pass
+        self._ingested_target_cache.clear()
 
     def __enter__(self) -> "RvsHarness":
         return self
@@ -4579,8 +4756,26 @@ class RvsHarness:
                 self._session_cache.pop(self._normalize_target(target), None)
             else:
                 self._session_cache.clear()
+        self._ingested_target_cache.clear(target)
         if not target:
             self._in_orchestration = False
+
+    def get_orchestrator(
+        self,
+        target: Union[str, Path],
+        default_abi: str = "x86_64",
+        cache: bool = True,
+    ) -> Any:
+        """
+        Retrieve or instantiate a persistent NeutralBinaryOrchestrator session for the active target.
+        If cache=True, session-level IngestedTargetCache reuses the orchestrator across multi-turn queries.
+        """
+        NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
+        if cache:
+            return self._ingested_target_cache.get_or_create(
+                target, default_abi=default_abi, harness=self, orchestrator_cls=NeutralBinaryOrchestrator
+            )
+        return NeutralBinaryOrchestrator(target, default_abi=default_abi, harness=self)
 
     transform_response = staticmethod(transform_response)
 
@@ -4654,6 +4849,20 @@ class RvsHarness:
             except json.JSONDecodeError:
                 pass
 
+        if resp and not resp.get("success") and "closed unexpectedly" in str(resp.get("error", {})).lower():
+            # Transient radare2 pipe EOF retry under high thread contention
+            code, stdout, stderr, duration = execute_rvs_subprocess(
+                cmd_args, timeout=t, rvs_bin=self.rvs_bin
+            )
+            if stdout.strip():
+                try:
+                    data = json.loads(stdout)
+                    if isinstance(data, dict):
+                        data["execution_time_seconds"] = round(duration, 3)
+                        resp = data  # type: ignore
+                except json.JSONDecodeError:
+                    pass
+
         if resp is None:
             # Construct synthetic envelope for non-JSON or error stream
             success = (code == EXIT_SUCCESS)
@@ -4702,7 +4911,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_info",
                     {
@@ -4739,7 +4948,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_functions",
                     {
@@ -4786,7 +4995,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_disasm",
                     {
@@ -4833,7 +5042,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_decompile",
                     {
@@ -4873,7 +5082,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_flow",
                     {
@@ -4916,7 +5125,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_xrefs",
                     {
@@ -4959,7 +5168,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_strings",
                     {
@@ -5006,7 +5215,7 @@ class RvsHarness:
         if not in_orch:
             is_apk = _is_apk_target(target)
             is_dex = _is_dex_target(target)
-            if is_apk or is_dex or eff_neutral or abi is not None or component_type is not None:
+            if is_apk or is_dex or (neutral is True) or abi is not None or component_type is not None:
                 return self.execute_tool(
                     "rvs_symbols",
                     {
@@ -5691,7 +5900,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.3.6",
+                    "format_version": "0.3.7",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6831,19 +7040,28 @@ if (fopenPtr) {
             compact_default = getattr(self, "default_compact", True)
             neutral_default = getattr(self, "default_neutral", True)
             compact = coerce_bool_param(arguments.get("compact"), compact_default, "compact")
-            budget = coerce_int_param(arguments.get("budget") or arguments.get("budget_tokens"), None, "budget", allow_negative=False)
+            budget_val = arguments.get("budget")
+            if budget_val is None:
+                budget_val = arguments.get("budget_tokens")
+            budget = coerce_int_param(budget_val, None, "budget", allow_negative=False)
             abi = arguments.get("abi")
             if isinstance(abi, str):
                 abi = abi.strip().lower()
-            neutral = coerce_bool_param(arguments.get("neutral"), neutral_default, "neutral")
             component_type = arguments.get("component_type")
             if isinstance(component_type, str):
                 component_type = component_type.strip().lower()
-
             is_apk = _is_apk_target(file)
             is_dex = _is_dex_target(file)
+            persist = not is_apk
+            explicit_neutral = arguments.get("neutral")
+            if explicit_neutral is not None:
+                neutral = coerce_bool_param(explicit_neutral, True, "neutral")
+            elif is_apk or is_dex:
+                neutral = getattr(self, "default_neutral", True)
+            else:
+                neutral = False
 
-            needs_orchestration = (is_apk or is_dex or neutral or abi is not None or component_type is not None)
+            needs_orchestration = bool(is_apk or is_dex or neutral or abi is not None or component_type is not None)
 
             ORCHESTRATED_TOOLS = {
                 "rvs_info": "info",
@@ -6978,110 +7196,124 @@ if (fopenPtr) {
                 NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
                 prev_ctx = getattr(_ORCHESTRATION_CONTEXT, "active", False)
                 _ORCHESTRATION_CONTEXT.active = True
+                orch = None
                 try:
-                    with NeutralBinaryOrchestrator(file, default_abi=abi or "x86_64", harness=self) as orch:
-                        raw_env = orch.query(cmd, **query_kwargs)
-                        if neutral and raw_env.get("success"):
-                            from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
-                            mapper = orch.token_mapper
-                            data_obj = raw_env.get("data")
-                            if isinstance(data_obj, dict):
-                                fn_target = str(query_kwargs.get("function_or_addr") or query_kwargs.get("function") or "")
-                                if fn_target and not fn_target.startswith("0x"):
-                                    cat = classify_token(fn_target)
-                                    if cat != TokenCategory.GENERAL:
-                                        mapper.sanitize_symbol(fn_target, category=cat)
-                                for fn in data_obj.get("functions", []):
-                                    if isinstance(fn, dict) and fn.get("name"):
-                                        cat = classify_token(fn["name"])
-                                        if cat != TokenCategory.GENERAL:
-                                            mapper.sanitize_symbol(fn["name"], category=cat)
-                                for sym in data_obj.get("symbols", []):
-                                    if isinstance(sym, dict) and sym.get("name"):
-                                        cat = classify_token(sym["name"])
-                                        if cat != TokenCategory.GENERAL:
-                                            mapper.sanitize_symbol(sym["name"], category=cat)
-                                for st in data_obj.get("strings", []):
-                                    if isinstance(st, dict) and st.get("string"):
-                                        cat = classify_token(st["string"])
-                                        if cat != TokenCategory.GENERAL:
-                                            mapper.sanitize_string(st["string"], category=cat)
-                                for inst in data_obj.get("instructions", []):
-                                    if isinstance(inst, dict):
-                                        op_str = inst.get("operands", "")
-                                        for part in re.findall(r"sym\.([a-zA-Z0-9_]+)", op_str):
-                                            cat = classify_token(part)
-                                            if cat != TokenCategory.GENERAL:
-                                                mapper.sanitize_symbol(part, category=cat)
+                    orch = self._ingested_target_cache.get_or_create(
+                        file, default_abi=abi or "x86_64", harness=self, orchestrator_cls=NeutralBinaryOrchestrator, acquire=True
+                    )
+                    raw_env = orch.query(cmd, **query_kwargs)
+                    if neutral and raw_env.get("success"):
+                        from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
+                        from neutral_orchestrator.orchestrator import auto_register_sensitive_tokens
+                        mapper = orch.token_mapper
+                        data_obj = raw_env.get("data")
+                        if isinstance(data_obj, dict):
+                            fn_target = str(query_kwargs.get("function_or_addr") or query_kwargs.get("function") or "")
+                            if fn_target and not fn_target.startswith("0x"):
+                                cat = classify_token(fn_target)
+                                if cat != TokenCategory.GENERAL:
+                                    mapper.sanitize_symbol(fn_target, category=cat)
+                            auto_register_sensitive_tokens(data_obj, mapper)
 
-                            raw_env["data"] = _neutralize_data_recursive(raw_env.get("data", {}), mapper)
-                            raw_env["codebook"] = mapper.export_codebook()
-                        elif not neutral:
-                            raw_env.pop("codebook", None)
+                        raw_env["data"] = _neutralize_data_recursive(raw_env.get("data", {}), mapper)
+                        raw_env["codebook"] = mapper.export_codebook(lean=True)
+                    elif not neutral:
+                        raw_env.pop("codebook", None)
 
-                        if "execution_time_seconds" not in raw_env:
-                            raw_env["execution_time_seconds"] = raw_env.get("telemetry", {}).get("execution_time_seconds", 0.0)
-                        if "warnings" not in raw_env:
-                            raw_env["warnings"] = []
-                        if "mode" not in raw_env:
-                            raw_env["mode"] = "compact" if compact else "full"
-                        if budget is not None:
-                            raw_env = transform_response(raw_env, mode=raw_env.get("mode", "compact"), budget=budget)
-                        return raw_env
+                    norm_target = self._normalize_target(file)
+                    if norm_target and raw_env.get("success") and isinstance(raw_env.get("data"), dict):
+                        d = raw_env["data"]
+                        with self._lock:
+                            if norm_target not in self._session_cache:
+                                self._session_cache[norm_target] = {}
+                            if d.get("arch"):
+                                self._session_cache[norm_target]["arch"] = d["arch"]
+                            if d.get("bits"):
+                                self._session_cache[norm_target]["bits"] = d["bits"]
+
+                    if "execution_time_seconds" not in raw_env:
+                        raw_env["execution_time_seconds"] = raw_env.get("telemetry", {}).get("execution_time_seconds", 0.0)
+                    if "warnings" not in raw_env:
+                        raw_env["warnings"] = []
+                    eff_mode = "compact" if compact else "full"
+                    raw_env["mode"] = eff_mode
+                    raw_env = transform_response(raw_env, mode=eff_mode, budget=budget)
+                    if raw_env.get("success") and raw_env.get("error") is None:
+                        raw_env.pop("error", None)
+                    return raw_env
                 finally:
+                    if orch is not None:
+                        self._ingested_target_cache.release(orch)
                     _ORCHESTRATION_CONTEXT.active = prev_ctx
 
             elif tool_name == "rvs_agent_triage" and needs_orchestration:
                 NeutralBinaryOrchestrator = _get_neutral_orchestrator_cls()
                 prev_ctx = getattr(_ORCHESTRATION_CONTEXT, "active", False)
                 _ORCHESTRATION_CONTEXT.active = True
+                orch = None
                 try:
-                    with NeutralBinaryOrchestrator(file, default_abi=abi or "x86_64", harness=self) as orch:
-                        comp = orch.unified_target.get_component(abi=abi or "x86_64", comp_type=component_type or "elf_so") if orch.unified_target else None
-                        if comp is None and orch.unified_target and orch.unified_target.components:
-                            comp = orch.unified_target.components[0]
-                        active_path = comp.path if comp else file
-                        res = self.triage(active_path, compact=compact)
-                        if is_apk and isinstance(res.get("data"), dict):
-                            if "format" in res["data"] and res["data"]["format"] != "APK":
-                                res["data"]["component_format"] = res["data"]["format"]
-                            res["data"]["format"] = "APK"
-                            apk_res = self.apk_info(file, compact=compact)
-                            if apk_res.get("success") and isinstance(apk_res.get("data"), dict):
-                                apk_data = apk_res["data"]
-                                if "languages" in apk_data:
-                                    res["data"]["detected_languages"] = apk_data["languages"]
-                                if "langs" in apk_data:
-                                    res["data"]["langs"] = apk_data["langs"]
-                                elif "languages" in apk_data:
-                                    res["data"]["langs"] = [
-                                        l.get("language") for l in apk_data["languages"] if isinstance(l, dict)
-                                    ]
-                                apk_recs = apk_data.get("recommendations", [])
-                                _merge_apk_recommendations(res["data"], apk_recs, compact=compact)
-                        if neutral and res.get("success"):
-                            from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
-                            mapper = orch.token_mapper
-                            data_obj = res.get("data")
-                            if isinstance(data_obj, dict):
-                                for fn in data_obj.get("functions", []):
-                                    if isinstance(fn, dict) and fn.get("name"):
-                                        cat = classify_token(fn["name"])
-                                        if cat != TokenCategory.GENERAL:
-                                            mapper.sanitize_symbol(fn["name"], category=cat)
-                            res["data"] = _neutralize_data_recursive(res.get("data", {}), mapper)
-                            res["codebook"] = mapper.export_codebook()
-                            res["telemetry"] = {
-                                "execution_time_seconds": res.get("execution_time_seconds", 0.0),
-                                "target_type": orch.target_type.value,
-                                "active_component": comp.archive_relpath if comp else None,
-                            }
-                        elif not neutral:
-                            res.pop("codebook", None)
-                        if budget is not None:
-                            res = transform_response(res, mode=res.get("mode", "compact"), budget=budget)
-                        return res
+                    orch = self._ingested_target_cache.get_or_create(
+                        file, default_abi=abi or "x86_64", harness=self, orchestrator_cls=NeutralBinaryOrchestrator, acquire=True
+                    )
+                    comp = orch.unified_target.get_component(abi=abi or "x86_64", comp_type=component_type or "elf_so") if orch.unified_target else None
+                    if comp is None and orch.unified_target and orch.unified_target.components:
+                        comp = orch.unified_target.components[0]
+                    active_path = comp.path if comp else file
+                    res = self.triage(active_path, compact=compact)
+                    if is_apk and isinstance(res.get("data"), dict):
+                        if "format" in res["data"] and res["data"]["format"] != "APK":
+                            res["data"]["component_format"] = res["data"]["format"]
+                        res["data"]["format"] = "APK"
+                        apk_res = self.apk_info(file, compact=compact)
+                        if apk_res.get("success") and isinstance(apk_res.get("data"), dict):
+                            apk_data = apk_res["data"]
+                            if "languages" in apk_data:
+                                res["data"]["detected_languages"] = apk_data["languages"]
+                            if "langs" in apk_data:
+                                res["data"]["langs"] = apk_data["langs"]
+                            elif "languages" in apk_data:
+                                res["data"]["langs"] = [
+                                    l.get("language") for l in apk_data["languages"] if isinstance(l, dict)
+                                ]
+                            apk_recs = apk_data.get("recommendations", [])
+                            _merge_apk_recommendations(res["data"], apk_recs, compact=compact)
+                    if neutral and res.get("success"):
+                        from neutral_orchestrator.neutral_representation import classify_token, TokenCategory
+                        from neutral_orchestrator.orchestrator import auto_register_sensitive_tokens
+                        mapper = orch.token_mapper
+                        data_obj = res.get("data")
+                        if isinstance(data_obj, dict):
+                            auto_register_sensitive_tokens(data_obj, mapper)
+                        res["data"] = _neutralize_data_recursive(res.get("data", {}), mapper)
+                        res["codebook"] = mapper.export_codebook(lean=True)
+                        res["target_type"] = orch.target_type.value
+                        res["active_component"] = comp.archive_relpath if comp else None
+                        res["telemetry"] = {
+                            "execution_time_seconds": res.get("execution_time_seconds", 0.0),
+                        }
+                    elif not neutral:
+                        res.pop("codebook", None)
+
+                    norm_target = self._normalize_target(file)
+                    if norm_target and res.get("success") and isinstance(res.get("data"), dict):
+                        d = res["data"]
+                        with self._lock:
+                            if norm_target not in self._session_cache:
+                                self._session_cache[norm_target] = {}
+                            if d.get("arch"):
+                                self._session_cache[norm_target]["arch"] = d["arch"]
+                            if d.get("bits"):
+                                self._session_cache[norm_target]["bits"] = d["bits"]
+
+                    eff_mode = "compact" if compact else "full"
+                    res["mode"] = eff_mode
+                    res = transform_response(res, mode=eff_mode, budget=budget)
+                    if res.get("success") and res.get("error") is None:
+                        res.pop("error", None)
+                    return res
                 finally:
+                    if orch is not None:
+                        self._ingested_target_cache.release(orch)
                     _ORCHESTRATION_CONTEXT.active = prev_ctx
 
             if tool_name == "rvs_info":
@@ -7943,6 +8175,16 @@ if (fopenPtr) {
                     suggestion="Use get_tool_schemas() or tools/list to see available tool definitions.",
                 )
 
+        except FileNotFoundError as e:
+            return make_error_envelope(
+                command_str=f"{tool_name}",
+                target_str=str(file) if file else "",
+                code="FILE_NOT_FOUND",
+                message=str(e),
+                category="FILE_ERROR",
+                exit_code=EXIT_FILE_ERROR,
+                suggestion="Verify that the target file exists and is accessible.",
+            )
         except ValueError as e:
             return make_error_envelope(
                 command_str=f"{tool_name}",
@@ -7954,12 +8196,20 @@ if (fopenPtr) {
                 suggestion="Check parameter types and provide valid arguments.",
             )
         except Exception as e:
+            err_code = getattr(e, "code", "INTERNAL_ERROR")
+            err_cat = getattr(e, "category", "INTERNAL_ERROR")
+            err_exit = getattr(e, "exit_code", EXIT_INTERNAL_ERROR)
+            if isinstance(e, FileNotFoundError) or "not exist" in str(e).lower() or "not found" in str(e).lower():
+                err_code = "FILE_NOT_FOUND"
+                err_cat = "FILE_ERROR"
+                err_exit = EXIT_FILE_ERROR
             return make_error_envelope(
                 command_str=f"{tool_name}",
                 target_str=str(file) if file else "",
-                code="INTERNAL_ERROR",
+                code=err_code,
                 message=str(e),
-                exit_code=EXIT_INTERNAL_ERROR,
+                category=err_cat,
+                exit_code=err_exit,
             )
 
     # -------------------------------------------------------------------------
@@ -8467,7 +8717,7 @@ def main() -> None:
     needs_orchestration = bool(
         target_str
         and not is_help_or_version
-        and (is_apk or is_dex or neutral_flag or abi_val is not None or comp_type_val is not None)
+        and (is_apk or is_dex or (explicit_neutral is True) or abi_val is not None or comp_type_val is not None)
     )
 
     if needs_orchestration:

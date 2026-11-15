@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 from typing import Any, Dict, List
 
 from neutral_orchestrator.neutral_representation import (
+    ALL_ARCH_REGISTERS,
     CFGEdge,
     CFGEdgeType,
     CFGNode,
@@ -189,10 +191,15 @@ class TestBidirectionalRestoreAndCodebook(unittest.TestCase):
         book = self.mapper.export_codebook()
 
         self.assertIn("forward_map", book)
-        self.assertIn("forward", book)
         self.assertIn("reverse_map", book)
-        self.assertIn("reverse", book)
         self.assertIn("counters", book)
+        self.assertIn("metadata", book)
+
+        # Legacy compatibility aliases preserved when lean=False
+        book_full = self.mapper.export_codebook(lean=False)
+        self.assertIn("forward", book_full)
+        self.assertIn("reverse", book_full)
+        self.assertIn("token_metadata", book_full)
 
         # JSON serialization
         json_str = json.dumps(book)
@@ -615,6 +622,273 @@ class TestAlgorithmicPatternDetector(unittest.TestCase):
         patterns = cfg.detect_patterns()
         pattern_ids = [p["pattern_id"] for p in patterns]
         self.assertIn("ALG_REC_BRANCH", pattern_ids)
+
+
+class TestNeutralProductionUpgrade(unittest.TestCase):
+    """
+    Milestone M1 Production Upgrade Verification Suite:
+    - Advanced taxonomy lexicon classification & safety keywords
+    - CamelCase identifier segmentation
+    - Extended CPU register set (cr0-cr15, dr0-dr15, flags, cpsr, etc.)
+    - Invariant Rule 7 memory operand verification modulo registered symbolic tokens
+    - Dual addr / offset resolution in diagnose_invariants
+    - Round-trip bijective deneutralization over multi-level structures
+    - Lean telemetry envelope deduplication & compact disasm deduplication
+    - Lazy DEX parsing and universal token auto-registration
+    """
+
+    def setUp(self) -> None:
+        self.mapper = NeutralTokenMapper()
+
+    def test_classify_token_advanced_safety_keywords(self) -> None:
+        """Verify advanced safety and evasion keywords map to accurate TokenCategories."""
+        # Evasion
+        self.assertEqual(classify_token("rdtsc"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("rdtscp"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("query_performance_counter"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("dr0"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("debug_register"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("unhandled_exception_filter"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("anti_sandbox"), TokenCategory.EVASION)
+
+        # Crypto
+        self.assertEqual(classify_token("chacha20"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("poly1305"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("ed25519"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("curve25519"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("argon2"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("keccak"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("aes_gcm"), TokenCategory.CRYPTO)
+
+        # Auth
+        self.assertEqual(classify_token("oauth"), TokenCategory.AUTH)
+        self.assertEqual(classify_token("bearer_token"), TokenCategory.AUTH)
+        self.assertEqual(classify_token("jwt_secret"), TokenCategory.AUTH)
+        self.assertEqual(classify_token("session_token"), TokenCategory.AUTH)
+        self.assertEqual(classify_token("id_rsa"), TokenCategory.AUTH)
+
+        # System
+        self.assertEqual(classify_token("virtual_protect"), TokenCategory.SYSTEM)
+        self.assertEqual(classify_token("virtual_alloc"), TokenCategory.SYSTEM)
+        self.assertEqual(classify_token("write_process_memory"), TokenCategory.SYSTEM)
+        self.assertEqual(classify_token("create_remote_thread"), TokenCategory.SYSTEM)
+        self.assertEqual(classify_token("mprotect"), TokenCategory.SYSTEM)
+
+        # Gate
+        self.assertEqual(classify_token("trial_expired"), TokenCategory.GATE)
+        self.assertEqual(classify_token("tamper_proofing"), TokenCategory.GATE)
+        self.assertEqual(classify_token("anti_tamper"), TokenCategory.GATE)
+        self.assertEqual(classify_token("signature_verify"), TokenCategory.GATE)
+
+    def test_classify_token_camel_case_segmentation(self) -> None:
+        """Verify compound CamelCase identifiers are decomposed and correctly categorized."""
+        self.assertEqual(classify_token("checkPassword"), TokenCategory.AUTH)
+        self.assertEqual(classify_token("checkMasterPassword"), TokenCategory.AUTH)
+        self.assertEqual(classify_token("isDebuggerPresent"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("isVirtualMachinePresent"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("unhandledExceptionFilter"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("vectoredExceptionHandler"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("detectHardwareBreakpoint"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("antiAnalysisRoutine"), TokenCategory.EVASION)
+        self.assertEqual(classify_token("decisionGateBranch"), TokenCategory.GATE)
+        self.assertEqual(classify_token("decryptPayload"), TokenCategory.CRYPTO)
+        self.assertEqual(classify_token("virtualProtectMemory"), TokenCategory.SYSTEM)
+        self.assertEqual(classify_token("validateLicense"), TokenCategory.GATE)
+        self.assertEqual(classify_token("AES256KeyGen"), TokenCategory.CRYPTO)
+
+    def test_all_arch_registers_expansion(self) -> None:
+        """Verify control, debug, and condition flags exist in ALL_ARCH_REGISTERS."""
+        # x86 Control & Debug & Flags
+        for i in range(16):
+            self.assertIn(f"cr{i}", ALL_ARCH_REGISTERS)
+            self.assertIn(f"dr{i}", ALL_ARCH_REGISTERS)
+        self.assertIn("rflags", ALL_ARCH_REGISTERS)
+        self.assertIn("eflags", ALL_ARCH_REGISTERS)
+        self.assertIn("mxcsr", ALL_ARCH_REGISTERS)
+
+        # ARM Status & Control
+        self.assertIn("cpsr", ALL_ARCH_REGISTERS)
+        self.assertIn("spsr", ALL_ARCH_REGISTERS)
+        self.assertIn("fpsr", ALL_ARCH_REGISTERS)
+        self.assertIn("fpcr", ALL_ARCH_REGISTERS)
+        self.assertIn("daif", ALL_ARCH_REGISTERS)
+
+        # Register alteration on control registers detected
+        orig = [{"asm": "mov rax, cr0", "addr": "0x1000", "size": 3}]
+        altered = [{"asm": "mov rax, cr3", "addr": "0x1000", "size": 3}]
+        disc = diagnose_invariants(orig, altered)
+        self.assertTrue(any(d["rule"] == "REGISTER_ALTERATION" for d in disc))
+
+    def test_rule7_memory_operand_modulo_registered_symbolic_tokens(self) -> None:
+        """Verify Rule 7 recognizes registered symbolic tokens inside memory operands without violation."""
+        mapper = NeutralTokenMapper()
+        sym_tok = mapper.sanitize_symbol("enc_key", TokenCategory.CRYPTO)
+        self.assertEqual(sym_tok, "SYM_TOKEN_FUNC_0001")
+
+        orig = [{"asm": "mov rax, qword [rip + sym.enc_key]", "addr": "0x1000", "size": 7}]
+        neut = [{"asm": f"mov rax, qword [rip + sym.{sym_tok}]", "addr": "0x1000", "size": 7}]
+
+        # Without codebook: detects alteration or symbolic pattern
+        disc_no_cb = diagnose_invariants(orig, neut)
+        # With codebook: 100% clean, zero invariant discrepancies
+        disc_with_cb = diagnose_invariants(orig, neut, codebook=mapper)
+        self.assertEqual(len(disc_with_cb), 0, f"Expected 0 discrepancies with codebook, got: {disc_with_cb}")
+
+        # Non-symbolic structural corruption inside memory operands is still flagged
+        neut_corrupt = [{"asm": "mov rax, qword [rip + 0x20]", "addr": "0x1000", "size": 7}]
+        disc_corrupt = diagnose_invariants(orig, neut_corrupt, codebook=mapper)
+        self.assertTrue(any(d["rule"] == "MEMORY_OPERAND_ALTERATION" for d in disc_corrupt))
+
+    def test_diagnose_invariants_registered_tokens_contract(self) -> None:
+        """Verify diagnose_invariants accepts registered_tokens and validates Rule 7 even without codebook."""
+        # 1. Empty disassembly with registered_tokens set
+        res = diagnose_invariants([], [], registered_tokens={"sym.SYM_0001"})
+        self.assertEqual(res, [])
+
+        # 2. Memory operand with registered_tokens set (no codebook)
+        orig = [{"asm": "mov rax, [rip + my_func]", "addr": 0x1000, "size": 7}]
+        neut_valid = [{"asm": "mov rax, [rip + sym.SYM_0001]", "addr": 0x1000, "size": 7}]
+        disc = diagnose_invariants(orig, neut_valid, registered_tokens={"sym.SYM_0001"})
+        self.assertEqual(disc, [], f"Expected 0 discrepancies, got: {disc}")
+
+        # 3. registered_tokens as List and Dict
+        disc_list = diagnose_invariants(orig, neut_valid, registered_tokens=["sym.SYM_0001"])
+        self.assertEqual(disc_list, [])
+
+        disc_dict = diagnose_invariants(orig, neut_valid, registered_tokens={"reverse_map": {"sym.SYM_0001": "my_func"}})
+        self.assertEqual(disc_dict, [])
+
+        # 4. Unregistered token fails Rule 7
+        neut_unreg = [{"asm": "mov rax, [rip + sym.SYM_9999]", "addr": 0x1000, "size": 7}]
+        disc_unreg = diagnose_invariants(orig, neut_unreg, registered_tokens={"sym.SYM_0001"})
+        self.assertTrue(any(d["rule"] == "MEMORY_OPERAND_ALTERATION" for d in disc_unreg))
+
+    def test_diagnose_invariants_short_symbolic_tokens_in_memory_operands(self) -> None:
+        """Verify SYMBOLIC_TARGET_PATTERN matches short symbolic token forms (sym.SYM_0001, str.STR_0002)."""
+        orig_str = [{"asm": "lea rbx, [r12 + 8*rax + my_str]", "addr": 0x1000, "size": 8}]
+        neut_str = [{"asm": "lea rbx, [r12 + 8*rax + str.STR_0002]", "addr": 0x1000, "size": 8}]
+        disc = diagnose_invariants(orig_str, neut_str, registered_tokens={"str.STR_0002"})
+        self.assertEqual(disc, [])
+
+        # Unregistered short form token
+        neut_corrupt_str = [{"asm": "lea rbx, [r12 + 8*rax + str.STR_9999]", "addr": 0x1000, "size": 8}]
+        disc_corrupt = diagnose_invariants(orig_str, neut_corrupt_str, registered_tokens={"str.STR_0002"})
+        self.assertTrue(any(d["rule"] == "MEMORY_OPERAND_ALTERATION" for d in disc_corrupt))
+
+    def test_diagnose_invariants_dual_addr_and_offset_keys(self) -> None:
+        """Verify diagnose_invariants accurately inspects radare2 'offset' when 'addr' is absent."""
+        orig = [{"asm": "nop", "offset": "0x401000", "size": 1}]
+        neut_matching = [{"asm": "nop", "offset": "0x401000", "size": 1}]
+        self.assertEqual(len(diagnose_invariants(orig, neut_matching)), 0)
+
+        # Address drift detected on offset key
+        neut_drift = [{"asm": "nop", "offset": "0x401005", "size": 1}]
+        disc = diagnose_invariants(orig, neut_drift)
+        self.assertTrue(any(d["rule"] == "ADDRESS_DRIFT" for d in disc))
+
+    def test_bijective_codebook_roundtrip_lossless_complex_payload(self) -> None:
+        """Verify deep nested payload with functions, decompilation, and strings deneutralizes 100% loss-free."""
+        from neutral_orchestrator.orchestrator import auto_register_sensitive_tokens
+        from rvs_agent_harness import _neutralize_data_recursive
+
+        raw_payload = {
+            "format": "elf",
+            "functions": [
+                {"name": "check_admin_pin", "addr": "0x401180"},
+                {"name": "sym.validate_license_key", "addr": "0x401200"},
+            ],
+            "strings": [
+                {"string": "K3Y-V4L1D-2026", "offset": 8200},
+                {"string": "Enter master password:", "offset": 8250},
+            ],
+            "decompilation": "int check_admin_pin(int pin) { if (pin == 7788) return 1; return 0; }",
+            "blocks": [
+                {
+                    "addr": "0x401180",
+                    "instructions": [
+                        {"asm": "cmp edi, 0x1e6c", "operands": "edi, 0x1e6c"},
+                        {"asm": "jne 0x401190", "operands": "0x401190"},
+                    ],
+                }
+            ],
+            "metadata": {"category": "test", "active": True, "count": 42},
+        }
+
+        mapper = NeutralTokenMapper()
+        auto_register_sensitive_tokens(raw_payload, mapper)
+
+        # Neutralize
+        neut_payload = _neutralize_data_recursive(raw_payload, mapper)
+        self.assertNotEqual(neut_payload["functions"][0]["name"], "check_admin_pin")
+        self.assertTrue(neut_payload["functions"][0]["name"].startswith("SYM_TOKEN_FUNC_"))
+
+        # Lean codebook export
+        book = mapper.export_codebook(lean=True)
+        self.assertNotIn("forward", book)
+        self.assertNotIn("reverse", book)
+        self.assertIn("forward_map", book)
+        self.assertIn("reverse_map", book)
+
+        # Restore in fresh mapper
+        fresh_mapper = NeutralTokenMapper()
+        fresh_mapper.import_codebook(book)
+        restored_payload = fresh_mapper.deneutralize_data(neut_payload)
+
+        # 100% loss-free equivalence
+        self.assertEqual(restored_payload, raw_payload)
+
+    def test_telemetry_envelope_deduplication(self) -> None:
+        """Verify telemetry envelope contains lean fields without root-level duplicates."""
+        from neutral_orchestrator.orchestrator import NeutralBinaryOrchestrator
+        target = "tests/fixtures/auth_gate_elf64"
+        with NeutralBinaryOrchestrator(target) as orch:
+            res = orch.query("info")
+            self.assertTrue(res.get("success"))
+            self.assertIn("target_type", res)
+            self.assertIn("active_component", res)
+            self.assertIn("telemetry", res)
+            # Lean telemetry must NOT duplicate target_type or active_component
+            self.assertNotIn("target_type", res["telemetry"])
+            self.assertNotIn("active_component", res["telemetry"])
+            self.assertIn("execution_time_seconds", res["telemetry"])
+
+    def test_compact_disasm_instruction_deduplication(self) -> None:
+        """Verify compact disasm omits duplicate instructions array when blocks are present."""
+        from neutral_orchestrator.orchestrator import NeutralBinaryOrchestrator
+        target = "tests/fixtures/auth_gate_elf64"
+        with NeutralBinaryOrchestrator(target) as orch:
+            res_compact = orch.query("disasm", function_or_addr="main", compact=True)
+            self.assertTrue(res_compact.get("success"))
+            data_compact = res_compact.get("data", {})
+            self.assertTrue(len(data_compact.get("blocks", [])) > 0)
+            # In compact mode with blocks, duplicated top-level instructions must be omitted
+            self.assertNotIn("instructions", data_compact)
+
+            res_full = orch.query("disasm", function_or_addr="main", compact=False)
+            self.assertTrue(res_full.get("success"))
+            data_full = res_full.get("data", {})
+            self.assertIn("instructions", data_full)
+
+    def test_lazy_dalvik_dex_parsing_info_vs_strings(self) -> None:
+        """Verify DalvikMetadataExtractor skips string table parsing when parse_strings=False."""
+        from neutral_orchestrator.orchestrator import DalvikMetadataExtractor
+        dex_fixture = Path("tests/fixtures/sample_classes.dex")
+        if not dex_fixture.exists():
+            from tests.fixtures_builder import DalvikDexBuilder
+            dex_bytes = DalvikDexBuilder().add_class("LTest;").build()
+            dex_fixture.write_bytes(dex_bytes)
+
+        # Lazy info extraction: parse_strings=False
+        meta_lazy = DalvikMetadataExtractor.extract_metadata(dex_fixture, parse_strings=False)
+        self.assertTrue(meta_lazy.get("valid"))
+        self.assertFalse(meta_lazy.get("strings_parsed"))
+        self.assertEqual(len(meta_lazy.get("strings", [])), 0)
+
+        # Full strings extraction: parse_strings=True
+        meta_full = DalvikMetadataExtractor.extract_metadata(dex_fixture, parse_strings=True)
+        self.assertTrue(meta_full.get("valid"))
+        self.assertTrue(meta_full.get("strings_parsed"))
+        self.assertGreaterEqual(len(meta_full.get("strings", [])), 0)
 
 
 if __name__ == "__main__":

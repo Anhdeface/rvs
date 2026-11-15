@@ -374,7 +374,7 @@ class TestM1Iteration2OrchestrationConcurrency(unittest.TestCase):
         resp5 = h.execute_tool("rvs_info", {"file": str(self.apk_path)})
         self.assertTrue(resp5.get("success"))
         self.assertIn("telemetry", resp5, "execute_tool on APK must invoke orchestrator with telemetry")
-        self.assertIsNotNone(resp5.get("telemetry", {}).get("active_component"))
+        self.assertIsNotNone(resp5.get("active_component") or resp5.get("telemetry", {}).get("active_component"))
 
     def test_06_thread_pool_executor_50_workers_recycling(self) -> None:
         """

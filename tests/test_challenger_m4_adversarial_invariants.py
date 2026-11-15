@@ -234,8 +234,14 @@ class TestAdversarialTokenBudgetMonotonicity(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         h = RvsHarness()
-        dis = h.execute_tool("rvs_disasm", {"file": "crackme_case", "target": "main", "compact": False})
+        dis = h.execute_tool("rvs_disasm", {"file": "crackme_case", "target": "main", "compact": False, "neutral": False})
         cls.crackme_main_payload = dis
+        blks = dis.get("data", {}).get("blocks", [])
+        raw_addr = blks[0].get("addr_hex") or blks[0].get("addr") if blks else "0x11e0"
+        if isinstance(raw_addr, int):
+            cls.expected_entry = hex(raw_addr)
+        else:
+            cls.expected_entry = str(raw_addr)
 
     def test_adv_07_dense_budget_monotonicity_crackme_main_200_to_600(self) -> None:
         """Dense budget sweep B in [200..600] on crackme_case main:
@@ -267,8 +273,8 @@ class TestAdversarialTokenBudgetMonotonicity(unittest.TestCase):
                 if isinstance(blocks, list) and len(blocks) > 0:
                     entry_addr = blocks[0].get("addr")
                     self.assertEqual(
-                        entry_addr, "0x11e0",
-                        f"B={b}: Entry block anchor lost! Expected 0x11e0, got {entry_addr}",
+                        entry_addr, self.expected_entry,
+                        f"B={b}: Entry block anchor lost! Expected {self.expected_entry}, got {entry_addr}",
                     )
 
             prev_tokens = tok
@@ -297,8 +303,8 @@ class TestAdversarialTokenBudgetMonotonicity(unittest.TestCase):
                     blocks = data.get("blocks")
                     if isinstance(blocks, list) and len(blocks) > 0:
                         self.assertEqual(
-                            blocks[0].get("addr"), "0x11e0",
-                            f"B={b_val}: Entry anchor 0x11e0 lost!",
+                            blocks[0].get("addr"), self.expected_entry,
+                            f"B={b_val}: Entry anchor {self.expected_entry} lost!",
                         )
 
     def test_adv_09_synthetic_cfg_dense_monotonicity_multi_seeds(self) -> None:

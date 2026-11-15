@@ -361,7 +361,7 @@ class TestUniversalToolSchemas(TestChallengerBase):
 
     def test_01_canonical_tools_count_and_completeness(self):
         """Verify CANONICAL_TOOLS contains all expected tools with valid definitions."""
-        self.assertEqual(len(CANONICAL_TOOLS), 44)
+        self.assertEqual(len(CANONICAL_TOOLS), 48)
         tool_names = [t["name"] for t in CANONICAL_TOOLS]
         for expected_tool in self.EXPECTED_16_TOOLS:
             self.assertIn(expected_tool, tool_names)
@@ -509,15 +509,24 @@ class TestPythonApiStress(TestChallengerBase):
         self.assertIn("symbols", r8["data"])
 
         # 9. patch_instruction (NOP sled)
-        r9 = self.harness.patch_instruction(temp_bin, addr="0x13d2", nop_bytes=6, backup=True)
+        s_resp = self.harness.strings(temp_bin, min_len=4, compact=True)
+        s_list = [s.get("string", "") for s in s_resp.get("data", {}).get("strings", [])] if s_resp.get("success") else []
+        has_serial = any("Enter serial" in s or "Valid serial" in s for s in s_list)
+        p_addr = "0x13d2" if has_serial else "0x11e5"
+        p_bytes = 6 if has_serial else 4
+        p_hex = "e9a200000090" if has_serial else "90909090"
+        old_s = "Enter serial:" if has_serial else "STATUS_SYSTEM_LOCKED"
+        new_s = "Passcode?   :" if has_serial else "STATUS_SYSTEM_ACTIVE"
+
+        r9 = self.harness.patch_instruction(temp_bin, addr=p_addr, nop_bytes=p_bytes, backup=True)
         self.assertTrue(r9.get("success"), f"patch_instruction failed: {r9}")
         self.assertTrue(r9["data"].get("verified"))
 
         # 10. patch_string
         r10 = self.harness.patch_string(
             temp_bin,
-            old_string="Enter serial:",
-            new_string="Passcode?   :",
+            old_string=old_s,
+            new_string=new_s,
             pad_null=True,
             backup=True,
         )
@@ -525,7 +534,7 @@ class TestPythonApiStress(TestChallengerBase):
         self.assertTrue(r10["data"].get("verified"))
 
         # 11. patch_bytes
-        r11 = self.harness.patch_bytes(temp_bin, addr="0x13d2", hex_bytes="e9a200000090", backup=True)
+        r11 = self.harness.patch_bytes(temp_bin, addr=p_addr, hex_bytes=p_hex, backup=True)
         self.assertTrue(r11.get("success"), f"patch_bytes failed: {r11}")
         self.assertTrue(r11["data"].get("verified"))
 
@@ -539,7 +548,7 @@ class TestPythonApiStress(TestChallengerBase):
             "name": "challenger_multi_patch",
             "dry_run": False,
             "steps": [
-                {"type": "bytes", "addr": "0x13d2", "hex": "909090909090"}
+                {"type": "bytes", "addr": p_addr, "hex": p_hex}
             ],
         }
         r13 = self.harness.patch_plan(temp_bin, plan=plan, dry_run=False)

@@ -50,11 +50,29 @@ TAXONOMY_LEXICON: Dict[TokenCategory, Dict[str, Any]] = {
             "being_debugged", "hook", "inline_hook", "tamper", "frida", "frida_server",
             "gumjs", "xposed", "cydia", "substrate", "seccomp", "sys_ptrace",
             "rootbeer", "magisk", "daemonsu", "integrity_check", "debugger",
+            "rdtsc", "rdtscp", "query_performance_counter", "get_tick_count",
+            "dr0", "dr1", "dr2", "dr3", "dr6", "dr7", "debug_register", "debug_registers",
+            "unhandled_exception_filter", "vectored_exception_handler", "veh", "seh",
+            "set_unhandled_exception_filter", "nt_query_information_process",
+            "process_debug_port", "process_debug_flags", "check_remote_debugger_present",
+            "checkremotedebuggerpresent", "output_debug_string", "winedbg",
+            "wine_get_unix_file_name", "cuckoo", "anti_vm", "antivm", "anti_sandbox",
+            "antisandbox", "sandbox_detected", "vm_detected", "qemu", "vmware", "vbox",
+            "virtualbox", "virtual_machine", "virtualmachine",
+            "is_virtual_machine_present", "isvirtualmachinepresent",
+            "hardware_breakpoint", "software_breakpoint", "memory_breakpoint",
+            "anti_analysis", "anti_disasm", "anti_hook", "obfuscated", "packer",
+            "upx", "themida", "vmp", "vmprotect",
         ],
         "regex_patterns": [
             r"(?i)\b(?:antidebug|anti_debug|is_?debugger_?present|debugger_?detected|debugger)\b",
             r"(?i)\b(?:ptrace|traceme|tracerpid|seccomp)\b",
             r"(?i)\b(?:frida|xposed|cydia|substrate|hook|tamper)\b",
+            r"(?i)\b(?:rdtsc|rdtscp|query_?performance_?counter|get_?tick_?count)\b",
+            r"(?i)\b(?:dr[0-7]|debug_?registers?|hardware_?breakpoint|memory_?breakpoint)\b",
+            r"(?i)\b(?:anti_?vm|anti_?sandbox|anti_?analysis|vm_?detect(?:ed)?|sandbox_?detect(?:ed)?)\b",
+            r"(?i)\b(?:is_?)?virtual_?machine(?:_?present)?\b",
+            r"(?i)\b(?:vectored_?exception|unhandled_?exception|nt_?query_?information_?process)\b",
         ],
         "weight": 15,
     },
@@ -65,12 +83,22 @@ TAXONOMY_LEXICON: Dict[TokenCategory, Dict[str, Any]] = {
             "hash", "sha256", "sha1", "md5", "hmac", "aes", "des", "rc4", "xor_key",
             "encrypted_payload", "decrypted_buffer", "payload", "shellcode",
             "flag", "ciphertext", "plaintext", "k3y",
+            "chacha20", "poly1305", "blowfish", "twofish", "rsa", "ecdsa", "ed25519",
+            "curve25519", "ecc", "argon2", "pbkdf2", "scrypt", "keccak", "blake2",
+            "blake2b", "blake2s", "sha3", "sha384", "sha512", "sbox", "substitution_box",
+            "keystream", "initialization_vector", "init_vector", "stream_cipher",
+            "block_cipher", "symmetric_key", "asymmetric_key", "public_key", "private_key",
+            "signature", "verify_signature", "digest", "mac_tag", "auth_tag",
+            "aes_gcm", "aes_cbc", "aes_ecb", "aes_ctr",
         ],
         "regex_patterns": [
             r"(?i)\b(?:decrypt|encrypt|cipher|payload|shellcode)\b",
-            r"(?i)\b(?:xor_key|secret_key|private_key|init_vector|iv)\b",
+            r"(?i)\b(?:xor_key|secret_key|private_key|public_key|init_vector|iv)\b",
             r"(?i)FLAG\{[^}]+\}",
             r"(?i)K3Y-[A-Z0-9\-]+",
+            r"(?i)\b(?:chacha20|poly1305|ed25519|curve25519|argon2|pbkdf2|scrypt|keccak|blake2[bs]?)\b",
+            r"(?i)\b(?:sbox|substitution_?box|keystream|initialization_?vector|init_?vector)\b",
+            r"(?i)\b(?:aes_(?:gcm|cbc|ctr|ecb)|sha(?:3|384|512))\b",
         ],
         "weight": 12,
     },
@@ -81,11 +109,20 @@ TAXONOMY_LEXICON: Dict[TokenCategory, Dict[str, Any]] = {
             "access_level", "admin", "administrator", "root_user", "superuser",
             "login", "logon", "authenticate", "authentication", "auth", "privilege",
             "secret_pin", "master_password", "user_pass",
+            "oauth", "oauth2", "bearer_token", "access_token", "refresh_token",
+            "jwt_secret", "session_token", "session_id", "session_key",
+            "id_rsa", "id_ecdsa", "id_ed25519", "keystore", "keychain", "shadow", "sudoers",
+            "biometric", "fingerprint", "face_id", "auth_token", "authenticator",
+            "totp", "hotp", "mfa", "2fa", "two_factor", "passphrase",
+            "user_credential", "client_secret", "api_secret",
         ],
         "regex_patterns": [
             r"(?i)\b(?:auth|pass(?:word|wd)?|pwd|pin|cred(?:ential)?s?|login|token)\b",
             r"(?i)\b(?:admin|access_level|super_?user)\b",
             r"(?i)bearer\s+[a-zA-Z0-9_\-\.]+",
+            r"(?i)\b(?:oauth(?:2)?|access_?token|refresh_?token|jwt_?secret|session_?token)\b",
+            r"(?i)\b(?:id_rsa|id_ecdsa|id_ed25519|keystore|keychain|shadow|sudoers)\b",
+            r"(?i)\b(?:biometric|fingerprint|face_?id|totp|hotp|two_?factor|2fa|mfa)\b",
         ],
         "weight": 10,
     },
@@ -95,12 +132,26 @@ TAXONOMY_LEXICON: Dict[TokenCategory, Dict[str, Any]] = {
             "procfs", "proc_status", "/proc/self/status", "/proc/self/maps",
             "/proc/self/mem", "/system/bin/su", "/system/xbin/su", "/data/local/tmp",
             "/dev/urandom", "ld_preload", "ro_debuggable",
+            "virtual_protect", "virtualprotect", "virtual_alloc", "virtualalloc",
+            "write_process_memory", "writeprocessmemory", "read_process_memory",
+            "readprocessmemory", "create_remote_thread", "createremotethread",
+            "queue_user_apc", "queueuserapc", "set_thread_context", "setthreadcontext",
+            "get_thread_context", "getthreadcontext", "mprotect", "mmap",
+            "ptrace_peektext", "ptrace_poketext", "ptrace_peekdata", "ptrace_pokedata",
+            "load_library", "loadlibrary", "get_proc_address", "getprocaddress",
+            "dlopen", "dlsym", "fork", "execve", "kill", "sigaction",
+            "shellcode", "exploit", "injection", "inject", "payload",
+            "rop_gadget", "privilege_escalation", "rootkit", "c2", "c2_server",
+            "beacon", "exfiltrate", "keylogger", "stealer",
         ],
         "regex_patterns": [
             r"/proc/(?:self|\d+)/(?:status|maps|mem|cmdline|stat)",
             r"/(?:system|sbin|vendor)/[a-zA-Z0-9_\-/]*(?:su|busybox)",
             r"/data/local/tmp(?:/[a-zA-Z0-9_\-\.]+)?",
             r"(?i)\b(?:privileged_exec|procfs_check)\b",
+            r"(?i)\b(?:virtual_?protect|virtual_?alloc|write_?process_?memory|read_?process_?memory)\b",
+            r"(?i)\b(?:create_?remote_?thread|queue_?user_?apc|set_?thread_?context|mprotect)\b",
+            r"(?i)\b(?:shellcode|exploit|rop_?gadget|privilege_?escalation|rootkit|keylogger|stealer)\b",
         ],
         "weight": 9,
     },
@@ -111,11 +162,21 @@ TAXONOMY_LEXICON: Dict[TokenCategory, Dict[str, Any]] = {
             "success", "failure", "grant", "reject", "crackme", "serial", "keygen",
             "license", "license_key", "trial", "registration", "tamper_detected",
             "access_granted", "access_denied", "bad_pin", "bad_password",
+            "trial_expired", "trialexpired", "subscription", "tamper_proofing",
+            "tamperproofing", "anti_tamper", "antitamper", "signature_verify",
+            "signatureverify", "checksum_verify", "checksumverify",
+            "hardware_id", "hwid", "dongle", "copy_protection", "copyprotection",
+            "activation", "activate", "deactivate", "eval_license",
+            "license_expired", "license_valid", "gate_open", "gate_closed",
+            "predicate_check", "decision_gate", "condition_branch", "bypass", "unprotect",
         ],
         "regex_patterns": [
             r"(?i)\b(?:check|verify|validate|is_valid|allowed|denied)\b",
             r"(?i)\b(?:auth_success|auth_fail|access_granted|access_denied)\b",
             r"(?i)\b(?:serial|crackme|license|keygen|registration)\b",
+            r"(?i)\b(?:trial_?expired|anti_?tamper|tamper_?proof(?:ing)?)\b",
+            r"(?i)\b(?:signature_?verify|checksum_?verify|hardware_?id|hwid|copy_?protection)\b",
+            r"(?i)\b(?:license_?expired|license_?valid|decision_?gate|predicate_?check)\b",
         ],
         "weight": 8,
     },
@@ -137,29 +198,62 @@ CATEGORY_PRIORITY = [
 ]
 
 
+def _extract_lexical_words(text: str) -> Set[str]:
+    """
+    Extract words segmented by both non-alphanumeric boundaries and CamelCase boundaries.
+    For example: 'checkMasterPassword' -> {'checkmasterpassword', 'check', 'master', 'password'}
+    'isDebuggerPresent' -> {'isdebuggerpresent', 'is', 'debugger', 'present'}
+    'AES256KeyGen' -> {'aes256keygen', 'aes', '256', 'key', 'gen'}
+    """
+    words: Set[str] = set()
+    raw_parts = [p for p in re.split(r'[^a-zA-Z0-9]+', text) if p]
+    for part in raw_parts:
+        words.add(part.lower())
+        # CamelCase splitting: handles uppercase sequences (acronyms), lowercase, and digits
+        camel_parts = re.findall(r'[A-Z]+(?=[A-Z][a-z]|\d|\b)|[A-Z]?[a-z]+|[0-9]+', part)
+        lower_cps = [cp.lower() for cp in camel_parts if cp]
+        for cp in lower_cps:
+            words.add(cp)
+        # Rejoin consecutive word subsets/n-grams to match compound phrases
+        n = len(lower_cps)
+        for i in range(n):
+            accum = lower_cps[i]
+            for j in range(i + 1, n):
+                accum += lower_cps[j]
+                words.add(accum)
+    return words
+
+
 def classify_token(text: str) -> TokenCategory:
     """
     Deterministically scores and classifies an unknown token or string into a TokenCategory.
     Enforces the domain specificity priority matrix:
     EVASION > CRYPTO > AUTH > SYSTEM > GATE > GENERAL.
+    Applies both delimiter segmentation and CamelCase decomposition.
     """
     if not text:
         return TokenCategory.GENERAL
 
     lower_text = text.lower()
-    words = set(re.split(r'[^a-zA-Z0-9]+', lower_text))
+    clean_lower_text = re.sub(r'[^a-z0-9]', '', lower_text)
+    words = _extract_lexical_words(text)
     scores: Dict[TokenCategory, int] = {cat: 0 for cat in TokenCategory}
 
     for cat, rules in TAXONOMY_LEXICON.items():
         weight = rules.get("weight", 1)
         for kw in rules.get("keywords", []):
             kw_lower = kw.lower()
+            kw_clean = kw_lower.replace("_", "")
             if len(kw_lower) <= 3:
                 # Require whole word boundary for short keywords (e.g. 'su', 'pin', 'pwd', 'iv')
                 if kw_lower in words or re.search(rf"\b{re.escape(kw_lower)}\b", lower_text):
                     scores[cat] += weight
             else:
-                if kw_lower in lower_text or kw_lower in words:
+                if (
+                    kw_lower in lower_text
+                    or kw_lower in words
+                    or ("_" in kw_lower and (kw_clean in lower_text or kw_clean in clean_lower_text or kw_clean in words))
+                ):
                     scores[cat] += weight
         for pattern in rules.get("regex_patterns", []):
             if re.search(pattern, text):
@@ -220,7 +314,7 @@ class BijectiveCodebook:
 
     def __init__(self, session_id: Optional[str] = None) -> None:
         self.session_id: str = session_id or f"sess_{uuid.uuid4().hex[:8]}"
-        self.created_at: str = datetime.now(timezone.utc).isoformat()
+        self.created_at: str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.forward_map: Dict[str, str] = {}
         self.reverse_map: Dict[str, str] = {}
         self.metadata: Dict[str, Dict[str, Any]] = {}
@@ -348,21 +442,24 @@ class BijectiveCodebook:
 
             return self._neutralize_regex.sub(lambda match: self.forward_map[match.group(0)], text)
 
-    def export_codebook(self) -> Dict[str, Any]:
-        """Exports codebook in dual-compatible JSON serializable schema."""
+    def export_codebook(self, lean: bool = True) -> Dict[str, Any]:
+        """Exports codebook in JSON serializable schema without redundant dictionary duplicates when lean=True."""
         with self._lock:
-            return {
+            counters_dict = {k: v for k, v in self.counters.items() if v > 0} if lean else dict(self.counters)
+            cb = {
                 "codebook_version": "1.0.0",
                 "session_id": self.session_id,
                 "created_at": self.created_at,
                 "forward_map": dict(self.forward_map),
                 "reverse_map": dict(self.reverse_map),
-                "forward": dict(self.forward_map),
-                "reverse": dict(self.reverse_map),
                 "metadata": dict(self.metadata),
-                "token_metadata": dict(self.metadata),
-                "counters": dict(self.counters),
+                "counters": counters_dict,
             }
+            if not lean:
+                cb["forward"] = dict(self.forward_map)
+                cb["reverse"] = dict(self.reverse_map)
+                cb["token_metadata"] = dict(self.metadata)
+            return cb
 
     def import_codebook(self, codebook: Dict[str, Any]) -> None:
         """Imports and reconciles codebook state across sessions."""
@@ -579,9 +676,9 @@ class NeutralTokenMapper:
         """Replaces raw symbols in text with neutralized tokens."""
         return self._codebook.neutralize(text)
 
-    def export_codebook(self) -> Dict[str, Any]:
+    def export_codebook(self, lean: bool = True) -> Dict[str, Any]:
         """Exports session codebook as a dictionary."""
-        return self._codebook.export_codebook()
+        return self._codebook.export_codebook(lean=lean)
 
     def import_codebook(self, codebook: Dict[str, Any]) -> None:
         """Imports and reconciles codebook into current session."""
@@ -602,21 +699,23 @@ class NeutralTokenMapper:
         original: Any,
         neutralized: Any,
         strict: bool = False,
+        registered_tokens: Optional[Union[Set[str], List[str], Dict[str, Any]]] = None,
     ) -> bool:
         """
         Rigorous verification engine comparing original disassembly vs neutralized disassembly.
         Asserts that opcodes, registers, memory operands, immediate constants, addresses,
         and instruction counts are preserved 100% identically.
         """
-        return verify_invariants(original, neutralized, strict=strict, codebook=self._codebook)
+        return verify_invariants(original, neutralized, strict=strict, codebook=self._codebook, registered_tokens=registered_tokens)
 
     def diagnose_invariants(
         self,
         original: Any,
         neutralized: Any,
+        registered_tokens: Optional[Union[Set[str], List[str], Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Returns detailed discrepancies using session codebook."""
-        return diagnose_invariants(original, neutralized, codebook=self._codebook)
+        return diagnose_invariants(original, neutralized, codebook=self._codebook, registered_tokens=registered_tokens)
 
 
 def deneutralize_data(
@@ -698,6 +797,10 @@ ALL_ARCH_REGISTERS: Set[str] = {
     *(f"zmm{i}" for i in range(32)),
     *(f"k{i}" for i in range(8)),
     "cs", "ds", "es", "fs", "gs", "ss",
+    # x86 Control, Debug, and Status/Flag Registers
+    *(f"cr{i}" for i in range(16)),
+    *(f"dr{i}" for i in range(16)),
+    "rflags", "eflags", "flags", "mxcsr",
     # ARM / AArch64 General Purpose & Aliases
     *(f"x{i}" for i in range(31)), "sp", "lr", "pc", "xzr",
     *(f"w{i}" for i in range(31)), "wzr",
@@ -710,6 +813,8 @@ ALL_ARCH_REGISTERS: Set[str] = {
     *(f"d{i}" for i in range(32)),
     *(f"q{i}" for i in range(32)),
     *(f"v{i}" for i in range(32)),
+    # ARM Status, Control, and Exception Flag Registers
+    "cpsr", "spsr", "fpsr", "fpcr", "daif",
 }
 
 ARM_SHIFT_MODIFIERS: Set[str] = {
@@ -732,7 +837,7 @@ X86_BRANCH_MNEMONICS: Set[str] = {
 }
 
 SYMBOLIC_TARGET_PATTERN = re.compile(
-    r'\b(?:sym\.)?(?:SYM_TOKEN_[A-Za-z0-9_]+|ADDR_REF_[A-Za-z0-9_]+|PREDICATE_GATE_[A-Za-z0-9_]+|SYM_STR_[A-Za-z0-9_]+)\b'
+    r'\b(?:sym\.|str\.)?(?:SYM_TOKEN_[A-Za-z0-9_]+|ADDR_REF_[A-Za-z0-9_]+|PREDICATE_GATE_[A-Za-z0-9_]+|SYM_STR_[A-Za-z0-9_]+|SYM_\d+|STR_\d+|GATE_\d+|ADDR_\d+|DATA_\d+|FUNC_\d+)\b'
 )
 
 
@@ -907,16 +1012,62 @@ def normalize_disassembly_input(payload: Any) -> Tuple[List[Dict[str, Any]], Lis
     return blocks, instructions
 
 
+def _restore_with_codebook(text: str, codebook: Optional[Any]) -> str:
+    """Restores neutralized text back to original symbols using codebook or dictionary."""
+    if not text or codebook is None:
+        return text
+    if hasattr(codebook, "restore") and callable(codebook.restore):
+        return codebook.restore(text)
+    if hasattr(codebook, "_codebook") and hasattr(codebook._codebook, "restore") and callable(codebook._codebook.restore):
+        return codebook._codebook.restore(text)
+    if isinstance(codebook, dict):
+        rev = codebook.get("reverse_map") or codebook.get("reverse") or codebook
+        if isinstance(rev, dict):
+            # Sort keys by descending length for boundary substitution
+            keys = sorted([k for k in rev.keys() if isinstance(k, str)], key=len, reverse=True)
+            res = text
+            for k in keys:
+                if k in res:
+                    res = res.replace(k, str(rev[k]))
+            return res
+    return text
+
+
 def diagnose_invariants(
     original: Any,
     neutralized: Any,
     codebook: Optional[Any] = None,
+    registered_tokens: Optional[Union[Set[str], List[str], Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Compares original vs neutralized disassembly and returns list of discrepancies."""
     orig_blocks, orig_insts = normalize_disassembly_input(original)
     neut_blocks, neut_insts = normalize_disassembly_input(neutralized)
 
-    registered_tokens = _extract_registered_tokens(codebook)
+    known_tokens: Optional[Set[str]] = None
+    if registered_tokens is not None:
+        if isinstance(registered_tokens, set):
+            known_tokens = set(registered_tokens)
+        elif isinstance(registered_tokens, (list, tuple)):
+            known_tokens = set(registered_tokens)
+        elif isinstance(registered_tokens, dict):
+            if "reverse_map" in registered_tokens and isinstance(registered_tokens["reverse_map"], dict):
+                known_tokens = set(registered_tokens["reverse_map"].keys())
+            else:
+                known_tokens = set(registered_tokens.keys())
+        else:
+            try:
+                known_tokens = set(registered_tokens)
+            except Exception:
+                known_tokens = set()
+
+    cb_tokens = _extract_registered_tokens(codebook)
+    if cb_tokens:
+        if known_tokens is None:
+            known_tokens = cb_tokens
+        else:
+            known_tokens.update(cb_tokens)
+
+    effective_registered_tokens = known_tokens
     discrepancies: List[Dict[str, Any]] = []
 
     # Rule 1: Basic block count preservation (if both provided blocks)
@@ -940,9 +1091,9 @@ def diagnose_invariants(
 
     # Compare instruction-by-instruction
     for idx, (oi, ni) in enumerate(zip(orig_insts, neut_insts)):
-        # Rule 3: Address immutability & presence enforcement
-        o_addr = oi.get("addr")
-        n_addr = ni.get("addr")
+        # Rule 3: Address immutability & presence enforcement (supports dual addr / offset keys)
+        o_addr = oi.get("addr") if oi.get("addr") is not None else oi.get("offset")
+        n_addr = ni.get("addr") if ni.get("addr") is not None else ni.get("offset")
         if o_addr is not None and n_addr is None:
             discrepancies.append({
                 "rule": "MISSING_ADDRESS",
@@ -1021,15 +1172,47 @@ def diagnose_invariants(
                 "neutralized": ni,
             })
 
-        # Rule 7: Memory operand structural integrity
+        # Rule 7: Memory operand structural integrity modulo registered symbolic tokens
         if o_sem.memory_operands != n_sem.memory_operands:
-            discrepancies.append({
-                "rule": "MEMORY_OPERAND_ALTERATION",
-                "message": f"Memory operands altered: {o_sem.memory_operands} -> {n_sem.memory_operands}",
-                "index": idx,
-                "original": oi,
-                "neutralized": ni,
-            })
+            is_valid_symbolic_mem = False
+            if len(o_sem.memory_operands) == len(n_sem.memory_operands):
+                # Attempt to restore neutralized memory operands using the codebook or dict
+                active_cb = codebook if codebook is not None else (registered_tokens if isinstance(registered_tokens, dict) else None)
+                restored_n_mem = [_restore_with_codebook(m, active_cb) for m in n_sem.memory_operands]
+                if o_sem.memory_operands == restored_n_mem:
+                    is_valid_symbolic_mem = True
+                elif effective_registered_tokens is not None or any(SYMBOLIC_TARGET_PATTERN.search(m) for m in n_sem.memory_operands):
+                    # Check whether every discrepancy is strictly due to valid registered/symbolic tokens
+                    all_symbolic = True
+                    for o_m, n_m in zip(o_sem.memory_operands, n_sem.memory_operands):
+                        if o_m == n_m:
+                            continue
+                        tokens = SYMBOLIC_TARGET_PATTERN.findall(n_m)
+                        if not tokens:
+                            all_symbolic = False
+                            break
+                        if effective_registered_tokens is not None:
+                            if not all(
+                                tok in effective_registered_tokens
+                                or (tok.startswith("sym.") and tok[4:] in effective_registered_tokens)
+                                or (tok.startswith("str.") and tok[4:] in effective_registered_tokens)
+                                or f"sym.{tok}" in effective_registered_tokens
+                                or f"str.{tok}" in effective_registered_tokens
+                                for tok in tokens
+                            ):
+                                all_symbolic = False
+                                break
+                    if all_symbolic:
+                        is_valid_symbolic_mem = True
+
+            if not is_valid_symbolic_mem:
+                discrepancies.append({
+                    "rule": "MEMORY_OPERAND_ALTERATION",
+                    "message": f"Memory operands altered: {o_sem.memory_operands} -> {n_sem.memory_operands}",
+                    "index": idx,
+                    "original": oi,
+                    "neutralized": ni,
+                })
 
         # Rule 7b: ALU operand shift / extension modifier preservation
         if o_sem.shift_modifiers != n_sem.shift_modifiers:
@@ -1048,9 +1231,13 @@ def diagnose_invariants(
             found_tokens = SYMBOLIC_TARGET_PATTERN.findall(n_sem.code_part)
             is_symbolic_target = False
             if found_tokens:
-                if registered_tokens is not None:
+                if effective_registered_tokens is not None:
                     is_symbolic_target = any(
-                        tok in registered_tokens or (tok.startswith("sym.") and tok[4:] in registered_tokens)
+                        tok in effective_registered_tokens
+                        or (tok.startswith("sym.") and tok[4:] in effective_registered_tokens)
+                        or (tok.startswith("str.") and tok[4:] in effective_registered_tokens)
+                        or f"sym.{tok}" in effective_registered_tokens
+                        or f"str.{tok}" in effective_registered_tokens
                         for tok in found_tokens
                     )
                 else:
@@ -1116,13 +1303,14 @@ def verify_invariants(
     neutralized: Any,
     strict: bool = False,
     codebook: Optional[Any] = None,
+    registered_tokens: Optional[Union[Set[str], List[str], Dict[str, Any]]] = None,
 ) -> bool:
     """
     Verifies that opcodes, registers, addresses, counts, and structural layouts are 100% intact.
     Returns True if valid, False if invalid.
     If strict=True, raises InvariantViolationError (subclass of AssertionError) on violation.
     """
-    discrepancies = diagnose_invariants(original, neutralized, codebook=codebook)
+    discrepancies = diagnose_invariants(original, neutralized, codebook=codebook, registered_tokens=registered_tokens)
     if not discrepancies:
         return True
 
