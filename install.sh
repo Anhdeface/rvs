@@ -213,7 +213,18 @@ run_preflight_diagnostics() {
         cargo_status="${C_GREEN}OK${C_RESET} ($cargo_ver)"
     fi
 
-    # 5. Agent Detection
+    # 5. rvs CLI Shortcut & Symlink Diagnostic
+    local rvs_cli_status="${C_DIM}Not installed (~/.local/bin/rvs)${C_RESET}"
+    if [[ -L "$HOME/.local/bin/rvs" ]]; then
+        local link_dest
+        link_dest="$(readlink "$HOME/.local/bin/rvs" 2>/dev/null || echo "symlink")"
+        rvs_cli_status="${C_GREEN}OK${C_RESET} (symlink -> $link_dest)"
+    elif [[ -e "$HOME/.local/bin/rvs" ]]; then
+        rvs_cli_status="${C_YELLOW}Regular binary (symlink recommended)${C_RESET}"
+        missing_warnings+=("~/.local/bin/rvs is a regular static binary; symlinking to $RVS_BIN is recommended.")
+    fi
+
+    # 6. Agent Detection
     local has_antigravity=false
     local has_claude=false
     local has_cursor=false
@@ -227,6 +238,7 @@ run_preflight_diagnostics() {
         echo -e "${C_BOLD}System Environment & Dependencies:${C_RESET}"
         echo -e "  - Current User    : ${C_CYAN}${USER:-$(whoami)}${C_RESET}"
         echo -e "  - Repository Path : ${C_CYAN}$REPO_DIR${C_RESET}"
+        echo -e "  - rvs CLI         : $rvs_cli_status"
         echo -e "  - Python 3        : $py_status"
         echo -e "  - radare2 (r2)    : $r2_status"
         echo -e "  - Git             : $git_status"
@@ -375,6 +387,114 @@ setup_terminal_shortcut() {
     else
         warn "Binary not found at $RVS_BIN. Skipping shortcut."
     fi
+}
+
+ensure_rvs_cli_setup() {
+    local interactive="${1:-true}"
+    local rvs_target="$HOME/.local/bin/rvs"
+
+    if [[ -L "$rvs_target" ]]; then
+        local link_dest
+        link_dest="$(readlink "$rvs_target" 2>/dev/null || echo "target/release/rvs")"
+        info "rvs CLI: Detected symlink ($rvs_target -> $link_dest). Skipping CLI prompt."
+        if [[ ! -f "$RVS_BIN" ]]; then
+            log "Local binary missing at $RVS_BIN. Fetching or building..."
+            build_rvs_binary
+        fi
+        return 0
+    elif [[ -e "$rvs_target" ]]; then
+        echo ""
+        warn "Notice: $rvs_target is a static binary file (not a symlink)."
+        echo -e "   ${C_YELLOW}Recommendation:${C_RESET} Symlinking to '${RVS_BIN}' is recommended so that"
+        echo -e "   rebuilding/updating rvs updates the system CLI automatically without manual copying."
+        if [[ "$interactive" == true ]]; then
+            local fix_sym="Y"
+            prompt_input "   Convert $rvs_target to symlink -> $RVS_BIN? [Y/n]: " "Y" fix_sym
+            if [[ "$fix_sym" =~ ^[Yy]$ ]]; then
+                [[ ! -f "$RVS_BIN" ]] && build_rvs_binary
+                mkdir -p "$HOME/.local/bin"
+                ln -sfn "$RVS_BIN" "$rvs_target"
+                success "Converted to symlink: $rvs_target -> $RVS_BIN"
+            else
+                info "Kept existing static binary as requested."
+            fi
+        fi
+        return 0
+    else
+        # Not installed yet: ask for the first time
+        echo ""
+        log "rvs CLI is not yet installed in $HOME/.local/bin/rvs."
+        if [[ "$interactive" == true ]]; then
+            local install_cli="Y"
+            prompt_input "Install rvs CLI into ~/.local/bin/rvs (symlink)? [Y/n]: " "Y" install_cli
+            if [[ "$install_cli" =~ ^[Yy]$ ]]; then
+                [[ ! -f "$RVS_BIN" ]] && build_rvs_binary
+                setup_terminal_shortcut
+            else
+                info "Skipped rvs CLI shortcut setup."
+            fi
+        fi
+        return 0
+    fi
+}
+
+manage_rvs_cli_menu() {
+    while true; do
+        echo ""
+        echo -e "${C_BOLD}rvs CLI Binary Management:${C_RESET}"
+        echo "  - Local Binary : $RVS_BIN ($([[ -f "$RVS_BIN" ]] && echo "${C_GREEN}Available${C_RESET}" || echo "${C_YELLOW}Not built${C_RESET}"))"
+        local link_info="${C_DIM}Not installed${C_RESET}"
+        if [[ -L "$HOME/.local/bin/rvs" ]]; then
+            link_info="${C_GREEN}Symlink -> $(readlink "$HOME/.local/bin/rvs")${C_RESET}"
+        elif [[ -e "$HOME/.local/bin/rvs" ]]; then
+            link_info="${C_YELLOW}Static binary (Symlink recommended)${C_RESET}"
+        fi
+        echo -e "  - CLI Shortcut : $HOME/.local/bin/rvs ($link_info)"
+        echo ""
+        echo "  1) Rebuild rvs binary from source (cargo build --release --bin rvs)"
+        echo "  2) (Re)create Symlink at ~/.local/bin/rvs"
+        echo "  3) Check rvs CLI version (rvs --version)"
+        echo "  0) Back to main menu"
+        echo ""
+        local cli_choice=""
+        if ! read -r -p "Select [0-3]: " cli_choice; then
+            echo ""
+            return 0
+        fi
+
+        case "$cli_choice" in
+            1)
+                build_rvs_binary
+                setup_terminal_shortcut
+                echo ""
+                prompt_input "Press Enter to return..." "" unused
+                ;;
+            2)
+                [[ ! -f "$RVS_BIN" ]] && build_rvs_binary
+                setup_terminal_shortcut
+                echo ""
+                prompt_input "Press Enter to return..." "" unused
+                ;;
+            3)
+                if command -v rvs &>/dev/null; then
+                    success "System CLI: $(rvs --version)"
+                elif [[ -f "$RVS_BIN" ]]; then
+                    success "Local Binary: $("$RVS_BIN" --version)"
+                else
+                    warn "rvs is not found in PATH or target/release/rvs."
+                fi
+                echo ""
+                prompt_input "Press Enter to return..." "" unused
+                ;;
+            0|q|Q)
+                return 0
+                ;;
+            *)
+                warn "Invalid selection."
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # =============================================================================
@@ -705,46 +825,29 @@ perform_uninstall() {
 }
 
 # =============================================================================
-# 9. Interactive Setup Wizard
+# 9. Interactive Setup Wizard (Agent MCP & Skills Configuration)
 # =============================================================================
 run_installation_wizard() {
-    # Step 1: Test Suites Configuration
-    echo ""
-    echo -e "${C_BOLD}[1/6] Test Suites & Fixtures${C_RESET}"
-    echo "  Tests are only needed for core development, not for running agents."
-    local inc_tests="N"
-    prompt_input "  Keep test suites in workspace? [y/N] (N excludes tests from future pulls): " "N" inc_tests
-    local include_tests=false
-    [[ "$inc_tests" =~ ^[Yy]$ ]] && include_tests=true
+    # 1. Automatic rvs CLI verification (silent if symlink exists; warning if static binary; prompt if first time)
+    ensure_rvs_cli_setup true
 
-    # Step 2: Binary Build
+    # Step 1: Target Agents
     echo ""
-    echo -e "${C_BOLD}[2/6] Rust Core Binary${C_RESET}"
-    local do_build="Y"
-    if [[ -f "$RVS_BIN" ]]; then
-        echo "  Binary exists at target/release/rvs."
-        prompt_input "  Rebuild from source? [y/N]: " "N" do_build
-    else
-        prompt_input "  Fetch or build target/release/rvs? [Y/n]: " "Y" do_build
-    fi
-
-    # Step 3: Target Agents
-    echo ""
-    echo -e "${C_BOLD}[3/6] Target Agents${C_RESET}"
+    echo -e "${C_BOLD}[1/3] Target AI Agents${C_RESET}"
     echo "  1) All detected agents"
     echo "  2) Google Antigravity only"
-    echo "  3) Claude only"
-    echo "  4) Cursor only"
+    echo "  3) Claude (Desktop & CLI) only"
+    echo "  4) Cursor IDE only"
     echo "  5) Manual export only (creates rvs_mcp_config.json, no auto-config)"
     echo "  6) Skip"
     local agent_choice="1"
     prompt_input "  Select [1-6] (default: 1): " "1" agent_choice
 
-    # Step 4: Skill Linking Method (if not manual or skip)
+    # Step 2: Skill Linking Method (if not manual or skip)
     local skill_mode="symlink"
     if [[ "$agent_choice" =~ ^[1-4]$ ]]; then
         echo ""
-        echo -e "${C_BOLD}[4/6] Skill Linking Mode${C_RESET}"
+        echo -e "${C_BOLD}[2/3] Skill Linking Mode${C_RESET}"
         echo "  1) Symlink (recommended - auto-syncs on git pull)"
         echo "  2) Copy (independent file)"
         local skill_choice="1"
@@ -752,11 +855,11 @@ run_installation_wizard() {
         [[ "$skill_choice" == "2" ]] && skill_mode="copy"
     fi
 
-    # Step 5: Background Update Check
+    # Step 3: Background Update Check
     local use_lazy=false
     if [[ "$agent_choice" =~ ^[1-4]$ ]]; then
         echo ""
-        echo -e "${C_BOLD}[5/6] Auto-Update Check${C_RESET}"
+        echo -e "${C_BOLD}[3/3] Auto-Update Check${C_RESET}"
         echo "  Checks GitHub tags in background when MCP launches (max once/24h, non-blocking)."
         echo "  Only notifies you upon opening install.sh — does NOT modify source code automatically."
         local lazy_choice="Y"
@@ -764,22 +867,14 @@ run_installation_wizard() {
         [[ "$lazy_choice" =~ ^[Yy]$ ]] && use_lazy=true
     fi
 
-    # Step 6: CLI Shortcut
-    echo ""
-    echo -e "${C_BOLD}[6/6] CLI Shortcut${C_RESET}"
-    local bin_choice="Y"
-    prompt_input "  Link binary to ~/.local/bin/rvs? [Y/n]: " "Y" bin_choice
-
     # Summary
     echo ""
     echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
     echo "Summary:"
-    echo "  - Test suites      : $([ "$include_tests" = true ] && echo "kept" || echo "excluded (sparse)")"
-    echo "  - Build binary     : $([[ "$do_build" =~ ^[Yy]$ ]] && echo "yes" || echo "skip")"
+    echo "  - rvs CLI Status   : $([[ -L "$HOME/.local/bin/rvs" ]] && echo "Symlink verified" || echo "Checked")"
     echo "  - Target agents    : Option $agent_choice"
     [[ "$agent_choice" =~ ^[1-4]$ ]] && echo "  - Skill mode       : $skill_mode"
     [[ "$agent_choice" =~ ^[1-4]$ ]] && echo "  - Auto-update check: $([ "$use_lazy" = true ] && echo "enabled (notify-only, 24h)" || echo "disabled")"
-    echo "  - CLI shortcut     : $([[ "$bin_choice" =~ ^[Yy]$ ]] && echo "yes" || echo "no")"
     echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
 
     local confirm_apply="Y"
@@ -790,12 +885,6 @@ run_installation_wizard() {
     fi
 
     echo ""
-    configure_test_suite_sparse "$include_tests"
-
-    if [[ "$do_build" =~ ^[Yy]$ ]]; then
-        build_rvs_binary
-    fi
-
     local has_antigravity=false
     local has_claude=false
     local has_cursor=false
@@ -833,10 +922,6 @@ run_installation_wizard() {
             ;;
     esac
 
-    if [[ "$bin_choice" =~ ^[Yy]$ ]]; then
-        setup_terminal_shortcut
-    fi
-
     echo ""
     success "Setup complete."
     exit 0
@@ -853,16 +938,17 @@ interactive_menu() {
         fi
 
         echo ""
-        echo "1) Setup / Configure Agents (Interactive Wizard)"
-        echo "2) Manual Setup (Export MCP Config Snippet)"
-        echo -e "3) Check GitHub Update${update_badge}"
-        echo "4) Toggle Test Suites (Exclude or Include)"
-        echo "5) System & Agent Diagnostic"
-        echo "6) Uninstall"
+        echo "1) Setup / Configure Agents (Add rvs MCP & Skill)"
+        echo "2) Manage rvs CLI Binary (Build / Re-link Symlink)"
+        echo "3) Manual Setup (Export MCP Config Snippet)"
+        echo -e "4) Check GitHub Update${update_badge}"
+        echo "5) Toggle Test Suites (Exclude or Include)"
+        echo "6) System & Agent Diagnostic"
+        echo "7) Uninstall"
         echo "0) Exit"
         echo ""
         local main_choice=""
-        if ! read -r -p "Select [0-6]: " main_choice; then
+        if ! read -r -p "Select [0-7]: " main_choice; then
             echo ""
             exit 0
         fi
@@ -873,17 +959,20 @@ interactive_menu() {
                 exit 0
                 ;;
             2)
+                manage_rvs_cli_menu
+                ;;
+            3)
                 export_manual_mcp_config
                 echo ""
                 prompt_input "Press Enter to return..." "" unused
                 ;;
-            3)
+            4)
                 echo ""
                 perform_update false
                 echo ""
                 prompt_input "Press Enter to return..." "" unused
                 ;;
-            4)
+            5)
                 echo ""
                 echo -e "${C_BOLD}Toggle Test Suites & Fixtures:${C_RESET}"
                 echo "  1) Exclude tests (sparse-checkout: saves disk & speeds up git pulls)"
@@ -898,13 +987,13 @@ interactive_menu() {
                 echo ""
                 prompt_input "Press Enter to return..." "" unused
                 ;;
-            5)
+            6)
                 echo ""
                 run_preflight_diagnostics true
                 echo ""
                 prompt_input "Press Enter to return..." "" unused
                 ;;
-            6)
+            7)
                 perform_uninstall
                 echo ""
                 prompt_input "Press Enter to return..." "" unused
