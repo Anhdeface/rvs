@@ -19,7 +19,15 @@ pub struct DexMethodSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub registers_size: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insns_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disassembly: Option<Vec<DalvikInstruction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smali: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompiled: Option<String>,
 }
 
 /// Summary representation of a Dalvik class definition.
@@ -31,6 +39,8 @@ pub struct DexClassSummary {
     pub access_flags: u32,
     pub methods: Vec<DexMethodSummary>,
     pub fields: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smali: Option<String>,
 }
 
 /// Aggregate result of DEX file analysis.
@@ -45,6 +55,10 @@ pub struct DexAnalysisResult {
     pub strings: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disassembly: Option<Vec<DalvikInstruction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smali: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompiled: Option<String>,
 }
 
 /// Disassembled Dalvik instruction representation from radare2 `pdj`.
@@ -228,12 +242,34 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
             let m_access = m.access_flags().bits() as u32;
             let code_offset = direct_offsets.get(idx).copied().flatten();
 
+            let (registers_size, insns_size) = if let Some(off) = code_offset {
+                let off_usize = off as usize;
+                if off_usize + 16 <= bytes.len() {
+                    let reg_sz = u16::from_le_bytes([bytes[off_usize], bytes[off_usize + 1]]);
+                    let ins_sz = u32::from_le_bytes([
+                        bytes[off_usize + 12],
+                        bytes[off_usize + 13],
+                        bytes[off_usize + 14],
+                        bytes[off_usize + 15],
+                    ]);
+                    (Some(reg_sz), Some(ins_sz))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
             class_methods.push(DexMethodSummary {
                 name,
                 signature,
                 access_flags: m_access,
                 code_offset,
+                registers_size,
+                insns_size,
                 disassembly: None,
+                smali: None,
+                decompiled: None,
             });
         }
 
@@ -249,12 +285,34 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
             let m_access = m.access_flags().bits() as u32;
             let code_offset = virtual_offsets.get(idx).copied().flatten();
 
+            let (registers_size, insns_size) = if let Some(off) = code_offset {
+                let off_usize = off as usize;
+                if off_usize + 16 <= bytes.len() {
+                    let reg_sz = u16::from_le_bytes([bytes[off_usize], bytes[off_usize + 1]]);
+                    let ins_sz = u32::from_le_bytes([
+                        bytes[off_usize + 12],
+                        bytes[off_usize + 13],
+                        bytes[off_usize + 14],
+                        bytes[off_usize + 15],
+                    ]);
+                    (Some(reg_sz), Some(ins_sz))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
             class_methods.push(DexMethodSummary {
                 name,
                 signature,
                 access_flags: m_access,
                 code_offset,
+                registers_size,
+                insns_size,
                 disassembly: None,
+                smali: None,
+                decompiled: None,
             });
         }
 
@@ -266,6 +324,7 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
             access_flags,
             methods: class_methods,
             fields: class_fields,
+            smali: None,
         });
     }
 
@@ -279,6 +338,8 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
         classes,
         strings: Some(strings),
         disassembly: None,
+        smali: None,
+        decompiled: None,
     })
 }
 
@@ -298,6 +359,8 @@ pub fn disassemble_dalvik_at(
     let output = std::process::Command::new("radare2")
         .arg("-N")
         .arg("-q")
+        .arg("-e")
+        .arg("scr.color=0")
         .arg("-a")
         .arg("dalvik")
         .arg("-c")
@@ -374,7 +437,153 @@ pub fn disassemble_dalvik_method(
 
     // In Dalvik DEX code_item: 16-byte header precedes the bytecode instructions
     let instruction_addr = code_offset + 16;
-    disassemble_dalvik_at(dex_path, instruction_addr, 50)
+    if let Some(insns_size) = method.insns_size {
+        disassemble_dalvik_bounded(dex_path, instruction_addr, insns_size)
+    } else {
+        disassemble_dalvik_at(dex_path, instruction_addr, 50)
+    }
+}
+
+/// Disassembles Dalvik bytecode strictly bounded to `insns_size * 2` bytes,
+/// preventing instruction spillover across method boundaries.
+pub fn disassemble_dalvik_bounded(
+    dex_path: &Path,
+    instruction_addr: u64,
+    insns_size: u32,
+) -> Result<Vec<DalvikInstruction>, AppError> {
+    let count = (insns_size as usize).max(1);
+    let raw = disassemble_dalvik_at(dex_path, instruction_addr, count)?;
+    let max_addr = instruction_addr + (insns_size as u64) * 2;
+    Ok(raw.into_iter().filter(|i| i.addr >= instruction_addr && i.addr < max_addr).collect())
+}
+
+/// Formats class access flags into Smali syntax keywords.
+pub fn format_access_flags_class(flags: u32) -> String {
+    let mut parts = Vec::new();
+    if flags & 0x0001 != 0 { parts.push("public"); }
+    if flags & 0x0002 != 0 { parts.push("private"); }
+    if flags & 0x0004 != 0 { parts.push("protected"); }
+    if flags & 0x0008 != 0 { parts.push("static"); }
+    if flags & 0x0010 != 0 { parts.push("final"); }
+    if flags & 0x0200 != 0 { parts.push("interface"); }
+    if flags & 0x0400 != 0 { parts.push("abstract"); }
+    if flags & 0x1000 != 0 { parts.push("synthetic"); }
+    if flags & 0x2000 != 0 { parts.push("annotation"); }
+    if flags & 0x4000 != 0 { parts.push("enum"); }
+    parts.join(" ")
+}
+
+/// Formats method access flags into Smali syntax keywords.
+pub fn format_access_flags_method(flags: u32) -> String {
+    let mut parts = Vec::new();
+    if flags & 0x0001 != 0 { parts.push("public"); }
+    if flags & 0x0002 != 0 { parts.push("private"); }
+    if flags & 0x0004 != 0 { parts.push("protected"); }
+    if flags & 0x0008 != 0 { parts.push("static"); }
+    if flags & 0x0010 != 0 { parts.push("final"); }
+    if flags & 0x0020 != 0 { parts.push("synchronized"); }
+    if flags & 0x0040 != 0 { parts.push("bridge"); }
+    if flags & 0x0080 != 0 { parts.push("varargs"); }
+    if flags & 0x0100 != 0 { parts.push("native"); }
+    if flags & 0x0400 != 0 { parts.push("abstract"); }
+    if flags & 0x0800 != 0 { parts.push("strictfp"); }
+    if flags & 0x1000 != 0 { parts.push("synthetic"); }
+    if flags & 0x8000 != 0 { parts.push("constructor"); }
+    if flags & 0x10000 != 0 { parts.push("declared-synchronized"); }
+    parts.join(" ")
+}
+
+/// Formats a single method into canonical Smali assembly representation.
+pub fn format_method_smali(m: &DexMethodSummary) -> String {
+    let access = format_access_flags_method(m.access_flags);
+    let access_str = if access.is_empty() { String::new() } else { format!("{} ", access) };
+    let mut out = format!(".method {}{}{}\n", access_str, m.name, m.signature);
+
+    if let Some(regs) = m.registers_size {
+        out.push_str(&format!("    .registers {}\n", regs));
+    }
+
+    if let Some(instructions) = &m.disassembly {
+        for inst in instructions {
+            let line = if !inst.disasm.is_empty() {
+                &inst.disasm
+            } else {
+                &inst.opcode
+            };
+            out.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    out.push_str(".end method");
+    out
+}
+
+/// Formats a complete class into canonical Smali assembly representation.
+pub fn format_class_smali(c: &DexClassSummary) -> String {
+    let access = format_access_flags_class(c.access_flags);
+    let access_str = if access.is_empty() { String::new() } else { format!("{} ", access) };
+    let mut out = format!(".class {}{}\n", access_str, c.name);
+
+    if let Some(super_cls) = &c.super_class {
+        out.push_str(&format!(".super {}\n", super_cls));
+    }
+    out.push('\n');
+
+    if !c.fields.is_empty() {
+        out.push_str("# fields\n");
+        for f in &c.fields {
+            out.push_str(&format!(".field {}\n", f));
+        }
+        out.push('\n');
+    }
+
+    if !c.methods.is_empty() {
+        out.push_str("# methods\n");
+        for m in &c.methods {
+            out.push_str(&format_method_smali(m));
+            out.push_str("\n\n");
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Decompiles Dalvik bytecode at a specific instruction address into pseudo-code using radare2 (`af; pdc`).
+pub fn decompile_dalvik_method(
+    dex_path: &Path,
+    instruction_addr: u64,
+) -> Result<String, AppError> {
+    if !dex_path.exists() {
+        return Err(AppError::FileNotFound(dex_path.display().to_string()));
+    }
+
+    let cmd = format!("af @ {}; pdc @ {}", instruction_addr, instruction_addr);
+
+    let output = std::process::Command::new("radare2")
+        .arg("-N")
+        .arg("-q")
+        .arg("-e")
+        .arg("scr.color=0")
+        .arg("-a")
+        .arg("dalvik")
+        .arg("-c")
+        .arg(&cmd)
+        .arg(dex_path)
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .output()
+        .map_err(|e| AppError::R2ExecutionError(format!("Failed to spawn radare2: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::R2ExecutionError(format!(
+            "radare2 Dalvik decompilation failed: {}",
+            stderr
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.trim().to_string())
 }
 
 // -----------------------------------------------------------------------------
@@ -545,5 +754,48 @@ mod tests {
             let analyses = pkg.analyze_dex(None).expect("analyze multi dex");
             assert!(analyses.len() >= 2, "Multi-dex must return at least 2 DEX analyses");
         }
+    }
+
+    #[test]
+    fn test_format_access_flags() {
+        assert_eq!(format_access_flags_class(0x0001), "public");
+        assert_eq!(format_access_flags_class(0x0011), "public final");
+        assert_eq!(format_access_flags_method(0x0009), "public static");
+    }
+
+    #[test]
+    fn test_format_method_smali_basic() {
+        let m = DexMethodSummary {
+            name: "testMethod".to_string(),
+            signature: "(I)V".to_string(),
+            access_flags: 1,
+            code_offset: Some(100),
+            registers_size: Some(2),
+            insns_size: Some(1),
+            disassembly: Some(vec![DalvikInstruction {
+                addr: 116,
+                opcode: "return-void".to_string(),
+                disasm: "return-void".to_string(),
+                bytes: Some("0e00".to_string()),
+                ins_type: Some("ret".to_string()),
+            }]),
+            smali: None,
+            decompiled: None,
+        };
+        let smali = format_method_smali(&m);
+        assert!(smali.contains(".method public testMethod(I)V"));
+        assert!(smali.contains(".registers 2"));
+        assert!(smali.contains("return-void"));
+        assert!(smali.contains(".end method"));
+    }
+
+    #[test]
+    fn test_disassemble_dalvik_bounded_strict() {
+        let dex_path = fixture_classes_dex();
+        // isChecked has 3 code units = 6 bytes (starts at 108012)
+        let insns = disassemble_dalvik_bounded(&dex_path, 108012, 3).unwrap();
+        assert_eq!(insns.len(), 2);
+        assert_eq!(insns[0].addr, 108012);
+        assert_eq!(insns[1].addr, 108016);
     }
 }

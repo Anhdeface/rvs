@@ -89,9 +89,11 @@ fn main() -> ExitCode {
         },
         Commands::Apk(apk_cmd) => match apk_cmd {
             ApkCommands::Inspect { path }
-            | ApkCommands::Manifest { path }
+            | ApkCommands::Manifest { path, .. }
             | ApkCommands::Dex { path, .. }
-            | ApkCommands::So { path, .. } => path.display().to_string(),
+            | ApkCommands::So { path, .. }
+            | ApkCommands::Resources { path, .. }
+            | ApkCommands::Signature { path, .. } => path.display().to_string(),
         },
         _ => cli.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default(),
     };
@@ -152,6 +154,8 @@ fn main() -> ExitCode {
         Commands::Apk(ApkCommands::Manifest { .. }) => "apk manifest",
         Commands::Apk(ApkCommands::Dex { .. }) => "apk dex",
         Commands::Apk(ApkCommands::So { .. }) => "apk so",
+        Commands::Apk(ApkCommands::Resources { .. }) => "apk resources",
+        Commands::Apk(ApkCommands::Signature { .. }) => "apk signature",
     };
 
     match execute_cli(&cli, command_name, &target_str) {
@@ -1053,7 +1057,7 @@ fn handle_apk_command(
             }
         }
 
-        ApkCommands::Manifest { path } => {
+        ApkCommands::Manifest { path, raw } => {
             if !path.exists() {
                 return Err(AppError::FileNotFound(path.display().to_string()));
             }
@@ -1096,7 +1100,12 @@ fn handle_apk_command(
                 }
             };
 
-            let manifest = ManifestInfo::parse(&bytes, is_binary)?;
+            let mut manifest = ManifestInfo::parse(&bytes, is_binary)?;
+            if *raw {
+                if let Ok(xml_str) = apk::decode_raw_manifest(&bytes) {
+                    manifest.raw_xml = Some(xml_str);
+                }
+            }
 
             if compact_flag {
                 let comp = compact::CompactManifestInfo::from(&manifest);
@@ -1114,6 +1123,8 @@ fn handle_apk_command(
             class,
             method,
             disasm,
+            smali,
+            decompile,
         } => {
             if !path.exists() {
                 return Err(AppError::FileNotFound(path.display().to_string()));
@@ -1228,6 +1239,8 @@ fn handle_apk_command(
                         classes: combined_classes,
                         strings: Some(all_strings),
                         disassembly: None,
+                        smali: None,
+                        decompiled: None,
                     }
                 }
             };
@@ -1247,36 +1260,65 @@ fn handle_apk_command(
                 analysis_result.methods_count = analysis_result.classes.iter().map(|c| c.methods.len()).sum();
             }
 
-            // Wire up --disasm flag: populate Dalvik bytecode disassembly for matched methods
-            if *disasm {
+            // Wire up --disasm and --smali flags: populate Dalvik bytecode disassembly
+            if *disasm || *smali {
                 let mut all_disasm = Vec::new();
-                if let (Some(c_query), Some(m_query)) = (&class, &method) {
-                    if let Ok(insts) = apk::disassemble_dalvik_method(&resolved_dex_path, c_query, m_query) {
-                        for c in &mut analysis_result.classes {
-                            for m in &mut c.methods {
-                                if (c.name == *c_query || c.name.contains(c_query))
-                                    && (m.name == *m_query || m.name.contains(m_query))
-                                {
-                                    m.disassembly = Some(insts.clone());
-                                }
+                for c in &mut analysis_result.classes {
+                    for m in &mut c.methods {
+                        if let Some(code_offset) = m.code_offset {
+                            let instruction_addr = code_offset + 16;
+                            let insts_res = if let Some(insns) = m.insns_size {
+                                apk::disassemble_dalvik_bounded(&resolved_dex_path, instruction_addr, insns)
+                            } else {
+                                apk::disassemble_dalvik_at(&resolved_dex_path, instruction_addr, 50)
+                            };
+
+                            if let Ok(insts) = insts_res {
+                                m.disassembly = Some(insts.clone());
+                                all_disasm.extend(insts);
                             }
                         }
-                        all_disasm.extend(insts);
                     }
-                } else {
-                    for c in &mut analysis_result.classes {
-                        for m in &mut c.methods {
-                            if let Some(code_offset) = m.code_offset {
-                                if let Ok(insts) = apk::disassemble_dalvik_at(&resolved_dex_path, code_offset + 16, 50) {
-                                    m.disassembly = Some(insts.clone());
-                                    all_disasm.extend(insts);
+                }
+                if *disasm && !all_disasm.is_empty() {
+                    analysis_result.disassembly = Some(all_disasm);
+                }
+            }
+
+            // Wire up --smali flag: format matched classes and methods as Smali
+            if *smali {
+                let mut class_smalis = Vec::new();
+                for c in &mut analysis_result.classes {
+                    for m in &mut c.methods {
+                        m.smali = Some(apk::format_method_smali(m));
+                    }
+                    let c_smali = apk::format_class_smali(c);
+                    c.smali = Some(c_smali.clone());
+                    class_smalis.push(c_smali);
+                }
+                if !class_smalis.is_empty() {
+                    analysis_result.smali = Some(class_smalis.join("\n\n"));
+                }
+            }
+
+            // Wire up --decompile flag: decompile matched methods using radare2 (af; pdc)
+            if *decompile {
+                let mut decompiled_methods = Vec::new();
+                for c in &mut analysis_result.classes {
+                    for m in &mut c.methods {
+                        if let Some(code_offset) = m.code_offset {
+                            let instruction_addr = code_offset + 16;
+                            if let Ok(decomp) = apk::decompile_dalvik_method(&resolved_dex_path, instruction_addr) {
+                                if !decomp.is_empty() {
+                                    m.decompiled = Some(decomp.clone());
+                                    decompiled_methods.push(decomp);
                                 }
                             }
                         }
                     }
                 }
-                if !all_disasm.is_empty() {
-                    analysis_result.disassembly = Some(all_disasm);
+                if !decompiled_methods.is_empty() {
+                    analysis_result.decompiled = Some(decompiled_methods.join("\n\n"));
                 }
             }
 
@@ -1509,6 +1551,63 @@ fn handle_apk_command(
                 resp.to_json(pretty).map_err(Into::into)
             } else {
                 let resp = ApiResponse::success(command_name, target_str, analysis);
+                resp.to_json(pretty).map_err(Into::into)
+            }
+        }
+
+        ApkCommands::Resources {
+            path,
+            list,
+            extract,
+            dump,
+        } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let pkg = ApkPackage::open(path)?;
+            let resources_data = apk::analyze_apk_resources(
+                &pkg,
+                *list,
+                extract.as_deref(),
+                dump.as_deref(),
+            )?;
+
+            if compact_flag {
+                let comp = compact::CompactApkResourcesData::from(&resources_data);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, resources_data);
+                resp.to_json(pretty).map_err(Into::into)
+            }
+        }
+
+        ApkCommands::Signature { path, verify } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let sig_info = apk::verify_apk_signature(path, *verify)?;
+
+            if compact_flag {
+                let comp = compact::CompactApkSignatureData::from(&sig_info);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, sig_info);
                 resp.to_json(pretty).map_err(Into::into)
             }
         }

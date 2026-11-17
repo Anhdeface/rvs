@@ -11,6 +11,7 @@
 mod common;
 
 use common::*;
+use std::io::Write;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -1224,4 +1225,434 @@ fn test_tier1_compact_apk_so_payload() {
     assert_eq!(data.elf_type, "DYN");
     assert_eq!(data.endian, "little");
     assert!(data.jni.iter().any(|j| j.cls.as_deref() == Some("com.example.app.MainActivity") && j.method.as_deref() == Some("stringFromJNI")));
+}
+
+// =============================================================================
+// Feature Coverage for F3, F4, F5, F6, F7
+// =============================================================================
+
+// --- F3: Manifest Raw/Decoded XML Extraction ---
+
+#[test]
+fn test_tier1_cli_apk_manifest_raw_xml_flag() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ManifestInfoData>(&["apk", "manifest", apk_str, "--raw"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ManifestInfoData expected");
+    assert_eq!(data.package_name, "eu.jgamba.myapplication");
+    assert!(data.raw_xml.is_some(), "raw_xml must be present when --raw is specified");
+    let xml = data.raw_xml.unwrap();
+    assert!(xml.contains("<manifest"), "Decoded XML must contain <manifest");
+    assert!(xml.contains("package=\"eu.jgamba.myapplication\""));
+    assert!(xml.contains("MainActivity"));
+}
+
+#[test]
+fn test_tier1_cli_apk_manifest_xml_alias_flag() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ManifestInfoData>(&["apk", "manifest", apk_str, "--xml"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ManifestInfoData expected");
+    assert!(data.raw_xml.is_some(), "raw_xml must be present when --xml alias is specified");
+}
+
+#[test]
+fn test_tier1_cli_apk_manifest_unpacked_text_raw_xml() {
+    let dir = unpacked_dir_fixture();
+    let dir_str = dir.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ManifestInfoData>(&["apk", "manifest", dir_str, "--raw"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ManifestInfoData expected");
+    assert!(data.raw_xml.is_some());
+    let xml = data.raw_xml.unwrap();
+    assert!(xml.contains("<manifest"));
+}
+
+// --- F4: Resource and Asset Listing, ARSC Parsing, Extraction, and Dumping ---
+
+#[test]
+fn test_tier1_cli_apk_resources_list() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_str, "--list"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(data.total_resources >= 1);
+    assert!(data.total_assets >= 1);
+    assert!(data.has_arsc);
+    assert!(data.entries.is_some());
+    assert!(!data.arsc_packages.is_empty(), "arsc_packages must not be empty on sample_raw.apk");
+    assert_eq!(data.arsc_packages[0].name, "com.example.synthetic.target");
+    assert_eq!(data.arsc_packages[0].types_count, 3);
+
+    let entries = data.entries.unwrap();
+    assert!(entries.iter().any(|e| e.name == "assets/app_config.json" && e.entry_type == "asset"));
+    assert!(entries.iter().any(|e| e.name == "res/values/strings.xml" && e.entry_type == "resource"));
+    assert!(entries.iter().any(|e| e.name == "resources.arsc" && e.entry_type == "arsc"));
+}
+
+#[test]
+fn test_tier1_cli_apk_resources_extract_asset() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_str, "--extract", "assets/app_config.json"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    let ext = data.extracted.expect("extracted resource expected");
+    assert_eq!(ext.name, "assets/app_config.json");
+    assert!(!ext.is_xml);
+    assert!(ext.content.contains("environment"));
+    assert!(ext.content.contains("production"));
+}
+
+#[test]
+fn test_tier1_cli_apk_resources_extract_res_xml() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_str, "--extract", "res/values/strings.xml"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    let ext = data.extracted.expect("extracted resource expected");
+    assert_eq!(ext.name, "res/values/strings.xml");
+    assert!(ext.is_xml);
+    assert!(ext.content.contains("<resources>"));
+    assert!(ext.content.contains("app_name"));
+}
+
+#[test]
+fn test_tier1_cli_apk_resources_dump_dir() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let temp = TempDir::new().unwrap();
+    let temp_str = temp.path().to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_str, "--dump", temp_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(data.dumped_files_count.unwrap_or(0) >= 2);
+    assert!(temp.path().join("assets/app_config.json").is_file());
+    assert!(temp.path().join("res/values/strings.xml").is_file());
+}
+
+#[test]
+fn test_tier1_cli_apk_resources_compact_format() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<serde_json::Value>(&["apk", "resources", apk_str, "--list", "-c"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("data expected");
+    assert_eq!(data["arsc"], true);
+    assert!(data["res_cnt"].as_u64().unwrap_or(0) >= 1);
+    assert!(data["asset_cnt"].as_u64().unwrap_or(0) >= 1);
+}
+
+// --- F5 & F6: DEX Smali Assembly Formatting & Dalvik Decompilation ---
+
+#[test]
+fn test_tier1_cli_apk_dex_smali_method_formatting() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "isChecked", "--smali",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert_eq!(data.classes_count, 1);
+    let cls = &data.classes[0];
+    assert!(cls.smali.is_some());
+    assert!(cls.smali.as_ref().unwrap().contains(".class public Lcom/devoteam/quickaction/QuickActionItem;"));
+
+    let m = &cls.methods[0];
+    assert!(m.smali.is_some());
+    let smali = m.smali.as_ref().unwrap();
+    assert!(smali.contains(".method public isChecked()Z"));
+    assert!(smali.contains(".registers 2"));
+    assert!(smali.contains("return v0"));
+    assert!(smali.contains(".end method"));
+}
+
+#[test]
+fn test_tier1_cli_apk_dex_method_decompilation() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "isChecked", "--decompile",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert_eq!(data.classes_count, 1);
+    let m = &data.classes[0].methods[0];
+    assert!(m.decompiled.is_some());
+    let decomp = m.decompiled.as_ref().unwrap();
+    assert!(decomp.contains("isChecked"));
+    assert!(decomp.contains("return v0"));
+}
+
+#[test]
+fn test_tier1_cli_apk_dex_bounded_disassembly_no_spillover() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "isChecked", "--disasm",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let m = &data.classes[0].methods[0];
+    assert_eq!(m.insns_size, Some(3));
+    // isChecked bytecode is 3 code units = 6 bytes (offsets 108012 and 108016)
+    // Disassembly must be strictly bounded to this method (2 instructions), no spillover
+    let disasm = m.disassembly.as_ref().expect("disassembly expected");
+    assert_eq!(disasm.len(), 2, "Disassembly must not spill over method boundaries");
+    assert_eq!(disasm[0]["addr"].as_u64(), Some(108012));
+    assert_eq!(disasm[1]["addr"].as_u64(), Some(108016));
+}
+
+// --- F7: APK Signature and Certificate Verification ---
+
+#[test]
+fn test_tier1_cli_apk_signature_verification() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<SignatureData>(&["apk", "signature", apk_str]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("SignatureData expected");
+    assert!(data.is_signed, "sample_raw.apk must be recognized as signed");
+    assert!(data.signing_block_present, "APK Signing Block must be detected");
+    assert!(data.schemes.contains(&"v1".to_string()));
+    assert!(data.schemes.contains(&"v2".to_string()));
+    assert!(!data.signers.is_empty(), "Must contain at least one signer");
+
+    let signer = &data.signers[0];
+    assert!(signer.subject.contains("RvsTestSigner") || signer.subject.contains("RvsTestSuite"));
+    assert_eq!(signer.sha256_fingerprint.len(), 64, "SHA-256 fingerprint must be 64 hex chars");
+    assert_eq!(signer.sha1_fingerprint.len(), 40, "SHA-1 fingerprint must be 40 hex chars");
+}
+
+#[test]
+fn test_tier1_cli_apk_signature_verify_flag() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<SignatureData>(&["apk", "signature", apk_str, "--verify"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("SignatureData expected");
+    assert_eq!(data.verified, Some(true));
+    assert!(data.verification_errors.is_empty());
+}
+
+#[test]
+fn test_tier1_cli_apk_signature_unsigned_apk() {
+    let apk = no_so_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<SignatureData>(&["apk", "signature", apk_str, "--verify"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("SignatureData expected");
+    assert!(!data.is_signed);
+    assert_eq!(data.verified, Some(false));
+    assert!(!data.verification_errors.is_empty());
+}
+
+#[test]
+fn test_tier1_cli_apk_signature_compact_format() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<serde_json::Value>(&["apk", "signature", apk_str, "--verify", "-c"]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("data expected");
+    assert_eq!(data["signed"], true);
+    assert_eq!(data["verified"], true);
+    assert_eq!(data["sig_block"], true);
+}
+
+// =============================================================================
+// Tier 2: Path Traversal & Zip Slip Remediation Regression Tests
+// =============================================================================
+
+#[test]
+fn test_tier2_apk_resources_dump_zip_slip_blocked() {
+    let temp_workspace = TempDir::new().unwrap();
+    let malicious_apk = temp_workspace.path().join("zip_slip_target.apk");
+    let canary_leak = temp_workspace.path().join("canary_escaped.txt");
+    let dump_dir = temp_workspace.path().join("dump_output");
+
+    if canary_leak.exists() {
+        let _ = std::fs::remove_file(&canary_leak);
+    }
+
+    // Build synthetic ZIP with Zip-Slip path traversal entry
+    {
+        let file = std::fs::File::create(&malicious_apk).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        zip.start_file("AndroidManifest.xml", options).unwrap();
+        zip.write_all(b"<manifest package=\"com.adversarial.zipslip\" />").unwrap();
+
+        zip.start_file("res/values/strings.xml", options).unwrap();
+        zip.write_all(b"<resources><string name=\"safe\">val</string></resources>").unwrap();
+
+        // Adversarial traversal entries: parent dir and absolute
+        zip.start_file("../canary_escaped.txt", options).unwrap();
+        zip.write_all(b"adversarial_zip_slip_payload").unwrap();
+
+        zip.start_file("res/../../../tmp/canary_tmp_escaped.txt", options).unwrap();
+        zip.write_all(b"adversarial_tmp_payload").unwrap();
+
+        zip.start_file("/tmp/canary_abs_escaped.txt", options).unwrap();
+        zip.write_all(b"adversarial_abs_payload").unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    // Direct Rust API verification: dump_resources_and_assets
+    let pkg = rvs::apk::ApkPackage::open(&malicious_apk).expect("open synthetic apk");
+    let dump_result = rvs::apk::dump_resources_and_assets(&pkg, &dump_dir);
+    assert!(dump_result.is_ok(), "dump_resources_and_assets should complete safely");
+    assert_eq!(dump_result.unwrap(), 1, "Only the 1 legitimate resource should be dumped");
+
+    // Verify legitimate file exists
+    assert!(dump_dir.join("res/values/strings.xml").is_file());
+
+    // Verify all traversal attempts were blocked and did not escape
+    assert!(!canary_leak.exists(), "Zip slip entry must not escape to parent directory");
+    assert!(!PathBuf::from("/tmp/canary_tmp_escaped.txt").exists(), "Zip slip entry must not escape to /tmp");
+    assert!(!PathBuf::from("/tmp/canary_abs_escaped.txt").exists(), "Absolute zip entry must not escape to /tmp");
+    assert!(!dump_dir.join("canary_escaped.txt").exists());
+
+    // CLI execution verification: rvs apk resources --dump
+    let cli_dump_dir = temp_workspace.path().join("cli_dump_output");
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", malicious_apk.to_str().unwrap(), "--dump", cli_dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert_eq!(data.dumped_files_count, Some(1));
+    assert!(cli_dump_dir.join("res/values/strings.xml").is_file());
+    assert!(!canary_leak.exists());
+}
+
+#[test]
+fn test_tier2_apk_container_directory_path_traversal_blocked() {
+    let unpacked_dir = unpacked_dir_fixture();
+    let pkg = rvs::apk::ApkPackage::open(&unpacked_dir).expect("open unpacked directory");
+
+    // Test that read_entry rejects absolute paths and parent directory components
+    let err_abs = pkg.read_entry("/etc/passwd").unwrap_err();
+    match &err_abs {
+        rvs::error::AppError::InvalidBinary(msg) => {
+            assert!(msg.contains("Invalid entry path"));
+            assert!(msg.contains("/etc/passwd"));
+        }
+        other => panic!("Expected InvalidBinary error, got: {:?}", other),
+    }
+
+    let err_traversal = pkg.read_entry("../../etc/passwd").unwrap_err();
+    match &err_traversal {
+        rvs::error::AppError::InvalidBinary(msg) => {
+            assert!(msg.contains("Invalid entry path"));
+            assert!(msg.contains("../../etc/passwd"));
+        }
+        other => panic!("Expected InvalidBinary error, got: {:?}", other),
+    }
+
+    let err_deep = pkg.read_entry("res/../../../etc/passwd").unwrap_err();
+    match &err_deep {
+        rvs::error::AppError::InvalidBinary(msg) => {
+            assert!(msg.contains("Invalid entry path"));
+        }
+        other => panic!("Expected InvalidBinary error, got: {:?}", other),
+    }
+
+    let err_win = pkg.read_entry("\\windows\\system32\\cmd.exe").unwrap_err();
+    match &err_win {
+        rvs::error::AppError::InvalidBinary(msg) => {
+            assert!(msg.contains("Invalid entry path"));
+        }
+        other => panic!("Expected InvalidBinary error, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_tier2_cli_apk_resources_directory_path_traversal_rejected() {
+    let unpacked_dir = unpacked_dir_fixture();
+    let unpacked_str = unpacked_dir.to_str().unwrap();
+
+    // Absolute host path extraction must fail
+    let (resp_abs, out_abs) = run_rvs_json::<serde_json::Value>(&[
+        "apk", "resources", unpacked_str, "--extract", "/etc/passwd",
+    ]);
+    assert!(!out_abs.status.success());
+    assert!(!resp_abs.success);
+    let err_abs = resp_abs.error.expect("error expected");
+    assert_eq!(err_abs.code, "INVALID_BINARY");
+    assert!(err_abs.message.contains("Invalid entry path"));
+    assert!(resp_abs.data.is_none() || resp_abs.data.as_ref().unwrap().get("extracted").is_none());
+
+    // Relative path traversal extraction must fail
+    let (resp_rel, out_rel) = run_rvs_json::<serde_json::Value>(&[
+        "apk", "resources", unpacked_str, "--extract", "../../../../../../etc/passwd",
+    ]);
+    assert!(!out_rel.status.success());
+    assert!(!resp_rel.success);
+    let err_rel = resp_rel.error.expect("error expected");
+    assert_eq!(err_rel.code, "INVALID_BINARY");
+    assert!(err_rel.message.contains("Invalid entry path"));
+}
+
+#[test]
+fn test_tier2_cli_apk_resources_archive_path_traversal_rejected() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+
+    // Absolute path on archive
+    let (resp_abs, out_abs) = run_rvs_json::<serde_json::Value>(&[
+        "apk", "resources", apk_str, "--extract", "/etc/passwd",
+    ]);
+    assert!(!out_abs.status.success());
+    assert!(!resp_abs.success);
+    let err_abs = resp_abs.error.expect("error expected");
+    assert_eq!(err_abs.code, "INVALID_BINARY");
+
+    // Traversal path on archive
+    let (resp_rel, out_rel) = run_rvs_json::<serde_json::Value>(&[
+        "apk", "resources", apk_str, "--extract", "../../etc/passwd",
+    ]);
+    assert!(!out_rel.status.success());
+    assert!(!resp_rel.success);
+    let err_rel = resp_rel.error.expect("error expected");
+    assert_eq!(err_rel.code, "INVALID_BINARY");
 }

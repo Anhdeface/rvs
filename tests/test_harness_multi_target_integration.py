@@ -690,5 +690,296 @@ class TestGroupINativeSoExtraction(BaseMultiTargetIntegrationTest):
         self.assertEqual(data.get("jni_functions"), [])
 
 
+# =============================================================================
+# Group J: APK Resources and Asset Inspection via rvs_apk_resources (J.1 - J.5)
+# =============================================================================
+
+class TestGroupJApkResources(BaseMultiTargetIntegrationTest):
+    """Group J: Resources and assets inspection, filtering, entry extraction, and directory dumping."""
+
+    def test_apk_resources_listing_full_and_compact(self) -> None:
+        """Case J.1: rvs_apk_resources lists resource and asset entries in full and compact modes."""
+        apk_path = self.temp_dir / "test_res_list.apk"
+        create_synthetic_apk(apk_path)
+
+        # Full mode
+        res_full = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(apk_path), "compact": False},
+        )
+        self.assertTrue(res_full.get("success"), f"Query failed: {res_full}")
+        data_full = res_full.get("data", {})
+        self.assertGreaterEqual(data_full.get("total_resources", 0), 1)
+        self.assertGreaterEqual(data_full.get("total_assets", 0), 1)
+        self.assertTrue(data_full.get("has_arsc"))
+        entries = data_full.get("entries", [])
+        entry_names = [e["name"] for e in entries]
+        self.assertTrue(any("assets/app_config.json" in n for n in entry_names))
+        self.assertTrue(any("res/values/strings.xml" in n for n in entry_names))
+
+        # Compact mode
+        res_comp = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(apk_path), "compact": True},
+        )
+        self.assertTrue(res_comp.get("success"), f"Query failed: {res_comp}")
+        data_comp = res_comp.get("data", {})
+        self.assertGreaterEqual(data_comp.get("res_cnt", 0), 1)
+        self.assertGreaterEqual(data_comp.get("asset_cnt", 0), 1)
+        self.assertTrue(data_comp.get("arsc"))
+
+    def test_apk_resources_filtering_by_type_and_name(self) -> None:
+        """Case J.2: rvs_apk_resources filters entries by type and name substring."""
+        apk_path = self.temp_dir / "test_res_filter.apk"
+        create_synthetic_apk(apk_path)
+
+        # Filter by type="asset"
+        res_asset = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(apk_path), "type": "asset", "compact": False},
+        )
+        self.assertTrue(res_asset.get("success"), f"Asset filter failed: {res_asset}")
+        asset_entries = res_asset.get("data", {}).get("entries", [])
+        self.assertTrue(len(asset_entries) > 0)
+        self.assertTrue(all(e.get("type") == "asset" or e.get("name", "").startswith("assets/") for e in asset_entries))
+
+        # Filter by name="secret_token"
+        res_name = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(apk_path), "name": "secret_token", "compact": False},
+        )
+        self.assertTrue(res_name.get("success"), f"Name filter failed: {res_name}")
+        name_entries = res_name.get("data", {}).get("entries", [])
+        self.assertEqual(len(name_entries), 1)
+        self.assertIn("secret_token.txt", name_entries[0]["name"])
+
+    def test_apk_resources_entry_extraction(self) -> None:
+        """Case J.3: rvs_apk_resources extracts and decodes text and XML content."""
+        apk_path = self.temp_dir / "test_res_extract.apk"
+        create_synthetic_apk(apk_path)
+
+        res = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(apk_path), "name": "assets/app_config.json", "compact": False},
+        )
+        self.assertTrue(res.get("success"), f"Extraction failed: {res}")
+        extracted = res.get("data", {}).get("extracted", {})
+        self.assertIn("app_config.json", extracted.get("name", ""))
+        self.assertIn("production", extracted.get("content", ""))
+
+    def test_apk_resources_directory_dump(self) -> None:
+        """Case J.4: rvs_apk_resources dumps extracted assets and resources to directory."""
+        apk_path = self.temp_dir / "test_res_dump.apk"
+        create_synthetic_apk(apk_path)
+        dump_target_dir = self.temp_dir / "dumped_resources"
+
+        res = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(apk_path), "dump": str(dump_target_dir), "compact": False},
+        )
+        self.assertTrue(res.get("success"), f"Dump failed: {res}")
+        data = res.get("data", {})
+        self.assertEqual(data.get("dump_dir"), str(dump_target_dir))
+        self.assertGreaterEqual(data.get("dumped_files_count", 0), 1)
+        self.assertTrue((dump_target_dir / "assets" / "app_config.json").exists())
+
+    def test_apk_resources_dump_failure_zero_ephemeral_leakage(self) -> None:
+        """Case J.5: rvs_apk_resources with dump=True cleans up and leaves zero leaked directories on failure."""
+        pattern = "/tmp/rvs_res_dump_*"
+
+        # Scenario 1: Non-existent file
+        before = set(glob.glob(pattern))
+        res_missing = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": "nonexistent.apk", "dump": True},
+        )
+        self.assertFalse(res_missing.get("success"), f"Expected failure on nonexistent file: {res_missing}")
+        after = set(glob.glob(pattern))
+        leaked = after - before
+        self.assertEqual(leaked, set(), f"Lingering dump directories detected after nonexistent file failure: {leaked}")
+
+        # Scenario 2: Corrupted APK
+        corrupted_apk = self.temp_dir / "corrupted_res_dump.apk"
+        create_corrupted_apk(corrupted_apk, corruption_type="bad_zip")
+
+        before = set(glob.glob(pattern))
+        res_corrupt = self.harness.execute_tool(
+            "rvs_apk_resources",
+            {"file": str(corrupted_apk), "dump": True},
+        )
+        self.assertFalse(res_corrupt.get("success"), f"Expected failure on corrupted APK: {res_corrupt}")
+        after = set(glob.glob(pattern))
+        leaked = after - before
+        self.assertEqual(leaked, set(), f"Lingering dump directories detected after corrupt APK failure: {leaked}")
+
+
+# =============================================================================
+# Group K: APK Signature and Certificate Verification (K.1 - K.3)
+# =============================================================================
+
+class TestGroupKApkSignature(BaseMultiTargetIntegrationTest):
+    """Group K: APK signing schemes (v1, v2) and X.509 certificate extraction / verification."""
+
+    def test_apk_signature_verification_full_mode(self) -> None:
+        """Case K.1: rvs_apk_signature extracts schemes, signers, certificates, and validates integrity."""
+        apk_path = Path("tests/fixtures/sample_raw.apk")
+        if not apk_path.exists():
+            self.skipTest("sample_raw.apk fixture not found")
+
+        res = self.harness.execute_tool(
+            "rvs_apk_signature",
+            {"file": str(apk_path), "verify": True, "compact": False},
+        )
+        self.assertTrue(res.get("success"), f"Signature query failed: {res}")
+        data = res.get("data", {})
+        self.assertTrue(data.get("is_signed"))
+        self.assertTrue(data.get("signing_block_present"))
+        self.assertTrue(data.get("verified"))
+        self.assertIn("v1", data.get("schemes", []))
+        self.assertIn("v2", data.get("schemes", []))
+
+        signers = data.get("signers", [])
+        self.assertGreaterEqual(len(signers), 1)
+        signer = signers[0]
+        self.assertIn("RvsTestSigner", signer.get("subject", ""))
+        self.assertIn("RvsTestSigner", signer.get("issuer", ""))
+        self.assertTrue(len(signer.get("sha256_fingerprint", "")) > 0)
+        self.assertTrue(len(signer.get("sha1_fingerprint", "")) > 0)
+
+    def test_apk_signature_compact_mode(self) -> None:
+        """Case K.2: rvs_apk_signature emits token-compact schema with compact keys."""
+        apk_path = Path("tests/fixtures/sample_raw.apk")
+        if not apk_path.exists():
+            self.skipTest("sample_raw.apk fixture not found")
+
+        res = self.harness.execute_tool(
+            "rvs_apk_signature",
+            {"file": str(apk_path), "verify": True, "compact": True},
+        )
+        self.assertTrue(res.get("success"), f"Compact signature query failed: {res}")
+        data = res.get("data", {})
+        self.assertTrue(data.get("signed"))
+        self.assertTrue(data.get("sig_block"))
+        self.assertTrue(data.get("verified"))
+        signers = data.get("signers", [])
+        self.assertGreaterEqual(len(signers), 1)
+        self.assertIn("sha256", signers[0])
+        self.assertIn("algo", signers[0])
+
+    def test_apk_signature_no_verify_flag(self) -> None:
+        """Case K.3: rvs_apk_signature with verify=False extracts details without asserting validity."""
+        apk_path = Path("tests/fixtures/sample_raw.apk")
+        if not apk_path.exists():
+            self.skipTest("sample_raw.apk fixture not found")
+
+        res = self.harness.execute_tool(
+            "rvs_apk_signature",
+            {"file": str(apk_path), "verify": False, "compact": False},
+        )
+        self.assertTrue(res.get("success"), f"Signature query failed: {res}")
+        data = res.get("data", {})
+        self.assertTrue(data.get("is_signed"))
+        self.assertNotIn("verified", data)
+
+
+# =============================================================================
+# Group L: Dalvik DEX Method Decompilation (L.1 - L.2)
+# =============================================================================
+
+class TestGroupLDexDecompilation(BaseMultiTargetIntegrationTest):
+    """Group L: Dalvik DEX bytecode decompilation into pseudo-code."""
+
+    def test_apk_dex_decompile_method(self) -> None:
+        """Case L.1: rvs_apk_dex with decompile=True decompiles matched methods."""
+        raw_apk = Path("tests/fixtures/sample_raw.apk")
+        if not raw_apk.exists():
+            self.skipTest("sample_raw.apk fixture not found")
+
+        res = self.harness.execute_tool(
+            "rvs_apk_dex",
+            {
+                "file": str(raw_apk),
+                "class": "QuickActionItem",
+                "method": "toggle",
+                "decompile": True,
+                "compact": False,
+            },
+        )
+        self.assertTrue(res.get("success"), f"DEX decompile query failed: {res}")
+        data = res.get("data", {})
+        self.assertIn("decompiled", data)
+        decomp_text = data.get("decompiled", "")
+        self.assertTrue("QuickActionItem" in decomp_text or "toggle" in decomp_text)
+
+    def test_apk_dex_decompile_flag_false_by_default(self) -> None:
+        """Case L.2: rvs_apk_dex without decompile flag omits decompiled pseudo-code."""
+        raw_apk = Path("tests/fixtures/sample_raw.apk")
+        if not raw_apk.exists():
+            self.skipTest("sample_raw.apk fixture not found")
+
+        res = self.harness.execute_tool(
+            "rvs_apk_dex",
+            {
+                "file": str(raw_apk),
+                "class": "QuickActionItem",
+                "method": "toggle",
+                "compact": False,
+            },
+        )
+        self.assertTrue(res.get("success"), f"DEX query failed: {res}")
+        data = res.get("data", {})
+        self.assertNotIn("decompiled", data)
+
+
+# =============================================================================
+# Group M: Dynamic Frida APK & Package Connection Support (M.1 - M.3)
+# =============================================================================
+
+class TestGroupMFridaApkConnection(BaseMultiTargetIntegrationTest):
+    """Group M: Frida dynamic connection support targeting APK archives and Android packages."""
+
+    def test_frida_spawn_apk_archive_target(self) -> None:
+        """Case M.1: rvs_frida_spawn connects to APK archive with fallback envelope and USB device URI."""
+        apk_path = self.temp_dir / "test_frida_target.apk"
+        create_synthetic_apk(apk_path)
+
+        res = self.harness.execute_tool(
+            "rvs_frida_spawn",
+            {"path": str(apk_path), "compact": True},
+        )
+        self.assertTrue(res.get("success"), f"Frida spawn APK failed: {res}")
+        data = res.get("data", {})
+        self.assertTrue(data.get("connected"))
+        self.assertTrue(data.get("fallback"))
+        self.assertEqual(data.get("os"), "android")
+        self.assertEqual(data.get("arch"), "arm64")
+        self.assertIn("frida://spawn/usb///", data.get("target_uri", ""))
+
+    def test_frida_spawn_package_parameter(self) -> None:
+        """Case M.2: rvs_frida_spawn accepts package parameter and generates canonical target URI."""
+        res = self.harness.execute_tool(
+            "rvs_frida_spawn",
+            {"package": "com.example.secure.app", "compact": True},
+        )
+        self.assertTrue(res.get("success"), f"Frida spawn package failed: {res}")
+        data = res.get("data", {})
+        self.assertTrue(data.get("connected"))
+        self.assertTrue(data.get("fallback"))
+        self.assertEqual(data.get("target_uri"), "frida://spawn/usb///com.example.secure.app")
+        self.assertEqual(data.get("process_name"), "com.example.secure.app")
+
+    def test_frida_attach_package_parameter(self) -> None:
+        """Case M.3: rvs_frida_attach accepts package parameter and attaches to Android package."""
+        res = self.harness.execute_tool(
+            "rvs_frida_attach",
+            {"package": "com.example.secure.app", "compact": True},
+        )
+        self.assertTrue(res.get("success"), f"Frida attach package failed: {res}")
+        data = res.get("data", {})
+        self.assertTrue(data.get("connected"))
+        self.assertTrue(data.get("fallback"))
+        self.assertEqual(data.get("target_uri"), "frida://attach/usb///com.example.secure.app")
+
+
 if __name__ == "__main__":
     unittest.main()

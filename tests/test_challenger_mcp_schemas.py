@@ -361,7 +361,7 @@ class TestUniversalToolSchemas(TestChallengerBase):
 
     def test_01_canonical_tools_count_and_completeness(self):
         """Verify CANONICAL_TOOLS contains all expected tools with valid definitions."""
-        self.assertEqual(len(CANONICAL_TOOLS), 48)
+        self.assertEqual(len(CANONICAL_TOOLS), 50)
         tool_names = [t["name"] for t in CANONICAL_TOOLS]
         for expected_tool in self.EXPECTED_16_TOOLS:
             self.assertIn(expected_tool, tool_names)

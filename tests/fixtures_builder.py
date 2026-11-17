@@ -22,6 +22,7 @@ Provides:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import struct
@@ -106,6 +107,8 @@ def synthesize_dex_bytes(
         map_data += struct.pack("<HHII", itype, 0, isize, ioff)
 
     file_size = map_off + len(map_data)
+    data_off = current_data_off
+    data_size = file_size - current_data_off
 
     # Construct Header (112 bytes)
     header = bytearray(header_size)
@@ -123,6 +126,9 @@ def synthesize_dex_bytes(
     # string_ids_size & string_ids_off
     struct.pack_into("<I", header, 0x38, string_ids_size)
     struct.pack_into("<I", header, 0x3C, string_ids_off)
+    # data_size & data_off
+    struct.pack_into("<I", header, 0x68, data_size)
+    struct.pack_into("<I", header, 0x6C, data_off)
 
     # Construct string_ids table (array of uint32 offsets)
     string_ids_table = bytearray()
@@ -382,25 +388,409 @@ def synthesize_elf_bytes(
     return bytes(data)
 
 
+# =============================================================================
+# ASN.1 DER & APK Signature Synthesizers
+# =============================================================================
+
+DEFAULT_RSA_MODULUS_HEX = (
+    "c4a45a33b006934c56832db740ca38596001099e2ff9bdfdbbd9b0391ab1a120"
+    "5f93e36e65561a32a68a5c689d14ec9f02fe045fb9633e68dfd058ad116ff1a3"
+    "bc8c8d2d9bb4e637a3b3dc5d820464f9bf51a2f6fb39f60b43f1190bc1ef0452"
+    "3c942eeed3be04f46f4142f9b8893707cb67ca2b6e50e82c5f1c9c43d2c77d"
+)
+
+
+def _der_len(length: int) -> bytes:
+    """Encode ASN.1 length in DER format."""
+    if length < 0x80:
+        return bytes([length])
+    lb = bytearray()
+    t = length
+    while t > 0:
+        lb.insert(0, t & 0xFF)
+        t >>= 8
+    return bytes([0x80 | len(lb)]) + bytes(lb)
+
+
+def _der_tlv(tag: int, val: bytes) -> bytes:
+    """Construct a DER Tag-Length-Value."""
+    return bytes([tag]) + _der_len(len(val)) + val
+
+
+def _der_seq(val: bytes) -> bytes:
+    """Construct an ASN.1 SEQUENCE."""
+    return _der_tlv(0x30, val)
+
+
+def _der_set(val: bytes) -> bytes:
+    """Construct an ASN.1 SET."""
+    return _der_tlv(0x31, val)
+
+
+def _der_int(val: int) -> bytes:
+    """Construct an ASN.1 INTEGER."""
+    if val == 0:
+        return _der_tlv(0x02, b"\x00")
+    b = bytearray()
+    t = val
+    while t > 0:
+        b.insert(0, t & 0xFF)
+        t >>= 8
+    if b[0] & 0x80:
+        b.insert(0, 0x00)
+    return _der_tlv(0x02, bytes(b))
+
+
+def _der_oid(oid_str: str) -> bytes:
+    """Encode an OID string into DER."""
+    parts = [int(p) for p in oid_str.split(".")]
+    res = bytearray([40 * parts[0] + parts[1]])
+    for part in parts[2:]:
+        p_bytes = bytearray()
+        v = part
+        while True:
+            p_bytes.insert(0, (v & 0x7F) | (0x80 if len(p_bytes) > 0 else 0x00))
+            v >>= 7
+            if v == 0:
+                break
+        res.extend(p_bytes)
+    return _der_tlv(0x06, bytes(res))
+
+
+def _der_bit_str(val: bytes, unused: int = 0) -> bytes:
+    """Construct an ASN.1 BIT STRING."""
+    return _der_tlv(0x03, bytes([unused]) + val)
+
+
+def _der_octet_str(val: bytes) -> bytes:
+    """Construct an ASN.1 OCTET STRING."""
+    return _der_tlv(0x04, val)
+
+
+def _der_null() -> bytes:
+    """Construct an ASN.1 NULL."""
+    return b"\x05\x00"
+
+
+def _der_printable(s: str) -> bytes:
+    """Construct an ASN.1 PrintableString."""
+    return _der_tlv(0x13, s.encode("ascii"))
+
+
+def _der_utf8(s: str) -> bytes:
+    """Construct an ASN.1 UTF8String."""
+    return _der_tlv(0x0C, s.encode("utf-8"))
+
+
+def _der_utc(s: str) -> bytes:
+    """Construct an ASN.1 UTCTime."""
+    return _der_tlv(0x17, s.encode("ascii"))
+
+
+def _parse_dn(dn_str: str) -> bytes:
+    """Parse a Distinguished Name (e.g. 'CN=Signer, O=Org, C=US') into DER RDN sequence."""
+    oid_map = {
+        "C": "2.5.4.6",
+        "O": "2.5.4.10",
+        "OU": "2.5.4.11",
+        "CN": "2.5.4.3",
+    }
+    rdns = bytearray()
+    for part in dn_str.split(","):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k = k.strip().upper()
+            v = v.strip()
+            oid = oid_map.get(k, "2.5.4.3")
+            s_der = _der_printable(v) if k == "C" else _der_utf8(v)
+            rdns.extend(_der_set(_der_seq(_der_oid(oid) + s_der)))
+    if not rdns:
+        rdns.extend(_der_set(_der_seq(_der_oid("2.5.4.3") + _der_utf8("RvsTestSigner"))))
+    return _der_seq(bytes(rdns))
+
+
+def synthesize_x509_cert_bytes(
+    cert_subject: str = "CN=RvsTestSigner, O=RvsTestSuite, C=US",
+    cert_issuer: Optional[str] = None,
+    serial_number: int = 0x12345678,
+    not_before: str = "240101000000Z",
+    not_after: str = "440101000000Z",
+) -> Tuple[bytes, bytes]:
+    """
+    Synthesizes a deterministic DER-encoded X.509 v3 self-signed certificate
+    and SubjectPublicKeyInfo structure.
+    
+    Returns:
+        (cert_der, spki_der)
+    """
+    subject_der = _parse_dn(cert_subject)
+    issuer_der = _parse_dn(cert_issuer or cert_subject)
+
+    rsa_pub_der = _der_seq(_der_int(int(DEFAULT_RSA_MODULUS_HEX, 16)) + _der_int(65537))
+    alg_rsa = _der_seq(_der_oid("1.2.840.113549.1.1.1") + _der_null())
+    spki = _der_seq(alg_rsa + _der_bit_str(rsa_pub_der))
+
+    alg_rsa_sha256 = _der_seq(_der_oid("1.2.840.113549.1.1.11") + _der_null())
+    validity = _der_seq(_der_utc(not_before) + _der_utc(not_after))
+
+    tbs = _der_seq(
+        _der_tlv(0xA0, _der_int(2))  # v3
+        + _der_int(serial_number)
+        + alg_rsa_sha256
+        + issuer_der
+        + validity
+        + subject_der
+        + spki
+    )
+    sig_val = (hashlib.sha256(tbs).digest() * 4)[:128]
+    cert_der = _der_seq(tbs + alg_rsa_sha256 + _der_bit_str(sig_val))
+    return cert_der, spki
+
+
+def synthesize_pkcs7_signature_bytes(
+    cert_subject: str = "CN=RvsTestSigner, O=RvsTestSuite, C=US",
+    cert_issuer: Optional[str] = None,
+    serial_number: int = 0x12345678,
+) -> bytes:
+    """
+    Synthesizes a deterministic DER-encoded PKCS#7 SignedData structure
+    containing the X.509 signer certificate for META-INF/*.RSA.
+    """
+    cert_der, _ = synthesize_x509_cert_bytes(
+        cert_subject=cert_subject,
+        cert_issuer=cert_issuer,
+        serial_number=serial_number,
+    )
+    issuer_der = _parse_dn(cert_issuer or cert_subject)
+    alg_rsa = _der_seq(_der_oid("1.2.840.113549.1.1.1") + _der_null())
+    alg_sha256 = _der_seq(_der_oid("2.16.840.1.101.3.4.2.1") + _der_null())
+    encap_content = _der_seq(_der_oid("1.2.840.113549.1.7.1"))
+    issuer_and_serial = _der_seq(issuer_der + _der_int(serial_number))
+    dummy_sig = b"\x42" * 128
+
+    signer_info = _der_seq(
+        _der_int(1)
+        + issuer_and_serial
+        + alg_sha256
+        + alg_rsa
+        + _der_octet_str(dummy_sig)
+    )
+    signed_data = _der_seq(
+        _der_int(1)
+        + _der_set(alg_sha256)
+        + encap_content
+        + _der_tlv(0xA0, cert_der)
+        + _der_set(signer_info)
+    )
+    return _der_seq(_der_oid("1.2.840.113549.1.7.2") + _der_tlv(0xA0, signed_data))
+
+
+def synthesize_arsc_bytes(
+    pkg_name: str = "com.example.synthetic.target",
+    strings: Optional[List[str]] = None,
+) -> bytes:
+    """
+    Synthesizes a minimal valid spec-compliant Android binary resources.arsc table
+    containing a global string pool, package chunk, type string pool, and key string pool.
+    """
+    if strings is None:
+        strings = ["app_name", "SyntheticTarget", "res/values/strings.xml"]
+
+    def _build_pool(strs: List[str]) -> bytes:
+        offsets = []
+        str_data = bytearray()
+        for s in strs:
+            offsets.append(len(str_data))
+            encoded = s.encode("utf-8")
+            str_data.append(len(s) & 0x7F)
+            str_data.append(len(encoded) & 0x7F)
+            str_data.extend(encoded)
+            str_data.append(0)
+        while len(str_data) % 4 != 0:
+            str_data.append(0)
+        h_size = 28
+        count = len(strs)
+        start = h_size + (count * 4)
+        total = start + len(str_data)
+        h = bytearray()
+        h.extend(struct.pack("<HHI", 0x0001, h_size, total))
+        h.extend(struct.pack("<IIIII", count, 0, 0x00000100, start, 0))
+        for off in offsets:
+            h.extend(struct.pack("<I", off))
+        return bytes(h) + bytes(str_data)
+
+    global_pool = _build_pool(strings)
+    type_pool = _build_pool(["attr", "string", "xml"])
+    key_pool = _build_pool(["app_name", "welcome_message", "api_endpoint"])
+
+    pkg_h_size = 288
+    type_off = pkg_h_size
+    key_off = type_off + len(type_pool)
+    pkg_total = key_off + len(key_pool)
+
+    pkg_name_utf16 = pkg_name.encode("utf-16le")
+    pkg_name_padded = pkg_name_utf16.ljust(256, b"\x00")[:256]
+
+    pkg_chunk = bytearray()
+    pkg_chunk.extend(struct.pack("<HHI", 0x0200, pkg_h_size, pkg_total))
+    pkg_chunk.extend(struct.pack("<I", 0x7F))
+    pkg_chunk.extend(pkg_name_padded)
+    pkg_chunk.extend(struct.pack("<IIIII", type_off, 0, key_off, 0, 0))
+    pkg_chunk.extend(type_pool)
+    pkg_chunk.extend(key_pool)
+
+    table_h_size = 12
+    table_total = table_h_size + len(global_pool) + len(pkg_chunk)
+    table_header = struct.pack("<HHII", 0x0002, table_h_size, table_total, 1)
+
+    return table_header + global_pool + bytes(pkg_chunk)
+
+
+def synthesize_apk_signing_block_v2(
+    pairs: Optional[List[Tuple[int, bytes]]] = None,
+    cert_der: Optional[bytes] = None,
+    spki_der: Optional[bytes] = None,
+    apk_digest_sha256: Optional[bytes] = None,
+) -> bytes:
+    """
+    Synthesizes an Android APK Signing Block with ID 0x7109871a (v2 scheme)
+    and 16-byte magic 'APK Sig Block 42'.
+    """
+    if pairs is None:
+        if cert_der is None or spki_der is None:
+            cert_der, spki_der = synthesize_x509_cert_bytes()
+        if apk_digest_sha256 is None:
+            apk_digest_sha256 = hashlib.sha256(b"rvs_apk_signing_block_v2_digest").digest()
+
+        def _pfx(data: bytes) -> bytes:
+            return struct.pack("<I", len(data)) + data
+
+        algo_id = 0x0101  # RSA-PKCS1-v1_5 with SHA256
+        digest_entry = struct.pack("<I", algo_id) + _pfx(apk_digest_sha256)
+        digests_seq = _pfx(_pfx(digest_entry))
+        certs_seq = _pfx(_pfx(cert_der))
+        attrs_seq = _pfx(b"")
+        signed_data = digests_seq + certs_seq + attrs_seq
+
+        sig_entry = struct.pack("<I", algo_id) + _pfx(b"\x5a" * 128)
+        sigs_seq = _pfx(_pfx(sig_entry))
+        signer = _pfx(signed_data) + sigs_seq + _pfx(spki_der)
+        signers_seq = _pfx(_pfx(signer))
+        pairs = [(0x7109871A, signers_seq)]
+
+    pairs_bytes = bytearray()
+    for pair_id, pair_val in pairs:
+        pair_len = 4 + len(pair_val)
+        pairs_bytes.extend(struct.pack("<Q", pair_len))
+        pairs_bytes.extend(struct.pack("<I", pair_id))
+        pairs_bytes.extend(pair_val)
+
+    # APK Signing Block format:
+    # uint64 size_of_block (excluding this field)
+    # pairs...
+    # uint64 size_of_block (same as first field)
+    # 16-byte magic: 'APK Sig Block 42'
+    block_size = len(pairs_bytes) + 24
+    block = bytearray()
+    block.extend(struct.pack("<Q", block_size))
+    block.extend(pairs_bytes)
+    block.extend(struct.pack("<Q", block_size))
+    block.extend(b"APK Sig Block 42")
+    return bytes(block)
+
+
+def inject_apk_signing_block(apk_path: Union[str, Path], block_bytes: bytes) -> None:
+    """
+    Injects an APK Signing Block immediately before the Central Directory
+    in a valid ZIP archive and shifts the Central Directory offset in the EOCD record.
+    """
+    apk = Path(apk_path)
+    zip_data = apk.read_bytes()
+    eocd_idx = zip_data.rfind(b"PK\x05\x06")
+    if eocd_idx == -1:
+        raise ValueError(f"Target {apk} is not a valid ZIP archive (no EOCD found)")
+    cd_offset = struct.unpack("<I", zip_data[eocd_idx + 16 : eocd_idx + 20])[0]
+
+    new_data = bytearray()
+    new_data.extend(zip_data[:cd_offset])
+    new_data.extend(block_bytes)
+    new_data.extend(zip_data[cd_offset:eocd_idx])
+
+    new_cd_offset = cd_offset + len(block_bytes)
+    new_eocd = bytearray(zip_data[eocd_idx:])
+    new_eocd[16:20] = struct.pack("<I", new_cd_offset)
+    new_data.extend(new_eocd)
+
+    apk.write_bytes(bytes(new_data))
+
+
+def synthesize_v1_manifest_and_sf(
+    entries: Dict[str, bytes],
+) -> Tuple[bytes, bytes, bytes]:
+    """
+    Synthesizes META-INF/MANIFEST.MF, META-INF/CERT.SF, and META-INF/CERT.RSA
+    for standard v1 JAR signing.
+    """
+    mf_lines = [
+        "Manifest-Version: 1.0",
+        "Created-By: 1.0 (Synthetic APK Fixture Builder)",
+    ]
+    for name, data in sorted(entries.items()):
+        if name.startswith("META-INF/"):
+            continue
+        digest = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
+        mf_lines.append("")
+        mf_lines.append(f"Name: {name}")
+        mf_lines.append(f"SHA-256-Digest: {digest}")
+    mf_lines.append("")
+    mf_bytes = "\r\n".join(mf_lines).encode("utf-8")
+
+    mf_digest = base64.b64encode(hashlib.sha256(mf_bytes).digest()).decode("ascii")
+    sf_lines = [
+        "Signature-Version: 1.0",
+        "Created-By: 1.0 (Synthetic APK Fixture Builder)",
+        f"SHA-256-Digest-Manifest: {mf_digest}",
+    ]
+    for name, data in sorted(entries.items()):
+        if name.startswith("META-INF/"):
+            continue
+        digest = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
+        sf_lines.append("")
+        sf_lines.append(f"Name: {name}")
+        sf_lines.append(f"SHA-256-Digest: {digest}")
+    sf_lines.append("")
+    sf_bytes = "\r\n".join(sf_lines).encode("utf-8")
+
+    rsa_bytes = synthesize_pkcs7_signature_bytes()
+    return mf_bytes, sf_bytes, rsa_bytes
+
+
 def create_synthetic_apk(
     output_path: Union[str, Path],
     elf_fixtures: Optional[Dict[str, Union[str, Path, bytes]]] = None,
     multidex: bool = True,
     dex_strings_map: Optional[Dict[str, List[str]]] = None,
     include_manifest: bool = True,
+    sign_v1: bool = True,
+    sign_v2: bool = True,
+    assets: Optional[Dict[str, Union[str, bytes]]] = None,
+    resources: Optional[Dict[str, Union[str, bytes]]] = None,
+    tamper_entry: Optional[Tuple[str, bytes]] = None,
 ) -> Path:
     """
-    Creates a valid synthetic Android APK package archive with multi-ABI native libraries
-    and Dalvik DEX bytecode components.
+    Creates a valid synthetic Android APK package archive with multi-ABI native libraries,
+    Dalvik DEX bytecode components, embedded resources, assets, and v1/v2 signatures.
     
     Default layout:
     - AndroidManifest.xml
-    - META-INF/MANIFEST.MF
     - classes.dex (valid Dalvik DEX)
     - classes2.dex (if multidex is True)
-    - lib/x86_64/libauth.so (synthesized x86_64 ELF)
-    - lib/arm64-v8a/libauth.so (synthesized arm64 ELF)
-    - lib/x86_64/libflow.so (synthesized x86_64 ELF)
+    - lib/x86_64/libauth.so, lib/arm64-v8a/libauth.so, lib/x86_64/libflow.so
+    - assets/app_config.json, assets/secret_token.txt
+    - res/values/strings.xml, resources.arsc
+    - META-INF/MANIFEST.MF, META-INF/CERT.SF, META-INF/CERT.RSA (if sign_v1 is True)
+    - APK Signing Block v2 (if sign_v2 is True)
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -419,8 +809,7 @@ def create_synthetic_apk(
             ],
         }
 
-    # Resolve default ELF fixtures: prefer compiled disk fixtures with machine code for disasm/functions,
-    # falling back to synthesized ELFs if absent.
+    # Resolve default ELF fixtures
     if elf_fixtures is None:
         auth_elf = FIXTURES_DIR / "auth_gate_elf64"
         flow_elf = FIXTURES_DIR / "flow_calc_elf64"
@@ -448,51 +837,164 @@ def create_synthetic_apk(
             "lib/x86_64/libflow.so": flow_bytes,
         }
 
-    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # 1. AndroidManifest.xml
-        if include_manifest:
-            manifest_xml = (
-                b'<?xml version="1.0" encoding="utf-8"?>\n'
-                b'<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
-                b'    package="com.example.synthetic.target"\n'
-                b'    android:versionCode="1"\n'
-                b'    android:versionName="1.0">\n'
-                b'    <application android:hasCode="true" android:label="SyntheticTarget">\n'
-                b'        <activity android:name=".MainActivity"/>\n'
-                b'    </application>\n'
-                b'</manifest>\n'
-            )
-            zf.writestr("AndroidManifest.xml", manifest_xml)
+    # Prepare archive entries dictionary
+    entries: Dict[str, bytes] = {}
 
-        # 2. META-INF/MANIFEST.MF
-        manifest_mf = (
+    # 1. AndroidManifest.xml
+    if include_manifest:
+        manifest_xml = (
+            b'<?xml version="1.0" encoding="utf-8"?>\n'
+            b'<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
+            b'    package="com.example.synthetic.target"\n'
+            b'    android:versionCode="1"\n'
+            b'    android:versionName="1.0">\n'
+            b'    <application android:hasCode="true" android:label="SyntheticTarget">\n'
+            b'        <activity android:name=".MainActivity"/>\n'
+            b'    </application>\n'
+            b'</manifest>\n'
+        )
+        entries["AndroidManifest.xml"] = manifest_xml
+
+    # 2. classes.dex
+    dex1_strings = dex_strings_map.get("classes.dex", ["Lcom/example/Main;"])
+    entries["classes.dex"] = synthesize_dex_bytes(strings=dex1_strings)
+
+    # 3. classes2.dex (if multidex)
+    if multidex:
+        dex2_strings = dex_strings_map.get("classes2.dex", ["Lcom/example/Secondary;"])
+        entries["classes2.dex"] = synthesize_dex_bytes(strings=dex2_strings)
+
+    # 4. Native libraries (ELF .so files)
+    for archive_path, content in elf_fixtures.items():
+        if isinstance(content, (str, Path)):
+            content_bytes = Path(content).read_bytes()
+        elif isinstance(content, bytes):
+            content_bytes = content
+        else:
+            raise TypeError(f"Invalid fixture content type for {archive_path}: {type(content)}")
+        entries[archive_path] = content_bytes
+
+    # 5. Assets
+    if assets is None:
+        assets = {
+            "assets/app_config.json": b'{"environment": "production", "debug": false, "app_id": "com.example.synthetic.target"}\n',
+            "assets/secret_token.txt": b"rvs_synthetic_secret_token_alpha_numeric_key_99\n",
+        }
+    for asset_path, asset_content in assets.items():
+        if isinstance(asset_content, str):
+            entries[asset_path] = asset_content.encode("utf-8")
+        else:
+            entries[asset_path] = bytes(asset_content)
+
+    # 6. Resources
+    if resources is None:
+        resources = {
+            "res/values/strings.xml": (
+                b'<?xml version="1.0" encoding="utf-8"?>\n'
+                b'<resources>\n'
+                b'    <string name="app_name">SyntheticTarget</string>\n'
+                b'    <string name="welcome_message">Welcome to rvs reverse engineering suite</string>\n'
+                b'    <string name="api_endpoint">https://api.example.com/v1</string>\n'
+                b'</resources>\n'
+            ),
+            "resources.arsc": synthesize_arsc_bytes(),
+        }
+    for res_path, res_content in resources.items():
+        if isinstance(res_content, str):
+            entries[res_path] = res_content.encode("utf-8")
+        else:
+            entries[res_path] = bytes(res_content)
+
+    # 7. v1 JAR Signatures
+    if sign_v1:
+        mf_bytes, sf_bytes, rsa_bytes = synthesize_v1_manifest_and_sf(entries)
+        entries["META-INF/MANIFEST.MF"] = mf_bytes
+        entries["META-INF/CERT.SF"] = sf_bytes
+        entries["META-INF/CERT.RSA"] = rsa_bytes
+    else:
+        # Minimal non-signature manifest header if requested
+        entries["META-INF/MANIFEST.MF"] = (
             b"Manifest-Version: 1.0\n"
             b"Created-By: 1.0 (Synthetic APK Fixture Builder)\n"
         )
-        zf.writestr("META-INF/MANIFEST.MF", manifest_mf)
 
-        # 3. classes.dex
-        dex1_strings = dex_strings_map.get("classes.dex", ["Lcom/example/Main;"])
-        dex1_bytes = synthesize_dex_bytes(strings=dex1_strings)
-        zf.writestr("classes.dex", dex1_bytes)
+    # Mutate entry payload AFTER v1 signatures are computed to trigger signature mismatch
+    if tamper_entry is not None:
+        tamper_name, tamper_data = tamper_entry
+        entries[tamper_name] = tamper_data
 
-        # 4. classes2.dex (if multidex)
-        if multidex:
-            dex2_strings = dex_strings_map.get("classes2.dex", ["Lcom/example/Secondary;"])
-            dex2_bytes = synthesize_dex_bytes(strings=dex2_strings)
-            zf.writestr("classes2.dex", dex2_bytes)
-
-        # 5. Native libraries (ELF .so files)
-        for archive_path, content in elf_fixtures.items():
-            if isinstance(content, (str, Path)):
-                content_bytes = Path(content).read_bytes()
-            elif isinstance(content, bytes):
-                content_bytes = content
+    # Write archive
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries.items():
+            zinfo = zipfile.ZipInfo(name)
+            if name.startswith("assets/"):
+                zinfo.compress_type = zipfile.ZIP_STORED
             else:
-                raise TypeError(f"Invalid fixture content type for {archive_path}: {type(content)}")
-            zf.writestr(archive_path, content_bytes)
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(zinfo, data)
+
+    # 8. v2 APK Signing Block
+    if sign_v2:
+        block = synthesize_apk_signing_block_v2()
+        inject_apk_signing_block(out, block)
 
     return out
+
+
+def create_unsigned_apk(
+    output_path: Union[str, Path],
+    multidex: bool = False,
+) -> Path:
+    """Creates a synthetic APK without any signatures (no v1 META-INF signatures, no v2 block)."""
+    return create_synthetic_apk(
+        output_path=output_path,
+        multidex=multidex,
+        sign_v1=False,
+        sign_v2=False,
+    )
+
+
+def create_tampered_signature_apk(
+    output_path: Union[str, Path],
+) -> Path:
+    """
+    Creates an APK with valid v1 & v2 signatures initially,
+    then deliberately mutates the content of an entry without updating signatures,
+    causing cryptographic digest verification to fail while preserving ZIP container integrity.
+    """
+    return create_synthetic_apk(
+        output_path=output_path,
+        sign_v1=True,
+        sign_v2=True,
+        tamper_entry=("assets/secret_token.txt", b"rvs_TAMPR_secret_token_alpha_numeric_key_99\n"),
+    )
+
+
+def create_corrupted_signing_block_apk(
+    output_path: Union[str, Path],
+    corruption_type: str = "bad_magic",
+) -> Path:
+    """
+    Creates an APK with a corrupted APK Signing Block.
+    Supported corruption types:
+    - 'bad_magic': Mutates the 16-byte magic to 'BAD Sig Block 42'
+    - 'size_mismatch': First uint64 size != second uint64 size
+    - 'truncated': Truncates block bytes
+    """
+    apk_path = Path(output_path)
+    create_synthetic_apk(apk_path, sign_v1=True, sign_v2=False)
+    block = bytearray(synthesize_apk_signing_block_v2())
+    if corruption_type == "bad_magic":
+        block[-16:] = b"BAD Sig Block 42"
+    elif corruption_type == "size_mismatch":
+        struct.pack_into("<Q", block, len(block) - 24, 0xDEADBEEF)
+    elif corruption_type == "truncated":
+        block = block[: len(block) - 10]
+    else:
+        block[-16:] = b"\x00" * 16
+
+    inject_apk_signing_block(apk_path, bytes(block))
+    return apk_path
 
 
 def create_synthetic_react_native_apk(output_path: Union[str, Path]) -> Path:
@@ -967,6 +1469,124 @@ class TestFixturesBuilder(unittest.TestCase):
         create_zero_byte_target(zero_path)
         self.assertTrue(zero_path.exists())
         self.assertEqual(zero_path.stat().st_size, 0)
+
+    def test_synthesize_x509_cert_and_pkcs7(self) -> None:
+        """Validates pure-Python X.509 certificate and PKCS#7 SignedData synthesis."""
+        cert_der, spki_der = synthesize_x509_cert_bytes(
+            cert_subject="CN=CustomSigner, O=CustomOrg, C=US",
+            serial_number=0xAABBCCDD,
+        )
+        self.assertTrue(cert_der.startswith(b"\x30"))
+        self.assertIn(b"CustomSigner", cert_der)
+        self.assertIn(b"CustomOrg", cert_der)
+        self.assertTrue(spki_der.startswith(b"\x30"))
+
+        pkcs7_der = synthesize_pkcs7_signature_bytes(
+            cert_subject="CN=CustomSigner, O=CustomOrg, C=US",
+            serial_number=0xAABBCCDD,
+        )
+        self.assertTrue(pkcs7_der.startswith(b"\x30"))
+        # Must contain SignedData OID 1.2.840.113549.1.7.2
+        self.assertIn(_der_oid("1.2.840.113549.1.7.2"), pkcs7_der)
+        # Must contain embedded certificate
+        self.assertIn(cert_der, pkcs7_der)
+
+    def test_synthesize_arsc_bytes(self) -> None:
+        """Validates pure-Python binary resources.arsc table structure."""
+        arsc = synthesize_arsc_bytes(pkg_name="com.test.app", strings=["hello", "world"])
+        self.assertGreaterEqual(len(arsc), 12)
+        chunk_type, header_size, total_size, pkg_count = struct.unpack_from("<HHII", arsc, 0)
+        self.assertEqual(chunk_type, 0x0002)  # RES_TABLE_TYPE
+        self.assertEqual(header_size, 12)
+        self.assertEqual(total_size, len(arsc))
+        self.assertEqual(pkg_count, 1)
+        self.assertIn(b"com.test.app".replace(b"", b"\x00")[1:-1], arsc)  # UTF-16LE package name
+
+    def test_synthesize_apk_signing_block_v2(self) -> None:
+        """Validates APK Signing Block v2 layout, magic, and size fields."""
+        block = synthesize_apk_signing_block_v2()
+        self.assertTrue(block.endswith(b"APK Sig Block 42"))
+        size1 = struct.unpack_from("<Q", block, 0)[0]
+        size2 = struct.unpack_from("<Q", block, len(block) - 24)[0]
+        self.assertEqual(size1, size2)
+        self.assertEqual(size1, len(block) - 8)
+        # Verify v2 ID 0x7109871a is present
+        self.assertIn(struct.pack("<I", 0x7109871A), block)
+
+    def test_create_synthetic_apk_with_v1_v2_and_resources(self) -> None:
+        """Validates that synthetic APK packaging includes v1 signatures, v2 signing block, resources, and assets."""
+        apk_path = self.tmp / "sample_signed.apk"
+        create_synthetic_apk(apk_path, multidex=True, sign_v1=True, sign_v2=True)
+        self.assertTrue(apk_path.exists())
+
+        # Verify ZIP structure
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            namelist = zf.namelist()
+            self.assertIn("AndroidManifest.xml", namelist)
+            self.assertIn("classes.dex", namelist)
+            self.assertIn("classes2.dex", namelist)
+            self.assertIn("assets/app_config.json", namelist)
+            self.assertIn("assets/secret_token.txt", namelist)
+            self.assertIn("res/values/strings.xml", namelist)
+            self.assertIn("resources.arsc", namelist)
+            self.assertIn("META-INF/MANIFEST.MF", namelist)
+            self.assertIn("META-INF/CERT.SF", namelist)
+            self.assertIn("META-INF/CERT.RSA", namelist)
+
+            # Check that manifest contains digests
+            mf_content = zf.read("META-INF/MANIFEST.MF").decode("utf-8")
+            self.assertIn("Name: AndroidManifest.xml", mf_content)
+            self.assertIn("SHA-256-Digest:", mf_content)
+
+            # Check that CERT.SF contains manifest digest
+            sf_content = zf.read("META-INF/CERT.SF").decode("utf-8")
+            self.assertIn("SHA-256-Digest-Manifest:", sf_content)
+
+            # Check CERT.RSA is valid PKCS#7
+            rsa_bytes = zf.read("META-INF/CERT.RSA")
+            self.assertTrue(rsa_bytes.startswith(b"\x30"))
+
+        # Verify APK Signing Block exists in raw file before central directory
+        raw_bytes = apk_path.read_bytes()
+        self.assertIn(b"APK Sig Block 42", raw_bytes)
+        self.assertIn(struct.pack("<I", 0x7109871A), raw_bytes)
+
+    def test_create_unsigned_apk(self) -> None:
+        """Validates unsigned APK fixture has no signatures."""
+        apk_path = self.tmp / "sample_unsigned.apk"
+        create_unsigned_apk(apk_path)
+        self.assertTrue(apk_path.exists())
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            namelist = zf.namelist()
+            self.assertNotIn("META-INF/CERT.SF", namelist)
+            self.assertNotIn("META-INF/CERT.RSA", namelist)
+        raw_bytes = apk_path.read_bytes()
+        self.assertNotIn(b"APK Sig Block 42", raw_bytes)
+
+    def test_create_tampered_signature_apk(self) -> None:
+        """Validates tampered signature APK fixture mutates file payload while preserving ZIP integrity."""
+        apk_path = self.tmp / "sample_tampered.apk"
+        create_tampered_signature_apk(apk_path)
+        self.assertTrue(apk_path.exists())
+        raw_bytes = apk_path.read_bytes()
+        self.assertIn(b"APK Sig Block 42", raw_bytes)
+        self.assertIn(b"TAMPR", raw_bytes)
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            self.assertIsNone(zf.testzip())
+            content = zf.read("assets/secret_token.txt")
+            self.assertIn(b"TAMPR", content)
+
+    def test_create_corrupted_signing_block_apk(self) -> None:
+        """Validates corrupted signing block fixtures."""
+        bad_magic_path = self.tmp / "bad_magic.apk"
+        create_corrupted_signing_block_apk(bad_magic_path, corruption_type="bad_magic")
+        self.assertTrue(bad_magic_path.exists())
+        self.assertIn(b"BAD Sig Block 42", bad_magic_path.read_bytes())
+
+        mismatch_path = self.tmp / "mismatch.apk"
+        create_corrupted_signing_block_apk(mismatch_path, corruption_type="size_mismatch")
+        self.assertTrue(mismatch_path.exists())
+        self.assertIn(struct.pack("<Q", 0xDEADBEEF), mismatch_path.read_bytes())
 
 
 if __name__ == "__main__":

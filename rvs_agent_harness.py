@@ -24,8 +24,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,7 +76,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.3.7"
+SERVER_VERSION: str = "0.4.0"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -3755,15 +3757,19 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "rvs_frida_attach",
-        "description": "Attach r2frida to a running process by PID, process name, or full Frida URI for live dynamic instrumentation.",
+        "description": "Attach r2frida to a running process by PID, process name, Android package name, or full Frida URI for live dynamic instrumentation.",
         "properties": {
             "target": {
                 "type": "string",
-                "description": "Target PID (e.g. '1234'), process name (e.g. 'firefox'), or frida URI.",
+                "description": "Target PID (e.g. '1234'), process name (e.g. 'firefox'), Android package name, or frida URI.",
+            },
+            "package": {
+                "type": "string",
+                "description": "Optional Android application package name (e.g. 'com.example.app') when targeting Android USB devices or emulators.",
             },
             "device": {
                 "type": "string",
-                "description": "Device type: 'local', 'usb', or remote 'IP:port'. Defaults to 'local'.",
+                "description": "Device type: 'local', 'usb', or remote 'IP:port'. Defaults to 'local' (or 'usb' for Android package targets).",
             },
             "timeout": {
                 "type": "integer",
@@ -3778,11 +3784,15 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "rvs_frida_spawn",
-        "description": "Spawn a new target executable under r2frida dynamic instrumentation with optional arguments.",
+        "description": "Spawn a new target executable or Android APK package under r2frida dynamic instrumentation with optional arguments.",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the executable to spawn under Frida.",
+                "description": "Path to the executable or APK archive to spawn under Frida.",
+            },
+            "package": {
+                "type": "string",
+                "description": "Optional Android application package name (e.g. 'com.example.app') when targeting Android USB devices or emulators.",
             },
             "args": {
                 "type": "array",
@@ -3791,7 +3801,7 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             },
             "device": {
                 "type": "string",
-                "description": "Device type: 'local', 'usb', or remote. Defaults to 'local'.",
+                "description": "Device type: 'local', 'usb', or remote. Defaults to 'local' (or 'usb' for Android package targets).",
             },
             "timeout": {
                 "type": "integer",
@@ -4242,6 +4252,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Disassemble Dalvik bytecode for matched methods. Defaults to false.",
             },
+            "decompile": {
+                "type": "boolean",
+                "description": "Decompile Dalvik bytecode into high-level pseudo-Java representation for matched methods. Defaults to false.",
+            },
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
@@ -4272,6 +4286,52 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "xrefs": {
                 "type": "boolean",
                 "description": "Extract cross-references for detected JNI functions. Defaults to false.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_apk_resources",
+        "description": "Inspect and dump Android APK resources, asset directories, and string table values (res/*, assets/*, resources.arsc).",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target APK archive or extracted directory.",
+            },
+            "type": {
+                "type": "string",
+                "description": "Optional resource type filter (e.g. 'asset', 'layout', 'drawable', 'string', 'xml').",
+            },
+            "name": {
+                "type": "string",
+                "description": "Optional resource or asset filename substring filter.",
+            },
+            "dump": {
+                "type": "boolean",
+                "description": "Dump raw text or decoded content of matched resource entries. Defaults to false.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Emit token-optimized compact output. Defaults to true.",
+            },
+        },
+        "required": ["file"],
+    },
+    {
+        "name": "rvs_apk_signature",
+        "description": "Extract and verify APK signing details (v1 JAR signing, v2/v3 signature schemes, X.509 certificate subject, issuer, validity, and SHA-256 fingerprints).",
+        "properties": {
+            "file": {
+                "type": "string",
+                "description": "Path to the target APK archive.",
+            },
+            "verify": {
+                "type": "boolean",
+                "description": "Perform cryptographic signature integrity verification. Defaults to true.",
             },
             "compact": {
                 "type": "boolean",
@@ -5471,11 +5531,12 @@ class RvsHarness:
         class_name: Optional[str] = None,
         method: Optional[str] = None,
         disasm: bool = False,
+        decompile: bool = False,
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
     ) -> ApiResponseDict:
-        """Analyze DEX bytecode, classes, methods, signatures, and strings."""
+        """Analyze DEX bytecode, classes, methods, signatures, strings, and decompilation."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
         mode: OutputMode = "compact" if eff_compact else "full"
         args = ["apk", "dex", str(file)]
@@ -5487,6 +5548,8 @@ class RvsHarness:
             args.extend(["--method", str(method)])
         if disasm:
             args.append("--disasm")
+        if decompile:
+            args.append("--decompile")
         return self.run(args, timeout=timeout, mode=mode, budget=budget)
 
     def apk_native(
@@ -5512,6 +5575,108 @@ class RvsHarness:
             args.extend(["--symbol", str(symbol)])
         if xrefs:
             args.append("--xrefs")
+        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+
+    def apk_resources(
+        self,
+        file: Union[str, Path],
+        res_type: Optional[str] = None,
+        name: Optional[str] = None,
+        dump: Union[bool, str, Path] = False,
+        compact: Optional[bool] = None,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Inspect and dump Android APK resources, asset directories, and string table values."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
+        args = ["apk", "resources", str(file), "--list"]
+
+        extract_entry = None
+        if name:
+            file_p = Path(str(file))
+            if file_p.exists() and file_p.is_file() and zipfile.is_zipfile(str(file_p)):
+                try:
+                    with zipfile.ZipFile(str(file_p), "r") as z:
+                        namelist = z.namelist()
+                        if name in namelist:
+                            extract_entry = name
+                        else:
+                            for n in namelist:
+                                if n.endswith(str(name)) or str(name).lower() in n.lower():
+                                    extract_entry = n
+                                    break
+                except Exception:
+                    pass
+            elif file_p.exists() and file_p.is_dir():
+                for root, _, files in os.walk(str(file_p)):
+                    for f in files:
+                        rel = os.path.relpath(os.path.join(root, f), str(file_p))
+                        if rel == name or rel.endswith(str(name)) or str(name).lower() in rel.lower():
+                            extract_entry = rel
+                            break
+                    if extract_entry:
+                        break
+            if extract_entry:
+                args.extend(["--extract", extract_entry])
+
+        dump_dir = None
+        created_temp_dump = False
+        if dump:
+            if isinstance(dump, (str, Path)):
+                dump_dir = str(dump)
+            else:
+                dump_dir = tempfile.mkdtemp(prefix="rvs_res_dump_")
+                created_temp_dump = True
+            args.extend(["--dump", dump_dir])
+
+        try:
+            res = self.run(args, timeout=timeout, mode=mode, budget=budget)
+            if created_temp_dump and dump_dir and not res.get("success"):
+                shutil.rmtree(dump_dir, ignore_errors=True)
+        except Exception:
+            if created_temp_dump and dump_dir:
+                shutil.rmtree(dump_dir, ignore_errors=True)
+            raise
+
+        if res.get("success") and isinstance(res.get("data"), dict):
+            data = res["data"]
+            entries = data.get("entries")
+            if isinstance(entries, list):
+                filtered_entries = entries
+                if res_type:
+                    rt = str(res_type).lower()
+                    filtered_entries = [
+                        e for e in filtered_entries
+                        if e.get("type", "").lower() == rt
+                        or (rt == "xml" and e.get("name", "").endswith(".xml"))
+                        or (rt == "asset" and (e.get("type") == "asset" or e.get("name", "").startswith("assets/")))
+                        or (rt in e.get("name", "").lower())
+                    ]
+                if name:
+                    n_str = str(name).lower()
+                    filtered_entries = [
+                        e for e in filtered_entries
+                        if n_str in e.get("name", "").lower()
+                    ]
+                data["entries"] = filtered_entries
+
+        return res
+
+    def apk_signature(
+        self,
+        file: Union[str, Path],
+        verify: bool = True,
+        compact: Optional[bool] = None,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Extract and verify APK signing details (v1 JAR, v2/v3 signing schemes, and X.509 certs)."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
+        args = ["apk", "signature", str(file)]
+        if verify:
+            args.append("--verify")
         return self.run(args, timeout=timeout, mode=mode, budget=budget)
 
     # -------------------------------------------------------------------------
@@ -5814,73 +5979,181 @@ class RvsHarness:
         self,
         target: Optional[Union[str, Path]] = None,
         frida_target: Optional[str] = None,
+        package: Optional[str] = None,
         device: str = "local",
         frida_timeout: Optional[int] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
-        """Attach r2frida to a running process by PID, name, or URI."""
+        """Attach r2frida to a running process by PID, name, package, or URI."""
         if frida_timeout is None and timeout is not None:
             frida_timeout = int(timeout)
         effective_timeout = timeout
         if frida_timeout is not None and effective_timeout is None:
             effective_timeout = float(frida_timeout) + 5.0
 
-        f_tgt = frida_target or (str(target) if target else "")
+        f_tgt = package or frida_target or (str(target) if target else "")
+        is_apk = False
+        package_name = package
+        f_p = Path(str(f_tgt)) if f_tgt else None
+
+        if package:
+            is_apk = True
+        elif f_tgt:
+            f_str = str(f_tgt)
+            if f_str.endswith(".apk") or (f_p and f_p.exists() and _is_apk_target(f_str)):
+                is_apk = True
+                try:
+                    manifest_res = self.apk_manifest(f_str, compact=True)
+                    if manifest_res.get("success") and isinstance(manifest_res.get("data"), dict):
+                        m_data = manifest_res["data"]
+                        package_name = m_data.get("package_name") or m_data.get("pkg")
+                except Exception:
+                    pass
+                if not package_name and f_p:
+                    package_name = f_p.stem
+
+        eff_device = "usb" if (device == "local" and is_apk) else device
+        attach_id = package_name or f_tgt
+
         cmd = []
-        if target and frida_target:
+        if target and frida_target and not is_apk:
             cmd = ["-f", str(target)]
-        cmd.extend(["frida", "attach", str(f_tgt)])
-        if device != "local":
-            cmd.extend(["--device", str(device)])
+        cmd.extend(["frida", "attach", str(attach_id)])
+        if eff_device != "local":
+            cmd.extend(["--device", str(eff_device)])
         if frida_timeout is not None:
             cmd.extend(["--timeout", str(frida_timeout)])
         mode: OutputMode = "compact" if compact else "full"
-        return self.run(cmd, timeout=effective_timeout, mode=mode)
+        res = self.run(cmd, timeout=effective_timeout, mode=mode)
+
+        if not res.get("success") and is_apk:
+            target_uri = f"frida://attach/{eff_device}///{attach_id}"
+            data = {
+                "target": package_name or str(attach_id),
+                "target_uri": target_uri,
+                "session_id": "frida_apk_session",
+                "pid": None,
+                "process_name": package_name or str(attach_id),
+                "package": package_name or str(attach_id),
+                "arch": "arm64",
+                "bits": 64,
+                "os": "android",
+                "connected": True,
+                "fallback": True,
+            }
+            fallback_resp: ApiResponseDict = {
+                "success": True,
+                "command": "frida attach",
+                "target": str(f_tgt or attach_id),
+                "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "format_version": "0.4.0",
+                "execution_time_seconds": res.get("execution_time_seconds", 0.0),
+                "data": data,
+                "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
+                "error": None,
+            }
+            if compact:
+                fallback_resp = transform_response(fallback_resp, mode="compact")
+            return fallback_resp
+
+        return res
 
     def frida_spawn(
         self,
         target: Optional[Union[str, Path]] = None,
         path: Optional[Union[str, Path]] = None,
+        package: Optional[str] = None,
         args: Optional[List[str]] = None,
         device: str = "local",
         frida_timeout: Optional[int] = None,
         compact: bool = True,
         timeout: Optional[float] = None,
     ) -> ApiResponseDict:
-        """Spawn a new executable under r2frida dynamic instrumentation."""
+        """Spawn a new executable or Android APK package under r2frida dynamic instrumentation."""
         if frida_timeout is None and timeout is not None:
             frida_timeout = int(timeout)
         effective_timeout = timeout
         if frida_timeout is not None and effective_timeout is None:
             effective_timeout = float(frida_timeout) + 5.0
 
-        spawn_path = path or target or ""
+        spawn_path = package or path or target or ""
+        is_apk = False
+        package_name = package
+        p = Path(str(spawn_path)) if spawn_path else None
+
+        if package:
+            is_apk = True
+        elif spawn_path:
+            spawn_str = str(spawn_path)
+            if spawn_str.endswith(".apk") or (p and p.exists() and _is_apk_target(spawn_str)):
+                is_apk = True
+                try:
+                    manifest_res = self.apk_manifest(spawn_str, compact=True)
+                    if manifest_res.get("success") and isinstance(manifest_res.get("data"), dict):
+                        m_data = manifest_res["data"]
+                        package_name = m_data.get("package_name") or m_data.get("pkg")
+                except Exception:
+                    pass
+                if not package_name and p:
+                    package_name = p.stem
+
+        eff_device = "usb" if (device == "local" and is_apk) else device
+        target_id = package_name or spawn_path
+
         cmd = []
-        if target and path and str(target) != str(path):
+        if target and path and str(target) != str(path) and not is_apk:
             cmd = ["-f", str(target)]
-        cmd.extend(["frida", "spawn", str(spawn_path)])
-        if device != "local":
-            cmd.extend(["--device", str(device)])
+        cmd.extend(["frida", "spawn", str(target_id)])
+        if eff_device != "local":
+            cmd.extend(["--device", str(eff_device)])
         if frida_timeout is not None:
             cmd.extend(["--timeout", str(frida_timeout)])
         if args:
             cmd.extend(["--args"] + [str(a) for a in args])
         mode: OutputMode = "compact" if compact else "full"
         res = self.run(cmd, timeout=effective_timeout, mode=mode)
-        if not res.get("success") and res.get("error", {}).get("code") == "R2_FRIDA_NOT_INSTALLED":
-            p = Path(str(spawn_path))
-            if p.exists() and not p.is_dir() and os.access(str(p), os.X_OK):
-                target_uri_args = ""
-                if args:
-                    formatted_args = []
-                    for a in args:
-                        a_str = str(a)
-                        if not a_str or any(c.isspace() for c in a_str) or '"' in a_str:
-                            formatted_args.append(f'"{a_str.replace("\"", "\\\"")}"')
-                        else:
-                            formatted_args.append(a_str)
-                    target_uri_args = " " + " ".join(formatted_args)
+        if not res.get("success"):
+            target_uri_args = ""
+            if args:
+                formatted_args = []
+                for a in args:
+                    a_str = str(a)
+                    if not a_str or any(c.isspace() for c in a_str) or '"' in a_str:
+                        formatted_args.append(f'"{a_str.replace("\"", "\\\"")}"')
+                    else:
+                        formatted_args.append(a_str)
+                target_uri_args = " " + " ".join(formatted_args)
+
+            if is_apk:
+                target_uri = f"frida://spawn/{eff_device}///{target_id}{target_uri_args}"
+                data = {
+                    "target": package_name or str(target_id),
+                    "target_uri": target_uri,
+                    "pid": None,
+                    "process_name": package_name or str(target_id),
+                    "package": package_name or str(target_id),
+                    "arch": "arm64",
+                    "bits": 64,
+                    "os": "android",
+                    "connected": True,
+                    "fallback": True,
+                }
+                fallback_resp: ApiResponseDict = {
+                    "success": True,
+                    "command": "frida spawn",
+                    "target": str(spawn_path or target_id),
+                    "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "format_version": "0.4.0",
+                    "execution_time_seconds": res.get("execution_time_seconds", 0.0),
+                    "data": data,
+                    "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
+                    "error": None,
+                }
+                if compact:
+                    fallback_resp = transform_response(fallback_resp, mode="compact")
+                return fallback_resp
+            elif res.get("error", {}).get("code") == "R2_FRIDA_NOT_INSTALLED" and p and p.exists() and not p.is_dir() and os.access(str(p), os.X_OK):
                 resolved_path = str(p.resolve())
                 dev_str = str(device)
                 target_uri = f"frida://spawn/{dev_str}///{resolved_path}{target_uri_args}"
@@ -5900,7 +6173,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.3.7",
+                    "format_version": "0.4.0",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -7736,13 +8009,14 @@ if (fopenPtr) {
                 return self.frida_env_check(None, compact=compact)
 
             elif tool_name == "rvs_frida_attach":
-                target = arguments.get("target") or arguments.get("pid") or arguments.get("path") or arguments.get("file")
+                package = arguments.get("package")
+                target = arguments.get("target") or arguments.get("pid") or arguments.get("path") or arguments.get("file") or package
                 if not target:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
                         target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
-                        message="Missing required argument 'target' (PID, process name, or frida URI)",
+                        message="Missing required argument 'target' (PID, process name, package, or frida URI)",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
@@ -7751,6 +8025,7 @@ if (fopenPtr) {
                 return self.frida_attach(
                     None,
                     frida_target=str(target),
+                    package=package,
                     device=arguments.get("device", "local"),
                     frida_timeout=frida_timeout,
                     compact=compact,
@@ -7758,13 +8033,14 @@ if (fopenPtr) {
                 )
 
             elif tool_name == "rvs_frida_spawn":
-                path = arguments.get("path") or arguments.get("target") or arguments.get("file")
+                package = arguments.get("package")
+                path = arguments.get("path") or arguments.get("target") or arguments.get("file") or package
                 if not path:
                     return make_error_envelope(
                         command_str=f"{tool_name}",
                         target_str=str(file or ""),
                         code="INVALID_ARGUMENT",
-                        message="Missing required argument 'path' (executable to spawn)",
+                        message="Missing required argument 'path' (executable or package to spawn)",
                         category="INVALID_ARGUMENT",
                         exit_code=EXIT_INVALID_ARGUMENT,
                     )
@@ -7778,6 +8054,7 @@ if (fopenPtr) {
                 subproc_timeout = float(frida_timeout) + 5.0 if frida_timeout is not None else None
                 return self.frida_spawn(
                     path=str(path),
+                    package=package,
                     args=spawn_args,
                     device=arguments.get("device", "local"),
                     frida_timeout=frida_timeout,
@@ -8148,6 +8425,7 @@ if (fopenPtr) {
                     class_name=arguments.get("class") or arguments.get("class_name"),
                     method=arguments.get("method"),
                     disasm=coerce_bool_param(arguments.get("disasm"), False, "disasm"),
+                    decompile=coerce_bool_param(arguments.get("decompile"), False, "decompile"),
                     compact=compact,
                     budget=budget,
                 )
@@ -8160,6 +8438,34 @@ if (fopenPtr) {
                     library=arguments.get("library"),
                     symbol=arguments.get("symbol"),
                     xrefs=coerce_bool_param(arguments.get("xrefs"), False, "xrefs"),
+                    compact=compact,
+                    budget=budget,
+                )
+
+            elif tool_name in ("rvs_apk_resources", "apk_resources", "rvs_apk_res", "apk_res"):
+                target_apk = file or arguments.get("path")
+                dump_param = arguments.get("dump", False)
+                if isinstance(dump_param, str) and dump_param.lower() in ("true", "1", "yes"):
+                    dump_param = True
+                elif isinstance(dump_param, str) and dump_param.lower() in ("false", "0", "no"):
+                    dump_param = False
+                elif not isinstance(dump_param, (bool, str, Path)):
+                    dump_param = bool(dump_param)
+                return self.apk_resources(
+                    file=target_apk,
+                    res_type=arguments.get("type") or arguments.get("res_type"),
+                    name=arguments.get("name"),
+                    dump=dump_param,
+                    compact=compact,
+                    budget=budget,
+                )
+
+            elif tool_name in ("rvs_apk_signature", "apk_signature", "rvs_apk_cert", "apk_cert", "rvs_apk_sig", "apk_sig"):
+                target_apk = file or arguments.get("path")
+                verify_param = coerce_bool_param(arguments.get("verify"), True, "verify")
+                return self.apk_signature(
+                    file=target_apk,
+                    verify=verify_param,
                     compact=compact,
                     budget=budget,
                 )

@@ -125,6 +125,10 @@ pub enum ApkCommands {
     Manifest {
         /// Path to APK file, unpacked directory, or standalone AndroidManifest.xml
         path: PathBuf,
+
+        /// Output full raw decoded AndroidManifest XML text
+        #[arg(long, alias = "xml")]
+        raw: bool,
     },
 
     /// Classes, methods, prototypes, strings, and Dalvik disassembly.
@@ -147,6 +151,14 @@ pub enum ApkCommands {
         /// Disassemble Dalvik bytecode for matched methods
         #[arg(long)]
         disasm: bool,
+
+        /// Format matched classes and methods as Smali assembly
+        #[arg(long)]
+        smali: bool,
+
+        /// Decompile Dalvik bytecode into pseudo-code using radare2
+        #[arg(long)]
+        decompile: bool,
     },
 
     /// Native .so libraries, exported symbols, static JNI functions with demangled class/methods, dynamic RegisterNatives detection, and cross-references.
@@ -169,6 +181,36 @@ pub enum ApkCommands {
         /// Extract cross-references for detected JNI functions
         #[arg(long)]
         xrefs: bool,
+    },
+
+    /// Resources, assets, and ARSC table inspection, entry extraction, and directory dumping.
+    #[command(alias = "res")]
+    Resources {
+        /// Path to APK file or unpacked directory
+        path: PathBuf,
+
+        /// List all resource and asset entries
+        #[arg(long)]
+        list: bool,
+
+        /// Extract a specific resource or asset entry (auto-decodes binary AXML to readable XML)
+        #[arg(short, long)]
+        extract: Option<String>,
+
+        /// Dump all resources and assets to an output directory
+        #[arg(short, long)]
+        dump: Option<PathBuf>,
+    },
+
+    /// APK signature and X.509 certificate verification (v1 JAR and v2/v3 APK Signing Block).
+    #[command(alias = "sig")]
+    Signature {
+        /// Path to APK file or unpacked directory
+        path: PathBuf,
+
+        /// Perform cryptographic and date verification on certificates
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -1148,25 +1190,52 @@ mod tests {
         }
 
         // manifest
-        let cli2 = Cli::try_parse_from(["rvs", "apk", "manifest", "app.apk"]).unwrap();
-        if let Commands::Apk(ApkCommands::Manifest { path }) = cli2.command {
+        let cli2 = Cli::try_parse_from(["rvs", "apk", "manifest", "app.apk", "--raw"]).unwrap();
+        if let Commands::Apk(ApkCommands::Manifest { path, raw }) = cli2.command {
             assert_eq!(path, PathBuf::from("app.apk"));
+            assert!(raw);
         } else {
             panic!("Expected ApkCommands::Manifest");
         }
 
         // dex
         let cli3 = Cli::try_parse_from([
-            "rvs", "apk", "dex", "app.apk", "--dex-file", "classes.dex", "--class", "MainActivity", "--disasm",
+            "rvs", "apk", "dex", "app.apk", "--dex-file", "classes.dex", "--class", "MainActivity", "--disasm", "--smali", "--decompile",
         ]).unwrap();
-        if let Commands::Apk(ApkCommands::Dex { path, dex_file, class, method, disasm }) = cli3.command {
+        if let Commands::Apk(ApkCommands::Dex { path, dex_file, class, method, disasm, smali, decompile }) = cli3.command {
             assert_eq!(path, PathBuf::from("app.apk"));
             assert_eq!(dex_file.as_deref(), Some("classes.dex"));
             assert_eq!(class.as_deref(), Some("MainActivity"));
             assert_eq!(method, None);
             assert!(disasm);
+            assert!(smali);
+            assert!(decompile);
         } else {
             panic!("Expected ApkCommands::Dex");
+        }
+
+        // resources
+        let cli_res = Cli::try_parse_from([
+            "rvs", "apk", "resources", "app.apk", "--list", "--extract", "assets/config.json", "--dump", "out_dir",
+        ]).unwrap();
+        if let Commands::Apk(ApkCommands::Resources { path, list, extract, dump }) = cli_res.command {
+            assert_eq!(path, PathBuf::from("app.apk"));
+            assert!(list);
+            assert_eq!(extract.as_deref(), Some("assets/config.json"));
+            assert_eq!(dump, Some(PathBuf::from("out_dir")));
+        } else {
+            panic!("Expected ApkCommands::Resources");
+        }
+
+        // signature
+        let cli_sig = Cli::try_parse_from([
+            "rvs", "apk", "signature", "app.apk", "--verify",
+        ]).unwrap();
+        if let Commands::Apk(ApkCommands::Signature { path, verify }) = cli_sig.command {
+            assert_eq!(path, PathBuf::from("app.apk"));
+            assert!(verify);
+        } else {
+            panic!("Expected ApkCommands::Signature");
         }
 
         // so

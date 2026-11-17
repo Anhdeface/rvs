@@ -1,6 +1,6 @@
 ---
 name: rvs-reverse-engineering
-description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, deterministic binary patching, Android APK & multi-language analysis using rvs v0.3.7 and its 48 canonical tool MCP agent harness.
+description: Autonomous binary reverse engineering, ESIL dynamic emulation, native interactive debugging (ptrace UDS daemon), live runtime instrumentation (r2frida), control-flow gate analysis, deterministic binary patching, Android APK & multi-language analysis using rvs v0.4.0 and its 50 canonical tool MCP agent harness.
 compatibility: Antigravity CLI, Claude Code, Google Gemini CLI, GitHub Copilot CLI, Cursor
 version: 2.3.0
 ---
@@ -57,7 +57,7 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
      - Crash diagnosis: `rvs_triage_crash`
      - In-memory CPU simulation: `rvs_dynamic_emulate`
      - Deterministic patching: `rvs_patch_instruction`, `rvs_patch_string`, `rvs_patch_bytes`, `rvs_agent_patch_plan`
-     - Android APK & multi-language analysis: `rvs_apk_info`, `rvs_apk_manifest`, `rvs_apk_dex`, `rvs_apk_native`
+     - Android APK & multi-language analysis: `rvs_apk_info`, `rvs_apk_manifest`, `rvs_apk_resources`, `rvs_apk_dex`, `rvs_apk_native`, `rvs_apk_signature`
 
 ### 🚫 Anti-Pattern Prohibition Matrix
 
@@ -71,7 +71,7 @@ This skill guides AI agents (Antigravity CLI, Claude Code, Gemini CLI, Copilot C
 | **In-Memory Buffer Extraction** | Injecting scripts to dump `/proc/<pid>/mem` or attaching GDB to dump memory regions | Complex process race conditions; ptrace permission denials; uncompressed hex dumps flood context. | `rvs_dump_decrypted_buffer`, `rvs_dynamic_emulate(read_mem=...)`, `rvs_frida_mem_read` | Autonomous breakpointing after decryption loops; extracts plaintext string, hex, and byte arrays safely. |
 | **Binary Patching** | Writing Python scripts with `open(file, "r+b")` seeking and writing raw bytes, or using `dd` | Bypasses atomic `.bak` backup creation; lacks dry-run verification; risks irreversible binary corruption. | `rvs_patch_instruction`, `rvs_patch_string`, `rvs_patch_bytes`, `rvs_agent_patch_plan` | Automatic timestamped `.bak` creation; `dry_run=True` simulation; architecture-aware byte alignment. |
 | **Interactive Debugging** | Launching raw command-line GDB or LLDB sessions in bash subprocesses | Shell stdin/stdout deadlocks; terminal prompts block agent execution; unparsed output exhausts tokens. | `rvs_debug_spawn`, `rvs_debug_breakpoint`, `rvs_debug_continue`, `rvs_debug_registers` | Daemon-backed UDS session management; structured register inspection with diffing support. |
-| **Android APK & Native .so Analysis** | Unzipping APKs manually with `unzip`, invoking external tools (`apktool`, `baksmali`, `aapt`), or running `readelf -Ws` on extracted `.so` files | Slow, token-inefficient, pollutes filesystem with unpacked directories, lacks unified multi-language detection and JNI unmangling. | `rvs_apk_info`, `rvs_apk_manifest`, `rvs_apk_dex`, `rvs_apk_native` | **90% token savings**; direct in-memory extraction of DEX, JNI exports, architecture, and multi-language markers (Java, C/C++, React Native, Flutter). |
+| **Android APK & Native .so Analysis** | Unzipping APKs manually with `unzip`, writing ad-hoc Python scripts to parse resources or calculate certificate hashes, or invoking external CLI tools (`apktool`, `baksmali`, `aapt`, `readelf`, `keytool`, `jarsigner`, `apksigner`) | Slow, token-inefficient, pollutes filesystem with unpacked directories, lacks unified multi-language detection, and introduces external script/environment failures. | `rvs_apk_info`, `rvs_apk_manifest`, `rvs_apk_resources`, `rvs_apk_dex`, `rvs_apk_native`, `rvs_apk_signature`, `rvs_frida_attach` | **90% token savings**; direct in-memory extraction of DEX, JNI exports, resources, signatures, architecture, and multi-language markers (Java, C/C++, React Native, Flutter). |
 
 ---
 
@@ -92,7 +92,7 @@ All AI agents operating `rvs` via Model Context Protocol (MCP) or the Python har
 - **Unverified Hypothesis Quarantine**: Any preliminary hypothesis must be explicitly tagged as unverified and confirmed via deterministic dynamic emulation (`rvs_dynamic_emulate`), interactive stepping (`rvs_debug_step`), or runtime inspection (`rvs_frida_hook`).
 
 ### 3. Mandatory Tool-First Workflow
-- **Strict Exclusive Utilization of 48 Built-In Tools**: All reverse engineering, static analysis, dynamic emulation, interactive debugging, Frida instrumentation, APK package reconnaissance, and binary patching operations MUST use the 48 canonical `rvs` MCP tools.
+- **Strict Exclusive Utilization of 50 Built-In Tools**: All reverse engineering, static analysis, dynamic emulation, interactive debugging, Frida instrumentation, APK package reconnaissance, and binary patching operations MUST use the 50 canonical `rvs` MCP tools.
 - **Strict Prohibition on Ad-Hoc Scripts**: Agents MUST NOT author, compile, or execute ad-hoc Python scripts (e.g. standalone scripts importing `frida`, `ctypes`, `open(..., "r+b")`, `struct`, or raw `subprocess`) or custom bash scripts when an `rvs` tool or CLI command exists for that task.
 - **Strict Prohibition on Raw Shell Pipes**: Agents MUST NOT invoke raw CLI utilities via bash pipes (`strings`, `objdump`, `readelf`, `nm`, `ltrace`, `strace`, `gdb`, `dd`, `sed`, `awk`). Such commands bypass subprocess isolation, flood the context window with thousands of uncompressed tokens, and bypass the bijective codebook.
 - **Approved Chaining Workflow**: Compose multi-step investigations exclusively through native `rvs` MCP tool calls or the `rvs_agent_harness.py` API:
@@ -101,7 +101,7 @@ All AI agents operating `rvs` via Model Context Protocol (MCP) or the Python har
   - Dynamic simulation: `rvs_dynamic_emulate` -> `rvs_dynamic_trace`
   - Interactive debugging: `rvs_debug_spawn` -> `rvs_debug_breakpoint` -> `rvs_debug_continue` -> `rvs_debug_registers`
   - Live runtime instrumentation: `rvs_frida_attach` / `rvs_frida_spawn` -> `rvs_frida_hook` -> `rvs_frida_hook_return`
-  - Android APK & multi-language inspection: `rvs_apk_info` -> `rvs_apk_manifest` -> `rvs_apk_dex` -> `rvs_apk_native`
+  - Android APK & multi-language inspection: `rvs_apk_info` -> `rvs_apk_manifest` -> `rvs_apk_resources` -> `rvs_apk_dex` -> `rvs_apk_native` -> `rvs_apk_signature`
   - Binary patching: `rvs_patch_instruction` -> `rvs_patch_bytes` -> `rvs_agent_patch_plan`
 
 ### 4. Neutral and Compact Mode Configuration & Explicit Overrides
@@ -126,7 +126,7 @@ All AI agents operating `rvs` via Model Context Protocol (MCP) or the Python har
 
 ---
 
-## 🧭 8 Scenario Reverse Engineering Decision Trees
+## 🧭 9 Scenario Reverse Engineering Decision Trees
 
 Agents should select native `rvs` tools according to these scenario-specific operational workflows:
 
@@ -175,6 +175,18 @@ Agents should select native `rvs` tools according to these scenario-specific ope
                                                                                         └─> rvs_patch_bytes(...)
 ```
 
+```
+[Scenario 9: Android APK Triage & Deep-Dive Analysis]
+  │
+  ├─ Package & Language Triage ────> rvs_apk_info
+  ├─ Manifest & Permissions ───────> rvs_apk_manifest
+  ├─ Resources & Asset Dumping ────> rvs_apk_resources
+  ├─ Dalvik Bytecode & Smali ──────> rvs_apk_dex(disasm=True, decompile=True)
+  ├─ Native .so & JNI Gates ───────> rvs_apk_native(abi="arm64-v8a", xrefs=True)
+  ├─ Signature & Integrity ────────> rvs_apk_signature(verify=True)
+  └─ Live Runtime Instrumentation ─> rvs_frida_attach(target="app.apk")
+```
+
 ### Detailed Scenario Prescriptions
 
 1. **Scenario 1: Initial Reconnaissance & Security Profiling**
@@ -201,6 +213,14 @@ Agents should select native `rvs` tools according to these scenario-specific ope
 8. **Scenario 8: Deterministic Binary Patching & Dry-Run Validation**
    - *Simulation*: `rvs_agent_patch_plan(file=..., plan={...}, dry_run=True)` — validates assembly syntax and byte offsets before modifying disk.
    - *Modification*: `rvs_patch_instruction` (single instruction/NOP sled), `rvs_patch_string` (string literal with padding), or `rvs_patch_bytes` (raw hex bytes) — all create timestamped `.bak` files.
+9. **Scenario 9: Android APK Triage & Deep-Dive Analysis**
+   - *Package & Language Triage*: `rvs_apk_info(file=...)` — extracts package identity, manifest metadata, DEX file listing, native `.so` inventory, and automated multi-language framework detection (Java, C/C++, React Native, Dart/Flutter).
+   - *Manifest & Permissions*: `rvs_apk_manifest(file=...)` — inspects XML package declarations, SDK versions, requested permissions, activities, services, receivers, providers, and debuggable status.
+   - *Resources & Asset Dumping*: `rvs_apk_resources(file=..., type="asset", dump=True)` — lists and dumps embedded resources, asset configurations, layout XMLs, and string tables without unzipping.
+   - *Dalvik Bytecode & Smali*: `rvs_apk_dex(file=..., class="...", method="...", disasm=True, decompile=True)` — analyzes Dalvik DEX bytecode, classes, methods, prototypes, and decompiled pseudo-Java logic.
+   - *Native .so & JNI Gates*: `rvs_apk_native(file=..., abi="arm64-v8a", library="libnative.so", xrefs=True)` — extracts native architecture, static `Java_*` JNI exports, and dynamic `RegisterNatives` bindings.
+   - *Signature & Integrity*: `rvs_apk_signature(file=..., verify=True)` — verifies v1 JAR and v2/v3 APK Signing Blocks and extracts X.509 certificate fingerprints.
+   - *Live Runtime Instrumentation*: `rvs_frida_attach(target="app.apk", package="com.example.app")` or `rvs_frida_spawn(path="app.apk", package="com.example.app")` — dynamically hooks Android runtime methods and native gates in-memory.
 
 | Operational Objective | Prescribed Native Tool | When to Select |
 |---|---|---|
@@ -212,6 +232,11 @@ Agents should select native `rvs` tools according to these scenario-specific ope
 | **Anti-Debug Neutralization**| `rvs_detect_anti_debug` | Detecting `ptrace(PTRACE_TRACEME)` and `/proc/self/status` TracerPid checks and acquiring tailored bypass hooks. |
 | **Deep Interactive Stepping**| `rvs_debug_*` | When granular instruction-by-instruction stepping, memory inspection, or hardware breakpoints are required. |
 | **Permanent Binary Patch** | `rvs_patch_instruction` / `rvs_agent_patch_plan` | Applying permanent on-disk opcode modifications with backup preservation. |
+| **APK Package & Framework Triage** | `rvs_apk_info` / `rvs_apk_manifest` | Initial inspection of Android APK containers, permissions, components, and multi-language framework detection. |
+| **APK Resources & Asset Extraction** | `rvs_apk_resources` | Inspecting and dumping embedded assets, config files, and string resources without invoking unzip. |
+| **Dalvik Bytecode & Decompilation** | `rvs_apk_dex` | Analyzing DEX classes, method bytecode disassembly, and high-level pseudo-Java decompilation. |
+| **Native JNI Export Analysis** | `rvs_apk_native` | Mapping exported JNI functions, `RegisterNatives` tables, and shared library dependencies inside APKs. |
+| **APK Signature Verification** | `rvs_apk_signature` | Verifying v1/v2/v3 signature integrity and extracting X.509 certificate metadata without jarsigner/apksigner. |
 
 ---
 
@@ -253,8 +278,8 @@ Agents should select native `rvs` tools according to these scenario-specific ope
                             │
 ┌───────────────────────────▼────────────────────────────┐
 │  Phase 7: Android APK & Multi-Language Analysis        │
-│  rvs_apk_info ──> rvs_apk_manifest ──> rvs_apk_dex     │
-│  ──> rvs_apk_native (architecture, JNI, symbols)       │
+│  rvs_apk_info ──> rvs_apk_manifest ──> resources       │
+│  ──> rvs_apk_dex ──> rvs_apk_native ──> signature      │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -312,8 +337,10 @@ Agents should select native `rvs` tools according to these scenario-specific ope
 ### Phase 7: Android APK & Multi-Language Analysis
 1. **APK Overview & Language Detection**: Call `rvs_apk_info(file="app.apk", compact=True)` to extract package identity, manifest metadata, DEX file listing, native `.so` inventory, and automated multi-language detection (identifying Java, C/C++, React Native, and Dart/Flutter via runtime signatures, native libraries, and DEX markers).
 2. **Manifest Deep-Dive**: Call `rvs_apk_manifest(file="app.apk", compact=True)` to inspect package declarations, SDK versions, requested permissions, activities, services, receivers, content providers, and debuggable flags.
-3. **Dalvik Bytecode Analysis**: Call `rvs_apk_dex(file="app.apk", class="com.example.MainActivity", method="checkLicense", disasm=True, compact=True)` to analyze Dalvik bytecode instructions, class hierarchies, method signatures, string references, and native method declarations.
-4. **Embedded Native `.so` & JNI Analysis**: Call `rvs_apk_native(file="app.apk", abi="arm64-v8a", library="libnative.so", xrefs=True, compact=True)` to extract ELF machine architecture, endianness, bitness, SONAME, DT_NEEDED dependencies, static `Java_*` JNI exports with demangled class/method names, and dynamic `RegisterNatives` bindings directly from embedded `.so` libraries without running external CLI tools or unzipping archives.
+3. **Resource & Asset Inspection**: Call `rvs_apk_resources(file="app.apk", type="asset", name="app_config.json", dump=True, compact=True)` to inspect and dump resource table entries, compiled XML, assets, and credentials without unzipping.
+4. **Dalvik Bytecode Analysis & Decompilation**: Call `rvs_apk_dex(file="app.apk", class="com.example.MainActivity", method="checkLicense", disasm=True, decompile=True, compact=True)` to analyze Dalvik bytecode instructions, decompiled pseudo-Java representations, class hierarchies, method signatures, string references, and native method declarations.
+5. **Embedded Native `.so` & JNI Analysis**: Call `rvs_apk_native(file="app.apk", abi="arm64-v8a", library="libnative.so", xrefs=True, compact=True)` to extract ELF machine architecture, endianness, bitness, SONAME, DT_NEEDED dependencies, static `Java_*` JNI exports with demangled class/method names, and dynamic `RegisterNatives` bindings directly from embedded `.so` libraries without running external CLI tools or unzipping archives.
+6. **Signature & Certificate Verification**: Call `rvs_apk_signature(file="app.apk", verify=True, compact=True)` to verify v1 JAR signing and v2/v3 APK Signing Blocks, extracting signer certificate Subject, Issuer, Serial, Validity, and SHA-256 fingerprints.
 
 ---
 
@@ -323,7 +350,7 @@ AI agent context windows are finite. Conformance with these directives is mandat
 
 | Directive | Specification | Impact |
 |---|---|---|
-| **1. Always Use Compact Mode** | Ensure `compact=True` (or `-c` CLI flag). Enabled by default across all 48 tools. | **70%–90% token reduction** |
+| **1. Always Use Compact Mode** | Ensure `compact=True` (or `-c` CLI flag). Enabled by default across all 50 tools. | **70%–90% token reduction** |
 | **2. Enforce Endpoint Pagination** | Large endpoints enforce strict pagination defaults: `symbols` (default: 50), `classes` (default: 50), `modules` (default: 30). Use `limit` and `offset`. | Eliminates 10k+ line JSON dumps |
 | **3. Prefer Register Diffs** | Read `register_diff` / `data.diff` instead of full architectural dumps. Unchanged registers are excluded. | Eliminates 95% redundant register tokens |
 | **4. Strict Trace Step Budgets** | Restrict `rvs_dynamic_trace` to 15–30 steps and `rvs_dynamic_emulate` to 50–100 steps. Use `until` to halt at specific gates. | Prevents runaway trace dumps |
@@ -370,7 +397,7 @@ All commands and MCP tools map runtime results to standard exit codes (0–6):
 
 ---
 
-## 🛠️ Complete 48-Tool Canonical MCP Catalog
+## 🛠️ Complete 50-Tool Canonical MCP Catalog
 
 ### Phase 1: Static Reconnaissance & Triage
 *Initial binary profiling, architecture classification, security mitigations, symbols, strings, and automated triage.*
@@ -623,21 +650,23 @@ Check r2frida plugin installation status and runtime capabilities.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 
 #### `rvs_frida_attach`
-Attach r2frida to a running process by PID, process name, or full Frida URI for live dynamic instrumentation.
+Attach r2frida to a running process by PID, process name, Android package name, or full Frida URI for live dynamic instrumentation.
 
 **Parameters:**
-- `target` (`string`, **required**): Target PID (e.g. '1234'), process name (e.g. 'firefox'), or frida URI.
-- `device` (`string`, optional): Device type: 'local', 'usb', or remote 'IP:port'. Defaults to 'local'.
+- `target` (`string`, **required**): Target PID (e.g. '1234'), process name (e.g. 'firefox'), Android package name, or frida URI.
+- `package` (`string`, optional): Optional Android application package name (e.g. 'com.example.app') when targeting Android USB devices or emulators.
+- `device` (`string`, optional): Device type: 'local', 'usb', or remote 'IP:port'. Defaults to 'local' (or 'usb' for Android package targets).
 - `timeout` (`integer`, optional): Timeout in seconds for attach operation.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 
 #### `rvs_frida_spawn`
-Spawn a new target executable under r2frida dynamic instrumentation with optional arguments.
+Spawn a new target executable or Android APK package under r2frida dynamic instrumentation with optional arguments.
 
 **Parameters:**
-- `path` (`string`, **required**): Path to the executable to spawn under Frida.
+- `path` (`string`, **required**): Path to the executable or APK archive to spawn under Frida.
+- `package` (`string`, optional): Optional Android application package name (e.g. 'com.example.app') when targeting Android USB devices or emulators.
 - `args` (`array`, optional): Command line arguments for the spawned process.
-- `device` (`string`, optional): Device type: 'local', 'usb', or remote. Defaults to 'local'.
+- `device` (`string`, optional): Device type: 'local', 'usb', or remote. Defaults to 'local' (or 'usb' for Android package targets).
 - `timeout` (`integer`, optional): Timeout in seconds for spawn operation.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 
@@ -865,6 +894,7 @@ Analyze Dalvik DEX bytecode, classes, methods, prototypes, signatures, and strin
 - `class` (`string`, optional): Optional class name substring filter.
 - `method` (`string`, optional): Optional method name substring filter.
 - `disasm` (`boolean`, optional): Disassemble Dalvik bytecode for matched methods. Defaults to false.
+- `decompile` (`boolean`, optional): Decompile Dalvik bytecode into high-level pseudo-Java representation for matched methods. Defaults to false.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 
 #### `rvs_apk_native`
@@ -876,6 +906,24 @@ Analyze native .so libraries in an APK or standalone .so (architecture, exported
 - `library` (`string`, optional): Optional native library file name filter (e.g. 'libnative.so').
 - `symbol` (`string`, optional): Optional symbol or JNI function name substring filter.
 - `xrefs` (`boolean`, optional): Extract cross-references for detected JNI functions. Defaults to false.
+- `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+
+#### `rvs_apk_resources`
+Inspect and dump Android APK resources, asset directories, and string table values (res/*, assets/*, resources.arsc).
+
+**Parameters:**
+- `file` (`string`, **required**): Path to the target APK archive or extracted directory.
+- `type` (`string`, optional): Optional resource type filter (e.g. 'asset', 'layout', 'drawable', 'string', 'xml').
+- `name` (`string`, optional): Optional resource or asset filename substring filter.
+- `dump` (`boolean`, optional): Dump raw text or decoded content of matched resource entries. Defaults to false.
+- `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
+
+#### `rvs_apk_signature`
+Extract and verify APK signing details (v1 JAR signing, v2/v3 signature schemes, X.509 certificate subject, issuer, validity, and SHA-256 fingerprints).
+
+**Parameters:**
+- `file` (`string`, **required**): Path to the target APK archive.
+- `verify` (`boolean`, optional): Perform cryptographic signature integrity verification. Defaults to true.
 - `compact` (`boolean`, optional): Emit token-optimized compact output. Defaults to true.
 
 ---
@@ -1024,21 +1072,59 @@ rvs_frida_hook_return(target="license_checker", addr="sym.validate_key", retval=
 
 ---
 
-### Recipe 6: Android APK Multi-Language Reconnaissance & Native .so JNI Analysis
-**Goal**: Inspect an Android APK package, detect embedded programming languages/frameworks, analyze Dalvik bytecode, and extract JNI exports from embedded native `.so` libraries.
+### Recipe 6A: Full APK Package Triage, Resource Dumping, and Signature Verification
+**Goal**: Perform initial reconnaissance on an Android APK, dumping sensitive asset configuration files and validating cryptographic signature schemes without writing custom Python scripts or calling external utilities.
 
 ```python
-# 1. Package overview & multi-language detection (Java, C/C++, React Native, Dart/Flutter)
-apk_overview = rvs_apk_info(file="target_app.apk", compact=True)
+# 1. Package overview & multi-language framework triage
+overview = rvs_apk_info(file="app.apk", compact=True)
 
-# 2. Inspect AndroidManifest.xml permissions, activities, and debuggable flag
-manifest = rvs_apk_manifest(file="target_app.apk", compact=True)
+# 2. Inspect manifest permissions, activities, and debuggable state
+manifest = rvs_apk_manifest(file="app.apk", compact=True)
 
-# 3. Analyze Dalvik DEX bytecode and find native method declarations
-dex_analysis = rvs_apk_dex(file="target_app.apk", dex_file="classes.dex", method="checkLicense", disasm=False, compact=True)
+# 3. List and extract sensitive asset configuration files
+resources = rvs_apk_resources(file="app.apk", type="asset", name="app_config.json", dump=True, compact=True)
 
-# 4. Extract native .so architecture, JNI exports, and symbols without external tools
-so_analysis = rvs_apk_native(file="target_app.apk", abi="arm64-v8a", library="libnative.so", symbol="Java_", xrefs=False, compact=True)
+# 4. Cryptographic signature and certificate verification
+sig_info = rvs_apk_signature(file="app.apk", verify=True, compact=True)
+```
+
+---
+
+### Recipe 6B: Dalvik Decompilation, JNI Function Resolution, and Native Gate Inversion
+**Goal**: Decompile Dalvik DEX bytecode to locate licensing logic, resolve native JNI function bindings, and apply an on-disk binary patch to invert a native verification gate.
+
+```python
+# 1. Decompile Dalvik DEX method to high-level pseudo-Java
+dex_code = rvs_apk_dex(file="app.apk", dex_file="classes.dex", method="validateLicense", decompile=True, compact=True)
+
+# 2. Resolve native JNI function bindings and cross-references
+jni_exports = rvs_apk_native(file="app.apk", abi="arm64-v8a", symbol="Java_", xrefs=True, compact=True)
+
+# 3. Inspect and disassemble native gate function inside the .so
+gate_flow = rvs_flow(file="libnative.so", function="Java_com_example_MainActivity_validateLicense")
+
+# 4. Apply binary patch to invert gate decision condition
+rvs_patch_instruction(file="libnative.so", addr="0x117a", assembly="je 0x1183")
+```
+
+---
+
+### Recipe 6C: Live Android Runtime Hooking with Target APK Parameter
+**Goal**: Dynamically attach to a live Android application using package resolution and intercept native licensing methods using Frida.
+
+```python
+# 1. Verify r2frida dynamic instrumentation environment
+env = rvs_frida_env_check(compact=True)
+
+# 2. Attach to target Android application with APK path or package name
+attach = rvs_frida_attach(target="app.apk", package="com.example.app", device="usb", compact=True)
+
+# 3. Enumerate loaded native modules in target process
+modules = rvs_frida_modules(target="com.example.app", filter="libnative", limit=10)
+
+# 4. Dynamically force validation gate return value to success
+rvs_frida_hook_return(target="com.example.app", addr="sym.Java_com_example_MainActivity_validateLicense", retval="0x1")
 ```
 
 ---
@@ -1052,4 +1138,4 @@ Before completing any reverse engineering assignment:
 4. **Token Budgeting**: Always pass `compact=True` (or omit to accept default `True`). Limit symbol and string queries.
 5. **Native Tool Prescription**: Verify that no standalone Python or custom shell scripts were created. Confirm all dynamic hooking, register evaluation, and gate bypass operations utilized native `rvs_frida_*` or composite `rvs_*` tools.
 6. **Data Neutrality & Grounding Compliance**: Ensure neutral mode (`neutral=True`) and compact mode (`compact=True`) are preserved. Verify all conclusions are strictly grounded in concrete tool output with zero unverified speculation.
-7. **Android APK & Multi-Language Verification**: For Android APK targets, ensure package identity, embedded languages (Java, C/C++, React Native, Dart/Flutter), and native `.so` JNI functions are extracted via `rvs_apk_*` tools rather than external unzipping utilities.
+7. **Android APK & Multi-Language Verification**: For Android APK targets, ensure package identity, embedded languages (Java, C/C++, React Native, Dart/Flutter), resources, signatures, and native `.so` JNI functions are extracted via `rvs_apk_*` tools rather than external unzipping utilities.

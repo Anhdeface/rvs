@@ -102,10 +102,10 @@ class TestSkillToolSynchronization(unittest.TestCase):
             "Byte content mismatch between local SKILL.md and global config skill",
         )
 
-    def test_02_all_48_canonical_tools_documented(self):
-        """Verify all 48 canonical tools are documented in SKILL.md with no omissions or phantom tools."""
-        self.assertEqual(len(h.CANONICAL_TOOLS), 48, "CANONICAL_TOOLS count must be exactly 48")
-        self.assertEqual(len(self.doc_tools), 48, "SKILL.md documented tools count must be exactly 48")
+    def test_02_all_50_canonical_tools_documented(self):
+        """Verify all 50 canonical tools are documented in SKILL.md with no omissions or phantom tools."""
+        self.assertEqual(len(h.CANONICAL_TOOLS), 50, "CANONICAL_TOOLS count must be exactly 50")
+        self.assertEqual(len(self.doc_tools), 50, "SKILL.md documented tools count must be exactly 50")
 
         canonical_names = set(self.canonical_by_name.keys())
         documented_names = set(self.doc_tools.keys())
@@ -175,7 +175,7 @@ class TestSkillToolSynchronization(unittest.TestCase):
                         )
 
     def test_05_seven_phase_catalog_partition(self):
-        """Verify that all 48 tools are cleanly partitioned into 7 phases in the MCP Catalog in SKILL.md without overlap."""
+        """Verify that all 50 tools are cleanly partitioned into 7 phases in the MCP Catalog in SKILL.md without overlap."""
         phases = {
             "Phase 1: Static Reconnaissance & Triage": 9,
             "Phase 2: Dynamic Emulation & ESIL Tracing": 3,
@@ -183,12 +183,12 @@ class TestSkillToolSynchronization(unittest.TestCase):
             "Phase 4: Live Runtime Instrumentation via Frida": 15,
             "Phase 5: High-Level Composite": 4,
             "Phase 6: Binary Patching & Verification": 4,
-            "Phase 7: Android APK & Multi-Language Analysis": 4,
+            "Phase 7: Android APK & Multi-Language Analysis": 6,
         }
 
-        # Extract only the catalog section: from "## 🛠️ Complete 48-Tool Canonical MCP Catalog" to next major section
+        # Extract only the catalog section: from "## 🛠️ Complete 50-Tool Canonical MCP Catalog" to next major section
         catalog_match = re.search(
-            r"## 🛠️ Complete 48-Tool Canonical MCP Catalog\s*\n(.*?)(?=\n## 💡 |\Z)",
+            r"## 🛠️ Complete 50-Tool Canonical MCP Catalog\s*\n(.*?)(?=\n## 💡 |\Z)",
             self.local_content,
             re.DOTALL,
         )
@@ -219,7 +219,7 @@ class TestSkillToolSynchronization(unittest.TestCase):
                 self.assertNotIn(t, all_phase_tools, f"Tool {t} duplicated across phases in SKILL.md")
                 all_phase_tools.add(t)
 
-        self.assertEqual(len(all_phase_tools), 48, "Total tools across all 7 phases must equal 48")
+        self.assertEqual(len(all_phase_tools), 50, "Total tools across all 7 phases must equal 50")
 
     def test_06_standardized_exit_codes_parity(self):
         """Verify all 7 exit codes (0-6) in SKILL.md match harness constants."""
@@ -286,18 +286,18 @@ class TestSkillToolSynchronization(unittest.TestCase):
                             )
 
     def test_09_multi_format_schemas_generation_invariants(self):
-        """Verify get_tool_schemas generates exactly 48 valid schemas across all 4 formats."""
+        """Verify get_tool_schemas generates exactly 50 valid schemas across all 4 formats."""
         for fmt in ("openai", "anthropic", "gemini", "mcp"):
             schemas = h.get_tool_schemas(fmt)  # type: ignore
             self.assertEqual(
                 len(schemas),
-                48,
-                f"Format {fmt} produced {len(schemas)} schemas, expected 48",
+                50,
+                f"Format {fmt} produced {len(schemas)} schemas, expected 50",
             )
             # Ensure serialization round-trip
             serialized = json.dumps(schemas)
             deserialized = json.loads(serialized)
-            self.assertEqual(len(deserialized), 48)
+            self.assertEqual(len(deserialized), 50)
 
     def test_10_no_file_required_invariant(self):
         """
@@ -447,7 +447,7 @@ class TestSkillToolSynchronization(unittest.TestCase):
     def test_15_phase_7_apk_multi_language_documentation(self):
         """Verify Phase 7 APK tools, multi-language detection, and native .so analysis directives in SKILL.md."""
         self.assertIn("Phase 7: Android APK & Multi-Language Analysis", self.local_content)
-        for tool_name in ("rvs_apk_info", "rvs_apk_manifest", "rvs_apk_dex", "rvs_apk_native"):
+        for tool_name in ("rvs_apk_info", "rvs_apk_manifest", "rvs_apk_dex", "rvs_apk_native", "rvs_apk_resources", "rvs_apk_signature"):
             self.assertIn(tool_name, self.local_content)
         for lang in ("Java", "C/C++", "React Native", "Flutter"):
             self.assertIn(lang, self.local_content)

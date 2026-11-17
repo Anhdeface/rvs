@@ -47,6 +47,8 @@ pub struct ApkPackage {
     pub native_libraries: HashMap<String, Vec<ApkEntry>>, // abi -> entries
     #[serde(default)]
     pub asset_entries: Vec<ApkEntry>,
+    #[serde(default)]
+    pub resource_entries: Vec<ApkEntry>,
 }
 
 impl ApkPackage {
@@ -152,8 +154,35 @@ impl ApkPackage {
                 )))
             }
             ApkSource::Directory(base_dir) => {
+                let rel = Path::new(entry_name);
+                if rel.is_absolute()
+                    || entry_name.starts_with('/')
+                    || entry_name.starts_with('\\')
+                    || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(AppError::InvalidBinary(format!(
+                        "Invalid entry path '{}'",
+                        entry_name
+                    )));
+                }
+
                 // 1. Direct path join
-                let direct_path = base_dir.join(entry_name);
+                let direct_path = base_dir.join(rel);
+                let canonical_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
+                if let Ok(canon_direct) = direct_path.canonicalize() {
+                    if !canon_direct.starts_with(&canonical_base) {
+                        return Err(AppError::InvalidBinary(format!(
+                            "Invalid entry path '{}'",
+                            entry_name
+                        )));
+                    }
+                } else if !direct_path.starts_with(base_dir) {
+                    return Err(AppError::InvalidBinary(format!(
+                        "Invalid entry path '{}'",
+                        entry_name
+                    )));
+                }
+
                 if direct_path.is_file() {
                     return Ok(std::fs::read(&direct_path)?);
                 }
@@ -184,6 +213,17 @@ impl ApkPackage {
 
                 // 4. Search in asset_entries
                 for entry in &self.asset_entries {
+                    if entry.name == entry_name || entry.name.ends_with(entry_name) {
+                        if let Some(p) = &entry.path {
+                            if p.is_file() {
+                                return Ok(std::fs::read(p)?);
+                            }
+                        }
+                    }
+                }
+
+                // 5. Search in resource_entries
+                for entry in &self.resource_entries {
                     if entry.name == entry_name || entry.name.ends_with(entry_name) {
                         if let Some(p) = &entry.path {
                             if p.is_file() {
@@ -534,6 +574,7 @@ impl ApkPackage {
         let mut dex_entries = Vec::new();
         let mut native_libraries: HashMap<String, Vec<ApkEntry>> = HashMap::new();
         let mut asset_entries = Vec::new();
+        let mut resource_entries = Vec::new();
 
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| {
@@ -583,11 +624,18 @@ impl ApkPackage {
                     size,
                     path: None,
                 });
+            } else if name == "resources.arsc" || name.starts_with("res/") || name.starts_with("res\\") {
+                resource_entries.push(ApkEntry {
+                    name: name.replace('\\', "/"),
+                    size,
+                    path: None,
+                });
             }
         }
 
         dex_entries.sort_by(|a, b| a.name.cmp(&b.name));
         asset_entries.sort_by(|a, b| a.name.cmp(&b.name));
+        resource_entries.sort_by(|a, b| a.name.cmp(&b.name));
         for list in native_libraries.values_mut() {
             list.sort_by(|a, b| a.name.cmp(&b.name));
         }
@@ -599,6 +647,7 @@ impl ApkPackage {
             dex_entries,
             native_libraries,
             asset_entries,
+            resource_entries,
         })
     }
 
@@ -611,6 +660,7 @@ impl ApkPackage {
         let mut dex_entries = Vec::new();
         let mut native_libraries: HashMap<String, Vec<ApkEntry>> = HashMap::new();
         let mut asset_entries = Vec::new();
+        let mut resource_entries = Vec::new();
 
         // Check for AndroidManifest.xml: prefer root AndroidManifest.xml
         let root_manifest = path.join("AndroidManifest.xml");
@@ -671,11 +721,18 @@ impl ApkPackage {
                     size,
                     path: Some(file_path.clone()),
                 });
+            } else if rel == "resources.arsc" || rel.starts_with("res/") {
+                resource_entries.push(ApkEntry {
+                    name: rel,
+                    size,
+                    path: Some(file_path.clone()),
+                });
             }
         }
 
         dex_entries.sort_by(|a, b| a.name.cmp(&b.name));
         asset_entries.sort_by(|a, b| a.name.cmp(&b.name));
+        resource_entries.sort_by(|a, b| a.name.cmp(&b.name));
         for list in native_libraries.values_mut() {
             list.sort_by(|a, b| a.name.cmp(&b.name));
         }
@@ -687,6 +744,7 @@ impl ApkPackage {
             dex_entries,
             native_libraries,
             asset_entries,
+            resource_entries,
         })
     }
 
@@ -703,6 +761,7 @@ impl ApkPackage {
             dex_entries: vec![entry],
             native_libraries: HashMap::new(),
             asset_entries: Vec::new(),
+            resource_entries: Vec::new(),
         })
     }
 
@@ -723,6 +782,7 @@ impl ApkPackage {
             dex_entries: Vec::new(),
             native_libraries,
             asset_entries: Vec::new(),
+            resource_entries: Vec::new(),
         })
     }
 }

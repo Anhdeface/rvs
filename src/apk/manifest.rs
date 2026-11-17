@@ -15,6 +15,32 @@ pub struct ManifestInfo {
     pub services: Vec<String>,
     pub receivers: Vec<String>,
     pub providers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_xml: Option<String>,
+}
+
+/// Decode AndroidManifest raw bytes (binary AXML or plain text XML) into readable XML text.
+pub fn decode_raw_manifest(bytes: &[u8]) -> Result<String, AppError> {
+    if bytes.is_empty() {
+        return Err(AppError::ZeroByteFile("Manifest data is empty (0 bytes)".to_string()));
+    }
+    if is_binary_axml(bytes) {
+        if let Ok(xml) = asc_axml::decode(bytes) {
+            return Ok(xml);
+        }
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if text.trim_start().starts_with('<') {
+            return Ok(text.to_string());
+        }
+    }
+    // Fallback attempt with asc_axml
+    if let Ok(xml) = asc_axml::decode(bytes) {
+        return Ok(xml);
+    }
+    Err(AppError::InvalidBinary(
+        "Failed to decode Android binary XML (AXML) manifest".to_string(),
+    ))
 }
 
 /// Checks whether the raw byte buffer begins with Android binary XML (AXML) magic.
@@ -211,6 +237,7 @@ impl ManifestInfo {
             services,
             receivers,
             providers,
+            raw_xml: None,
         })
     }
 
@@ -314,6 +341,7 @@ impl ManifestInfo {
             services,
             receivers,
             providers,
+            raw_xml: None,
         })
     }
 }
@@ -439,5 +467,17 @@ mod tests {
             assert!(!info.package_name.is_empty(), "Package name should not be empty");
             println!("Decoded real AXML package: {}", info.package_name);
         }
+    }
+
+    #[test]
+    fn test_decode_raw_manifest_empty() {
+        assert!(decode_raw_manifest(&[]).is_err());
+    }
+
+    #[test]
+    fn test_decode_raw_manifest_text() {
+        let xml = "<manifest package=\"com.test\"><application/></manifest>";
+        let res = decode_raw_manifest(xml.as_bytes()).unwrap();
+        assert!(res.contains("com.test"));
     }
 }

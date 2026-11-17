@@ -1533,6 +1533,8 @@ pub struct CompactManifestInfo {
     pub receivers: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_xml: Option<String>,
 }
 
 impl From<&ManifestInfo> for CompactManifestInfo {
@@ -1549,6 +1551,7 @@ impl From<&ManifestInfo> for CompactManifestInfo {
             services: m.services.clone(),
             receivers: m.receivers.clone(),
             providers: m.providers.clone(),
+            raw_xml: m.raw_xml.clone(),
         }
     }
 }
@@ -1568,6 +1571,10 @@ pub struct CompactDexMethod {
     pub off: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disassembly: Option<Vec<crate::apk::dex::DalvikInstruction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smali: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompiled: Option<String>,
 }
 
 /// Compact representation of DEX class summary.
@@ -1579,6 +1586,8 @@ pub struct CompactDexClass {
     pub methods: Vec<CompactDexMethod>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smali: Option<String>,
 }
 
 /// Compact representation of DEX analysis results.
@@ -1593,6 +1602,10 @@ pub struct CompactDexAnalysisResult {
     pub string_pool: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disassembly: Option<Vec<crate::apk::dex::DalvikInstruction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smali: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompiled: Option<String>,
 }
 
 impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
@@ -1609,6 +1622,8 @@ impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
                         sig: m.signature.clone(),
                         off: m.code_offset.map(|o| format!("0x{:x}", o)),
                         disassembly: m.disassembly.clone(),
+                        smali: m.smali.clone(),
+                        decompiled: m.decompiled.clone(),
                     })
                     .collect();
                 CompactDexClass {
@@ -1616,6 +1631,7 @@ impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
                     super_cls: c.super_class.clone(),
                     methods,
                     fields: c.fields.clone(),
+                    smali: c.smali.clone(),
                 }
             })
             .collect();
@@ -1628,6 +1644,8 @@ impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
             class_list,
             string_pool: d.strings.clone(),
             disassembly: d.disassembly.clone(),
+            smali: d.smali.clone(),
+            decompiled: d.decompiled.clone(),
         }
     }
 }
@@ -1713,6 +1731,140 @@ impl From<&NativeLibraryAnalysis> for CompactNativeLibraryAnalysis {
 impl From<NativeLibraryAnalysis> for CompactNativeLibraryAnalysis {
     fn from(n: NativeLibraryAnalysis) -> Self {
         Self::from(&n)
+    }
+}
+
+/// Compact representation of APK resources and assets analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactApkResourcesData {
+    #[serde(rename = "res_cnt")]
+    pub total_resources: usize,
+    #[serde(rename = "asset_cnt")]
+    pub total_assets: usize,
+    pub arsc: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<CompactResourceEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extracted: Option<CompactExtractedResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dump_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dumped_cnt: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactResourceEntry {
+    pub name: String,
+    #[serde(rename = "sz")]
+    pub size: u64,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactExtractedResource {
+    pub name: String,
+    #[serde(rename = "sz")]
+    pub size: usize,
+    pub is_xml: bool,
+    pub content: String,
+}
+
+impl From<&crate::apk::resources::ApkResourcesData> for CompactApkResourcesData {
+    fn from(r: &crate::apk::resources::ApkResourcesData) -> Self {
+        let packages = r.arsc_packages.iter().map(|p| p.name.clone()).collect();
+        let entries = r.entries.as_ref().map(|list| {
+            list.iter()
+                .map(|e| CompactResourceEntry {
+                    name: e.name.clone(),
+                    size: e.size,
+                    entry_type: e.entry_type.clone(),
+                })
+                .collect()
+        });
+        let extracted = r.extracted.as_ref().map(|ex| CompactExtractedResource {
+            name: ex.name.clone(),
+            size: ex.size,
+            is_xml: ex.is_xml,
+            content: ex.content.clone(),
+        });
+
+        Self {
+            total_resources: r.total_resources,
+            total_assets: r.total_assets,
+            arsc: r.has_arsc,
+            packages,
+            entries,
+            extracted,
+            dump_dir: r.dump_dir.clone(),
+            dumped_cnt: r.dumped_files_count,
+        }
+    }
+}
+
+impl From<crate::apk::resources::ApkResourcesData> for CompactApkResourcesData {
+    fn from(r: crate::apk::resources::ApkResourcesData) -> Self {
+        Self::from(&r)
+    }
+}
+
+/// Compact representation of APK signature information.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactApkSignatureData {
+    pub signed: bool,
+    pub schemes: Vec<String>,
+    pub sig_block: bool,
+    pub signers: Vec<CompactSignerInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactSignerInfo {
+    pub subject: String,
+    pub issuer: String,
+    pub serial: String,
+    pub sha256: String,
+    pub algo: String,
+    pub valid_to: String,
+}
+
+impl From<&crate::apk::signature::ApkSignatureInfo> for CompactApkSignatureData {
+    fn from(s: &crate::apk::signature::ApkSignatureInfo) -> Self {
+        let signers = s
+            .signers
+            .iter()
+            .map(|sig| CompactSignerInfo {
+                subject: sig.subject.clone(),
+                issuer: sig.issuer.clone(),
+                serial: sig.serial_number.clone(),
+                sha256: sig.sha256_fingerprint.clone(),
+                algo: sig.signature_algorithm.clone(),
+                valid_to: sig.valid_to.clone(),
+            })
+            .collect();
+
+        Self {
+            signed: s.is_signed,
+            schemes: s.schemes.clone(),
+            sig_block: s.signing_block_present,
+            signers,
+            verified: s.verified,
+            errors: s.verification_errors.clone(),
+            warnings: s.warnings.clone(),
+        }
+    }
+}
+
+impl From<crate::apk::signature::ApkSignatureInfo> for CompactApkSignatureData {
+    fn from(s: crate::apk::signature::ApkSignatureInfo) -> Self {
+        Self::from(&s)
     }
 }
 
@@ -2086,6 +2238,7 @@ mod tests {
             services: Vec::new(),
             receivers: Vec::new(),
             providers: Vec::new(),
+            raw_xml: None,
         };
         let compact = CompactManifestInfo::from(&full);
         assert_eq!(compact.pkg, "com.example.app");

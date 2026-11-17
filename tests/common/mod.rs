@@ -653,6 +653,8 @@ pub struct ManifestInfoData {
     pub receivers: Vec<String>,
     #[serde(default)]
     pub providers: Vec<String>,
+    #[serde(default)]
+    pub raw_xml: Option<String>,
 }
 
 /// DEX analysis payload
@@ -670,6 +672,10 @@ pub struct DexAnalysisData {
     pub classes: Vec<DexClassSummaryData>,
     #[serde(default)]
     pub strings: Option<Vec<String>>,
+    #[serde(default)]
+    pub smali: Option<String>,
+    #[serde(default)]
+    pub decompiled: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -683,6 +689,8 @@ pub struct DexClassSummaryData {
     pub methods: Vec<DexMethodSummaryData>,
     #[serde(default)]
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub smali: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -693,6 +701,93 @@ pub struct DexMethodSummaryData {
     pub access_flags: u32,
     #[serde(default)]
     pub code_offset: Option<u64>,
+    #[serde(default)]
+    pub registers_size: Option<u16>,
+    #[serde(default)]
+    pub insns_size: Option<u32>,
+    #[serde(default)]
+    pub disassembly: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub smali: Option<String>,
+    #[serde(default)]
+    pub decompiled: Option<String>,
+}
+
+/// Resources analysis payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourcesData {
+    pub total_resources: usize,
+    pub total_assets: usize,
+    #[serde(default)]
+    pub has_arsc: bool,
+    #[serde(default)]
+    pub arsc_packages: Vec<ArscPackageData>,
+    #[serde(default)]
+    pub entries: Option<Vec<ResourceEntryData>>,
+    #[serde(default)]
+    pub extracted: Option<ExtractedResourceData>,
+    #[serde(default)]
+    pub dump_dir: Option<String>,
+    #[serde(default)]
+    pub dumped_files_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArscPackageData {
+    pub id: u32,
+    pub name: String,
+    #[serde(default)]
+    pub types_count: usize,
+    #[serde(default)]
+    pub string_pool_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceEntryData {
+    pub name: String,
+    pub size: u64,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedResourceData {
+    pub name: String,
+    pub size: usize,
+    pub is_xml: bool,
+    pub content: String,
+}
+
+/// Signature analysis payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureData {
+    pub is_signed: bool,
+    #[serde(default)]
+    pub schemes: Vec<String>,
+    #[serde(default)]
+    pub signing_block_present: bool,
+    #[serde(default)]
+    pub signers: Vec<SignerInfoData>,
+    #[serde(default)]
+    pub verified: Option<bool>,
+    #[serde(default)]
+    pub verification_errors: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerInfoData {
+    pub subject: String,
+    pub issuer: String,
+    pub serial_number: String,
+    pub valid_from: String,
+    pub valid_to: String,
+    pub signature_algorithm: String,
+    pub sha256_fingerprint: String,
+    pub sha1_fingerprint: String,
+    #[serde(default)]
+    pub md5_fingerprint: Option<String>,
 }
 
 /// Native .so JNI payload
