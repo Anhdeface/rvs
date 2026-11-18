@@ -85,7 +85,7 @@ check_repo_sync_status() {
     if [[ -n "$remote_branch_commit" && "$remote_branch_commit" != "$local_commit" ]]; then
         if ! git merge-base --is-ancestor "$remote_branch_commit" "$local_commit" 2>/dev/null; then
             is_synced=false
-            update_reason="Branch 'origin/$current_branch' has new updates"
+            update_reason="Branch $current_branch updated"
         fi
     fi
 
@@ -93,7 +93,7 @@ check_repo_sync_status() {
     if [[ -n "$tag_commit" && "$tag_commit" != "$local_commit" ]]; then
         if ! git merge-base --is-ancestor "$tag_commit" "$local_commit" 2>/dev/null; then
             is_synced=false
-            update_reason="A new release ${latest_tag}"
+            update_reason="New release ${latest_tag}"
         fi
     fi
 
@@ -126,8 +126,8 @@ check_and_print_pending_notification() {
         local pending_msg
         pending_msg=$(cat "$PENDING_UPDATE_FILE" 2>/dev/null || true)
         if [[ -n "$pending_msg" ]]; then
-            echo -e "${C_YELLOW}🔔 Notice: ${pending_msg} is available on GitHub!${C_RESET}"
-            echo -e "   Select Option 3 (Check GitHub Update) to review and sync."
+            echo -e "${C_YELLOW}${pending_msg}${C_RESET}"
+            echo "  Choose option 4 to review and sync."
             echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
         fi
     fi
@@ -153,6 +153,20 @@ prompt_input() {
     printf -v "$var_name" "%s" "${input:-$default_val}"
 }
 
+# Set AG_* flags once; shared by diagnostics and the setup wizard.
+detect_agents() {
+    AG_ANTIGRAVITY=false
+    AG_CLAUDE=false
+    AG_CURSOR=false
+    AG_OPENCODE=false
+
+    [[ -d "$HOME/.gemini" ]] && AG_ANTIGRAVITY=true
+    (command -v claude &>/dev/null || [[ -d "$HOME/.config/Claude" || -d "$HOME/Library/Application Support/Claude" ]]) && AG_CLAUDE=true
+    ([[ -d "$HOME/.cursor" || -d "$HOME/Library/Application Support/Cursor" || -d "$HOME/.config/Cursor" ]]) && AG_CURSOR=true
+    (command -v opencode &>/dev/null || [[ -d "$OPENCODE_CONFIG_DIR" ]]) && AG_OPENCODE=true
+    return 0
+}
+
 # =============================================================================
 # 1. Pre-flight Dependency & Agent Diagnostic (Notification-Only, No Auto-Install)
 # =============================================================================
@@ -163,15 +177,15 @@ run_preflight_diagnostics() {
     local missing_warnings=()
 
     # 1. Python 3 Check (Version >= 3.9)
-    local py_status="${C_RED}Missing${C_RESET}"
+    local py_status="${C_RED}missing${C_RESET}"
     if command -v python3 &>/dev/null; then
         local py_ver
         py_ver=$(python3 -c 'import sys; print(f"v{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")' 2>/dev/null || echo "detected")
         if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
             py_status="${C_GREEN}OK${C_RESET} ($py_ver)"
         else
-            py_status="${C_YELLOW}Outdated${C_RESET} ($py_ver, requires >= 3.9)"
-            missing_required+=("python3 (>= 3.9)")
+            py_status="${C_YELLOW}outdated${C_RESET} ($py_ver, need >= 3.9)"
+            missing_required+=("python3")
             has_errors=true
         fi
     else
@@ -180,17 +194,17 @@ run_preflight_diagnostics() {
     fi
 
     # 2. radare2 (r2) Check
-    local r2_status="${C_YELLOW}Not found${C_RESET}"
+    local r2_status="${C_YELLOW}not found${C_RESET}"
     if command -v radare2 &>/dev/null; then
         local r2_ver
         r2_ver=$(radare2 -v 2>/dev/null | head -n1 | awk '{print $2}' || echo "detected")
         r2_status="${C_GREEN}OK${C_RESET} (v$r2_ver)"
     else
-        missing_warnings+=("radare2 (binary analysis/ESIL emulation will not work without r2)")
+        missing_warnings+=("radare2 is missing; static/ESIL analysis will be limited.")
     fi
 
     # 3. Core CLI tools (git, jq)
-    local git_status="${C_RED}Missing${C_RESET}"
+    local git_status="${C_RED}missing${C_RESET}"
     if command -v git &>/dev/null; then
         git_status="${C_GREEN}OK${C_RESET}"
     else
@@ -198,7 +212,7 @@ run_preflight_diagnostics() {
         has_errors=true
     fi
 
-    local jq_status="${C_RED}Missing${C_RESET}"
+    local jq_status="${C_RED}missing${C_RESET}"
     if command -v jq &>/dev/null; then
         jq_status="${C_GREEN}OK${C_RESET}"
     else
@@ -207,7 +221,7 @@ run_preflight_diagnostics() {
     fi
 
     # 4. Cargo (Optional, for building from source)
-    local cargo_status="${C_DIM}Not found (pre-built binary download fallback)${C_RESET}"
+    local cargo_status="${C_DIM}not found${C_RESET}"
     if command -v cargo &>/dev/null; then
         local cargo_ver
         cargo_ver=$(cargo --version 2>/dev/null | awk '{print $2}' || echo "detected")
@@ -215,60 +229,51 @@ run_preflight_diagnostics() {
     fi
 
     # 5. rvs CLI Shortcut & Symlink Diagnostic
-    local rvs_cli_status="${C_DIM}Not installed (~/.local/bin/rvs)${C_RESET}"
+    local rvs_cli_status="${C_DIM}not installed${C_RESET}"
     if [[ -L "$HOME/.local/bin/rvs" ]]; then
         local link_dest
         link_dest="$(readlink "$HOME/.local/bin/rvs" 2>/dev/null || echo "symlink")"
         rvs_cli_status="${C_GREEN}OK${C_RESET} (symlink -> $link_dest)"
     elif [[ -e "$HOME/.local/bin/rvs" ]]; then
-        rvs_cli_status="${C_YELLOW}Regular binary (symlink recommended)${C_RESET}"
-        missing_warnings+=("~/.local/bin/rvs is a regular static binary; symlinking to $RVS_BIN is recommended.")
+        rvs_cli_status="${C_YELLOW}static binary (symlink recommended)${C_RESET}"
+        missing_warnings+=("$HOME/.local/bin/rvs is not a symlink; re-link it to $RVS_BIN.")
     fi
 
     # 6. Agent Detection
-    local has_antigravity=false
-    local has_claude=false
-    local has_cursor=false
-    local has_opencode=false
-
-    [[ -d "$HOME/.gemini" ]] && has_antigravity=true
-    (command -v claude &>/dev/null || [[ -d "$HOME/.config/Claude" || -d "$HOME/Library/Application Support/Claude" ]]) && has_claude=true
-    ([[ -d "$HOME/.cursor" || -d "$HOME/Library/Application Support/Cursor" || -d "$HOME/.config/Cursor" ]]) && has_cursor=true
-    (command -v opencode &>/dev/null || [[ -d "$OPENCODE_CONFIG_DIR" ]]) && has_opencode=true
+    detect_agents
 
     # Display Diagnostic Table
     if [[ "$show_summary" == true || "$has_errors" == true ]]; then
-        echo -e "${C_BOLD}System Environment & Dependencies:${C_RESET}"
-        echo -e "  - Current User    : ${C_CYAN}${USER:-$(whoami)}${C_RESET}"
-        echo -e "  - Repository Path : ${C_CYAN}$REPO_DIR${C_RESET}"
-        echo -e "  - rvs CLI         : $rvs_cli_status"
-        echo -e "  - Python 3        : $py_status"
-        echo -e "  - radare2 (r2)    : $r2_status"
-        echo -e "  - Git             : $git_status"
-        echo -e "  - jq              : $jq_status"
-        echo -e "  - Cargo (Rust)    : $cargo_status"
+        echo -e "${C_BOLD}Environment${C_RESET}"
+        echo -e "  User      : ${C_CYAN}${USER:-$(whoami)}${C_RESET}"
+        echo -e "  Repo      : ${C_CYAN}$REPO_DIR${C_RESET}"
+        echo -e "  rvs CLI   : $rvs_cli_status"
+        echo -e "  Python 3  : $py_status"
+        echo -e "  radare2   : $r2_status"
+        echo -e "  Git       : $git_status"
+        echo -e "  jq        : $jq_status"
+        echo -e "  Cargo     : $cargo_status"
         echo ""
-        echo -e "${C_BOLD}Detected AI Agents:${C_RESET}"
-        echo -e "  - Google Antigravity : $([[ "$has_antigravity" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
-        echo -e "  - Claude (Desktop/CLI): $([[ "$has_claude" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
-        echo -e "  - Cursor IDE         : $([[ "$has_cursor" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
-        echo -e "  - OpenCode           : $([[ "$has_opencode" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
+        echo -e "${C_BOLD}Agents${C_RESET}"
+        echo -e "  Antigravity : $([[ "$AG_ANTIGRAVITY" == true ]] && echo "${C_GREEN}yes${C_RESET}" || echo "${C_DIM}no${C_RESET}")"
+        echo -e "  Claude      : $([[ "$AG_CLAUDE" == true ]] && echo "${C_GREEN}yes${C_RESET}" || echo "${C_DIM}no${C_RESET}")"
+        echo -e "  Cursor      : $([[ "$AG_CURSOR" == true ]] && echo "${C_GREEN}yes${C_RESET}" || echo "${C_DIM}no${C_RESET}")"
+        echo -e "  OpenCode    : $([[ "$AG_OPENCODE" == true ]] && echo "${C_GREEN}yes${C_RESET}" || echo "${C_DIM}no${C_RESET}")"
         echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
 
         if [[ ${#missing_required[@]} -gt 0 ]]; then
             echo ""
             error "Missing required dependencies: ${missing_required[*]}"
-            echo "Please install them manually using your system package manager:"
-            echo "  - Debian/Ubuntu : sudo apt install ${missing_required[*]}"
-            echo "  - macOS (Homebrew): brew install ${missing_required[*]}"
-            echo "  - Arch Linux    : sudo pacman -S ${missing_required[*]}"
+            echo "Install them with your package manager:"
+            echo "  Debian/Ubuntu : sudo apt install ${missing_required[*]}"
+            echo "  macOS         : brew install ${missing_required[*]}"
+            echo "  Arch Linux    : sudo pacman -S ${missing_required[*]}"
             echo ""
             return 1
         fi
 
         if [[ ${#missing_warnings[@]} -gt 0 ]]; then
-            warn "Notice: ${missing_warnings[*]}"
-            echo "  (Install manually if you plan to perform local static/dynamic analysis: https://radare.org)"
+            warn "${missing_warnings[*]}"
             echo ""
         fi
     fi
@@ -326,7 +331,7 @@ download_prebuilt_binary() {
     local download_url="${base_url}/rvs-${os_arch}"
     local checksum_url="${download_url}.sha256"
 
-    log "Checking pre-built binary ($os_arch)..."
+    log "Downloading pre-built binary ($os_arch)..."
     mkdir -p -m 755 "$REPO_DIR/target/release"
     local temp_bin="$REPO_DIR/target/release/rvs.tmp.$$"
 
@@ -344,16 +349,16 @@ download_prebuilt_binary() {
 
             rm -f "$temp_sha"
             if [[ -n "$expected_hash" && -n "$actual_hash" && "$expected_hash" != "$actual_hash" ]]; then
-                error "Integrity check failed for $download_url (SHA256 mismatch)!"
+                error "Checksum mismatch for $download_url"
                 rm -f "$temp_bin"
                 return 1
             fi
-            info "SHA256 checksum verified."
+            info "Checksum verified."
         fi
 
         mv -f "$temp_bin" "$RVS_BIN"
         chmod 755 "$RVS_BIN"
-        success "Downloaded pre-built binary: $RVS_BIN"
+        success "Binary downloaded: $RVS_BIN"
         return 0
     fi
 
@@ -371,11 +376,11 @@ build_rvs_binary() {
 
     # 2. Fallback to Cargo (scoped to --bin rvs, skipping test/dev dependencies)
     if ! command -v cargo &>/dev/null; then
-        warn "Pre-built binary not found and Cargo is not installed. Skipping build."
+        warn "Pre-built binary unavailable and Cargo is not installed. Skipping build."
         return 0
     fi
 
-    log "Building target/release/rvs via cargo (fast --bin rvs mode)..."
+    log "Building rvs with cargo..."
     if (cd "$REPO_DIR" && cargo build --release --bin rvs); then
         success "Binary ready: $RVS_BIN"
     else
@@ -400,42 +405,41 @@ ensure_rvs_cli_setup() {
     if [[ -L "$rvs_target" ]]; then
         local link_dest
         link_dest="$(readlink "$rvs_target" 2>/dev/null || echo "target/release/rvs")"
-        info "rvs CLI: Detected symlink ($rvs_target -> $link_dest). Skipping CLI prompt."
+        info "rvs CLI already linked ($rvs_target -> $link_dest)."
         if [[ ! -f "$RVS_BIN" ]]; then
-            log "Local binary missing at $RVS_BIN. Fetching or building..."
+            log "Local binary missing. Fetching or building..."
             build_rvs_binary
         fi
         return 0
     elif [[ -e "$rvs_target" ]]; then
         echo ""
-        warn "Notice: $rvs_target is a static binary file (not a symlink)."
-        echo -e "   ${C_YELLOW}Recommendation:${C_RESET} Symlinking to '${RVS_BIN}' is recommended so that"
-        echo -e "   rebuilding/updating rvs updates the system CLI automatically without manual copying."
+        warn "$rvs_target is a static binary, not a symlink."
+        echo "  Re-link it to $RVS_BIN so updates apply automatically."
         if [[ "$interactive" == true ]]; then
             local fix_sym="Y"
-            prompt_input "   Convert $rvs_target to symlink -> $RVS_BIN? [Y/n]: " "Y" fix_sym
+            prompt_input "  Convert to symlink? [Y/n]: " "Y" fix_sym
             if [[ "$fix_sym" =~ ^[Yy]$ ]]; then
                 [[ ! -f "$RVS_BIN" ]] && build_rvs_binary
                 mkdir -p "$HOME/.local/bin"
                 ln -sfn "$RVS_BIN" "$rvs_target"
-                success "Converted to symlink: $rvs_target -> $RVS_BIN"
+                success "Linked: $rvs_target -> $RVS_BIN"
             else
-                info "Kept existing static binary as requested."
+                info "Keeping the existing binary."
             fi
         fi
         return 0
     else
         # Not installed yet: ask for the first time
         echo ""
-        log "rvs CLI is not yet installed in $HOME/.local/bin/rvs."
+        log "rvs CLI is not installed."
         if [[ "$interactive" == true ]]; then
             local install_cli="Y"
-            prompt_input "Install rvs CLI into ~/.local/bin/rvs (symlink)? [Y/n]: " "Y" install_cli
+            prompt_input "Install rvs CLI at ~/.local/bin/rvs? [Y/n]: " "Y" install_cli
             if [[ "$install_cli" =~ ^[Yy]$ ]]; then
                 [[ ! -f "$RVS_BIN" ]] && build_rvs_binary
                 setup_terminal_shortcut
             else
-                info "Skipped rvs CLI shortcut setup."
+                info "Skipped CLI setup."
             fi
         fi
         return 0
@@ -445,20 +449,20 @@ ensure_rvs_cli_setup() {
 manage_rvs_cli_menu() {
     while true; do
         echo ""
-        echo -e "${C_BOLD}rvs CLI Binary Management:${C_RESET}"
-        echo "  - Local Binary : $RVS_BIN ($([[ -f "$RVS_BIN" ]] && echo "${C_GREEN}Available${C_RESET}" || echo "${C_YELLOW}Not built${C_RESET}"))"
-        local link_info="${C_DIM}Not installed${C_RESET}"
+        echo -e "${C_BOLD}rvs CLI${C_RESET}"
+        echo "  Binary : $RVS_BIN ($([[ -f "$RVS_BIN" ]] && echo "${C_GREEN}ready${C_RESET}" || echo "${C_YELLOW}missing${C_RESET}"))"
+        local link_info="${C_DIM}not installed${C_RESET}"
         if [[ -L "$HOME/.local/bin/rvs" ]]; then
-            link_info="${C_GREEN}Symlink -> $(readlink "$HOME/.local/bin/rvs")${C_RESET}"
+            link_info="${C_GREEN}-> $(readlink "$HOME/.local/bin/rvs")${C_RESET}"
         elif [[ -e "$HOME/.local/bin/rvs" ]]; then
-            link_info="${C_YELLOW}Static binary (Symlink recommended)${C_RESET}"
+            link_info="${C_YELLOW}static file${C_RESET}"
         fi
-        echo -e "  - CLI Shortcut : $HOME/.local/bin/rvs ($link_info)"
+        echo -e "  CLI    : $HOME/.local/bin/rvs ($link_info)"
         echo ""
-        echo "  1) Rebuild rvs binary from source (cargo build --release --bin rvs)"
-        echo "  2) (Re)create Symlink at ~/.local/bin/rvs"
-        echo "  3) Check rvs CLI version (rvs --version)"
-        echo "  0) Back to main menu"
+        echo "  1) Rebuild binary"
+        echo "  2) Create/update symlink"
+        echo "  3) Show version"
+        echo "  0) Back"
         echo ""
         local cli_choice=""
         if ! read -r -p "Select [0-3]: " cli_choice; then
@@ -511,17 +515,17 @@ configure_test_suite_sparse() {
     fi
 
     if [[ "$include_tests" == false ]]; then
-        log "Excluding test suites to optimize disk space and future pulls..."
+        log "Excluding tests..."
         if git sparse-checkout set --no-cone '/*' '!/tests' '!/.agents' 2>/dev/null; then
-            success "Tests excluded (future updates will NOT fetch tests/ or .agents/)."
+            success "Tests excluded."
         else
             rm -rf "$REPO_DIR/tests" "$REPO_DIR/.agents"
-            info "Cleaned test folders locally."
+            info "Removed local test folders."
         fi
     else
-        log "Restoring test suites..."
+        log "Restoring tests..."
         git sparse-checkout disable 2>/dev/null || true
-        success "Test suites included."
+        success "Tests included."
     fi
 }
 
@@ -545,24 +549,21 @@ export_manual_mcp_config() {
 JSON_EOF
 
     echo ""
-    echo -e "${C_BOLD}Manual MCP Configuration Snippet:${C_RESET}"
-    echo -e "${C_DIM}Dynamic Path for User: ${USER:-$(whoami)} (Repository: $REPO_DIR)${C_RESET}"
+    echo -e "${C_BOLD}Manual MCP config${C_RESET} (saved to $MANUAL_CONFIG_FILE)"
+    echo -e "${C_DIM}Repo: $REPO_DIR${C_RESET}"
     echo ""
     echo -e "${C_CYAN}$(cat "$MANUAL_CONFIG_FILE")${C_RESET}"
     echo ""
-    echo "Saved to: $MANUAL_CONFIG_FILE"
+    echo "Add this block to:"
+    echo "  Antigravity    : ~/.gemini/config/mcp_config.json"
+    echo "  Claude Desktop : ~/.config/Claude/claude_desktop_config.json"
+    echo "  Claude Code    : claude mcp add rvs -- python3 \"$HARNESS_PATH\" --mcp"
+    echo "  Cursor         : ~/.cursor/mcp.json"
+    echo "  OpenCode       : opencode mcp add rvs --global -- python3 \"$HARNESS_PATH\" --mcp"
     echo ""
-    echo "Add the 'rvs' block above into your Agent configuration file:"
-    echo "  - Antigravity : ~/.gemini/config/mcp_config.json"
-    echo "  - Claude Desktop: ~/.config/Claude/claude_desktop_config.json"
-    echo "  - Claude Code CLI: claude mcp add rvs -- python3 \"$HARNESS_PATH\" --mcp"
-    echo "  - Cursor IDE    : ~/.cursor/mcp.json"
-    echo "  - OpenCode CLI  : opencode mcp add rvs --global -- python3 \"$HARNESS_PATH\" --mcp"
+    echo "Skill: copy or link $SKILL_SRC"
     echo ""
-    echo "To attach the skill manually, copy or link:"
-    echo "  $SKILL_SRC"
-    echo ""
-    info "Note: Manual setup does not enable automatic background updates."
+    info "Manual setup does not enable background update checks."
 }
 
 # =============================================================================
@@ -640,6 +641,19 @@ safe_merge_mcp_config() {
     return 1
 }
 
+export_antigravity_tools() {
+    local schemas_dir="$HOME/.gemini/antigravity-cli/mcp/rvs"
+    mkdir -p "$schemas_dir"
+
+    local tools_json
+    tools_json=$(python3 "$HARNESS_PATH" --export-tools mcp 2>/dev/null) || return 0
+    echo "$tools_json" | jq -c '.[] | {name, description, parameters: .inputSchema}' | while read -r tool; do
+        local tool_name
+        tool_name=$(echo "$tool" | jq -r .name)
+        echo "$tool" > "$schemas_dir/${tool_name}.json"
+    done
+}
+
 configure_antigravity_core() {
     local use_lazy="$1"
     local skill_mode="$2"
@@ -649,17 +663,7 @@ configure_antigravity_core() {
 
     local config_file="$HOME/.gemini/config/mcp_config.json"
     safe_merge_mcp_config "$config_file" "$cmd" "$args_json"
-
-    local schemas_dir="$HOME/.gemini/antigravity-cli/mcp/rvs"
-    mkdir -p "$schemas_dir"
-    local tools_json
-    if tools_json=$(python3 "$HARNESS_PATH" --export-tools mcp 2>/dev/null); then
-        echo "$tools_json" | jq -c '.[] | {name, description, parameters: .inputSchema}' | while read -r tool; do
-            local tool_name
-            tool_name=$(echo "$tool" | jq -r .name)
-            echo "$tool" > "$schemas_dir/${tool_name}.json"
-        done
-    fi
+    export_antigravity_tools
 
     attach_skill_to_dir "$HOME/.gemini/config/skills/rvs" "Antigravity" "$skill_mode"
     success "Antigravity configured."
@@ -832,41 +836,42 @@ perform_update() {
             fi
         fi
 
-        [[ "$silent" == false ]] && log "Pulling latest updates from GitHub..."
+        [[ "$silent" == false ]] && log "Pulling updates..."
         if [[ "$current_branch" != "HEAD" ]]; then
             git pull origin "$current_branch" -q 2>/dev/null || git fetch --tags origin -q 2>/dev/null || return 0
         else
             git fetch --tags origin -q 2>/dev/null || return 0
         fi
 
-        # Try fast pre-built binary download first, then cargo --bin rvs
         build_rvs_binary
-
-        if [[ -d "$HOME/.gemini/antigravity-cli/mcp/rvs" ]]; then
-            local tools_json
-            if tools_json=$(python3 "$HARNESS_PATH" --export-tools mcp 2>/dev/null); then
-                echo "$tools_json" | jq -c '.[] | {name, description, parameters: .inputSchema}' | while read -r tool; do
-                    local tool_name
-                    tool_name=$(echo "$tool" | jq -r .name)
-                    echo "$tool" > "$HOME/.gemini/antigravity-cli/mcp/rvs/${tool_name}.json"
-                done
-            fi
-        fi
+        [[ -d "$HOME/.gemini/antigravity-cli/mcp/rvs" ]] && export_antigravity_tools
 
         rm -f "$PENDING_UPDATE_FILE"
-        [[ "$silent" == false ]] && success "Successfully synchronized with GitHub."
+        [[ "$silent" == false ]] && success "Updated."
     else
         rm -f "$PENDING_UPDATE_FILE"
-        [[ "$silent" == false ]] && success "Already up to date and synchronized with GitHub (${head_tag:-${current_branch} @ ${current_commit:0:7}})."
+        [[ "$silent" == false ]] && success "Up to date (${head_tag:-${current_branch} @ ${current_commit:0:7}})."
     fi
 }
 
 # =============================================================================
 # 8. Clean Uninstall
 # =============================================================================
+remove_legacy_mcp_entry() {
+    local config_file="$1"
+    [[ -f "$config_file" ]] || return 0
+
+    local temp_config="${config_file}.tmp.$$"
+    if jq 'del(.mcpServers.rvs)' "$config_file" > "$temp_config" 2>/dev/null; then
+        mv -f "$temp_config" "$config_file"
+    else
+        rm -f "$temp_config"
+    fi
+}
+
 perform_uninstall() {
     echo ""
-    echo -e "${C_YELLOW}This removes rvs MCP servers and skills from all agents.${C_RESET}"
+    echo -e "${C_YELLOW}Remove rvs MCP entries and skills from all agents?${C_RESET}"
     local confirm="N"
     prompt_input "Proceed? [y/N]: " "N" confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -874,40 +879,17 @@ perform_uninstall() {
         return 0
     fi
 
-    local config_file="$HOME/.gemini/config/mcp_config.json"
-    if [[ -f "$config_file" ]]; then
-        local tmp_gemini="${config_file}.tmp.$$"
-        if jq 'del(.mcpServers.rvs)' "$config_file" > "$tmp_gemini" 2>/dev/null; then
-            mv -f "$tmp_gemini" "$config_file"
-        else
-            rm -f "$tmp_gemini"
-        fi
-    fi
-    rm -rf "$HOME/.gemini/antigravity-cli/mcp/rvs"
-    rm -rf "$HOME/.gemini/config/skills/rvs"
+    local gemini_cfg="$HOME/.gemini/config/mcp_config.json"
+    remove_legacy_mcp_entry "$gemini_cfg"
+    rm -rf "$HOME/.gemini/antigravity-cli/mcp/rvs" "$HOME/.gemini/config/skills/rvs"
 
     local claude_cfg="$HOME/.config/Claude/claude_desktop_config.json"
     [[ "$(uname -s)" == "Darwin" ]] && claude_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-    if [[ -f "$claude_cfg" ]]; then
-        local tmp_claude="${claude_cfg}.tmp.$$"
-        if jq 'del(.mcpServers.rvs)' "$claude_cfg" > "$tmp_claude" 2>/dev/null; then
-            mv -f "$tmp_claude" "$claude_cfg"
-        else
-            rm -f "$tmp_claude"
-        fi
-    fi
+    remove_legacy_mcp_entry "$claude_cfg"
     command -v claude &>/dev/null && claude mcp remove rvs -s user &>/dev/null || true
     rm -rf "$HOME/.claude/skills/rvs"
 
-    local cursor_cfg="$HOME/.cursor/mcp.json"
-    if [[ -f "$cursor_cfg" ]]; then
-        local tmp_cursor="${cursor_cfg}.tmp.$$"
-        if jq 'del(.mcpServers.rvs)' "$cursor_cfg" > "$tmp_cursor" 2>/dev/null; then
-            mv -f "$tmp_cursor" "$cursor_cfg"
-        else
-            rm -f "$tmp_cursor"
-        fi
-    fi
+    remove_legacy_mcp_entry "$HOME/.cursor/mcp.json"
 
     remove_opencode_mcp_server "$OPENCODE_CONFIG_DIR/opencode.json"
     remove_opencode_mcp_server "$OPENCODE_CONFIG_DIR/opencode.jsonc"
@@ -916,7 +898,7 @@ perform_uninstall() {
     rm -f "$HOME/.local/bin/rvs" "$MANUAL_CONFIG_FILE"
     rm -rf "$CACHE_DIR"
 
-    success "Uninstalled rvs from all agents."
+    success "rvs removed."
 }
 
 # =============================================================================
@@ -928,13 +910,13 @@ run_installation_wizard() {
 
     # Step 1: Target Agents
     echo ""
-    echo -e "${C_BOLD}[1/3] Target AI Agents${C_RESET}"
-    echo "  1) All detected agents"
-    echo "  2) Google Antigravity only"
-    echo "  3) Claude (Desktop & CLI) only"
-    echo "  4) Cursor IDE only"
-    echo "  5) OpenCode only"
-    echo "  6) Manual export only (creates rvs_mcp_config.json, no auto-config)"
+    echo -e "${C_BOLD}[1/3] Agents${C_RESET}"
+    echo "  1) All detected"
+    echo "  2) Antigravity"
+    echo "  3) Claude"
+    echo "  4) Cursor"
+    echo "  5) OpenCode"
+    echo "  6) Manual config only"
     echo "  7) Skip"
     local agent_choice="1"
     prompt_input "  Select [1-7] (default: 1): " "1" agent_choice
@@ -943,9 +925,9 @@ run_installation_wizard() {
     local skill_mode="symlink"
     if [[ "$agent_choice" =~ ^[1-5]$ ]]; then
         echo ""
-        echo -e "${C_BOLD}[2/3] Skill Linking Mode${C_RESET}"
-        echo "  1) Symlink (recommended - auto-syncs on git pull)"
-        echo "  2) Copy (independent file)"
+        echo -e "${C_BOLD}[2/3] Skill install${C_RESET}"
+        echo "  1) Symlink (recommended)"
+        echo "  2) Copy"
         local skill_choice="1"
         prompt_input "  Select [1-2] (default: 1): " "1" skill_choice
         [[ "$skill_choice" == "2" ]] && skill_mode="copy"
@@ -955,22 +937,33 @@ run_installation_wizard() {
     local use_lazy=false
     if [[ "$agent_choice" =~ ^[1-5]$ ]]; then
         echo ""
-        echo -e "${C_BOLD}[3/3] Auto-Update Check${C_RESET}"
-        echo "  Checks GitHub tags in background when MCP launches (max once/24h, non-blocking)."
-        echo "  Only notifies you upon opening install.sh — does NOT modify source code automatically."
+        echo -e "${C_BOLD}[3/3] Update check${C_RESET}"
+        echo "  Check GitHub once per day in the background (notify only)."
         local lazy_choice="Y"
-        prompt_input "  Enable background check? [Y/n]: " "Y" lazy_choice
+        prompt_input "  Enable? [Y/n]: " "Y" lazy_choice
         [[ "$lazy_choice" =~ ^[Yy]$ ]] && use_lazy=true
     fi
+
+    local agent_label="Unknown"
+    case "$agent_choice" in
+        1) agent_label="All detected" ;;
+        2) agent_label="Antigravity" ;;
+        3) agent_label="Claude" ;;
+        4) agent_label="Cursor" ;;
+        5) agent_label="OpenCode" ;;
+        6) agent_label="Manual config" ;;
+        7) agent_label="Skip" ;;
+    esac
 
     # Summary
     echo ""
     echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
-    echo "Summary:"
-    echo "  - rvs CLI Status   : $([[ -L "$HOME/.local/bin/rvs" ]] && echo "Symlink verified" || echo "Checked")"
-    echo "  - Target agents    : Option $agent_choice"
-    [[ "$agent_choice" =~ ^[1-5]$ ]] && echo "  - Skill mode       : $skill_mode"
-    [[ "$agent_choice" =~ ^[1-5]$ ]] && echo "  - Auto-update check: $([ "$use_lazy" = true ] && echo "enabled (notify-only, 24h)" || echo "disabled")"
+    echo "Summary"
+    echo "  Agents : $agent_label"
+    if [[ "$agent_choice" =~ ^[1-5]$ ]]; then
+        echo "  Skill  : $skill_mode"
+        echo "  Updates: $([ "$use_lazy" == true ] && echo "on" || echo "off")"
+    fi
     echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
 
     local confirm_apply="Y"
@@ -981,22 +974,15 @@ run_installation_wizard() {
     fi
 
     echo ""
-    local has_antigravity=false
-    local has_claude=false
-    local has_cursor=false
-    local has_opencode=false
-    [[ -d "$HOME/.gemini" ]] && has_antigravity=true
-    (command -v claude &>/dev/null || [[ -d "$HOME/.config/Claude" || -d "$HOME/Library/Application Support/Claude" ]]) && has_claude=true
-    ([[ -d "$HOME/.cursor" || -d "$HOME/Library/Application Support/Cursor" || -d "$HOME/.config/Cursor" ]]) && has_cursor=true
-    (command -v opencode &>/dev/null || [[ -d "$OPENCODE_CONFIG_DIR" ]]) && has_opencode=true
+    detect_agents
 
     case "$agent_choice" in
         1)
-            [[ "$has_antigravity" == true ]] && configure_antigravity_core "$use_lazy" "$skill_mode"
-            [[ "$has_claude" == true ]] && configure_claude_core "$use_lazy" "$skill_mode"
-            [[ "$has_cursor" == true ]] && configure_cursor_core "$use_lazy"
-            [[ "$has_opencode" == true ]] && configure_opencode_core "$use_lazy" "$skill_mode"
-            if [[ "$has_antigravity" == false && "$has_claude" == false && "$has_cursor" == false && "$has_opencode" == false ]]; then
+            [[ "$AG_ANTIGRAVITY" == true ]] && configure_antigravity_core "$use_lazy" "$skill_mode"
+            [[ "$AG_CLAUDE" == true ]] && configure_claude_core "$use_lazy" "$skill_mode"
+            [[ "$AG_CURSOR" == true ]] && configure_cursor_core "$use_lazy"
+            [[ "$AG_OPENCODE" == true ]] && configure_opencode_core "$use_lazy" "$skill_mode"
+            if [[ "$AG_ANTIGRAVITY" == false && "$AG_CLAUDE" == false && "$AG_CURSOR" == false && "$AG_OPENCODE" == false ]]; then
                 configure_antigravity_core "$use_lazy" "$skill_mode"
                 configure_claude_core "$use_lazy" "$skill_mode"
             fi
@@ -1020,7 +1006,7 @@ run_installation_wizard() {
             info "Skipped agent configuration."
             ;;
         *)
-            warn "Invalid agent selection, skipping configuration."
+            warn "Invalid selection."
             ;;
     esac
 
@@ -1036,16 +1022,16 @@ interactive_menu() {
     while true; do
         local update_badge=""
         if [[ -f "$PENDING_UPDATE_FILE" ]]; then
-            update_badge=" ${C_YELLOW}(update available)${C_RESET}"
+            update_badge=" ${C_YELLOW}(update)${C_RESET}"
         fi
 
         echo ""
-        echo "1) Setup / Configure Agents (Add rvs MCP & Skill)"
-        echo "2) Manage rvs CLI Binary (Build / Re-link Symlink)"
-        echo "3) Manual Setup (Export MCP Config Snippet)"
-        echo -e "4) Check GitHub Update${update_badge}"
-        echo "5) Toggle Test Suites (Exclude or Include)"
-        echo "6) System & Agent Diagnostic"
+        echo "1) Setup agents"
+        echo "2) Manage rvs CLI"
+        echo "3) Export manual config"
+        echo -e "4) Check for updates${update_badge}"
+        echo "5) Test suites"
+        echo "6) Diagnostics"
         echo "7) Uninstall"
         echo "0) Exit"
         echo ""
@@ -1076,9 +1062,9 @@ interactive_menu() {
                 ;;
             5)
                 echo ""
-                echo -e "${C_BOLD}Toggle Test Suites & Fixtures:${C_RESET}"
-                echo "  1) Exclude tests (sparse-checkout: saves disk & speeds up git pulls)"
-                echo "  2) Include tests (full checkout: restores tests/ and .agents/)"
+                echo -e "${C_BOLD}Tests${C_RESET}"
+                echo "  1) Exclude (saves disk)"
+                echo "  2) Include (restore tests/ and .agents/)"
                 local t_choice="1"
                 prompt_input "Select [1-2]: " "1" t_choice
                 if [[ "$t_choice" == "1" ]]; then
