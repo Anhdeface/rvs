@@ -18,6 +18,7 @@ CACHE_DIR="$HOME/.cache/rvs"
 LAST_CHECK_FILE="$CACHE_DIR/last_update_check"
 PENDING_UPDATE_FILE="$CACHE_DIR/pending_update"
 MANUAL_CONFIG_FILE="$REPO_DIR/rvs_mcp_config.json"
+OPENCODE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 
 # Formatting
 C_RESET=$'\033[0m'
@@ -228,10 +229,12 @@ run_preflight_diagnostics() {
     local has_antigravity=false
     local has_claude=false
     local has_cursor=false
+    local has_opencode=false
 
     [[ -d "$HOME/.gemini" ]] && has_antigravity=true
     (command -v claude &>/dev/null || [[ -d "$HOME/.config/Claude" || -d "$HOME/Library/Application Support/Claude" ]]) && has_claude=true
     ([[ -d "$HOME/.cursor" || -d "$HOME/Library/Application Support/Cursor" || -d "$HOME/.config/Cursor" ]]) && has_cursor=true
+    (command -v opencode &>/dev/null || [[ -d "$OPENCODE_CONFIG_DIR" ]]) && has_opencode=true
 
     # Display Diagnostic Table
     if [[ "$show_summary" == true || "$has_errors" == true ]]; then
@@ -249,6 +252,7 @@ run_preflight_diagnostics() {
         echo -e "  - Google Antigravity : $([[ "$has_antigravity" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
         echo -e "  - Claude (Desktop/CLI): $([[ "$has_claude" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
         echo -e "  - Cursor IDE         : $([[ "$has_cursor" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
+        echo -e "  - OpenCode           : $([[ "$has_opencode" == true ]] && echo "${C_GREEN}Detected${C_RESET}" || echo "${C_DIM}Not found${C_RESET}")"
         echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
 
         if [[ ${#missing_required[@]} -gt 0 ]]; then
@@ -553,6 +557,7 @@ JSON_EOF
     echo "  - Claude Desktop: ~/.config/Claude/claude_desktop_config.json"
     echo "  - Claude Code CLI: claude mcp add rvs -- python3 \"$HARNESS_PATH\" --mcp"
     echo "  - Cursor IDE    : ~/.cursor/mcp.json"
+    echo "  - OpenCode CLI  : opencode mcp add rvs --global -- python3 \"$HARNESS_PATH\" --mcp"
     echo ""
     echo "To attach the skill manually, copy or link:"
     echo "  $SKILL_SRC"
@@ -697,6 +702,92 @@ configure_cursor_core() {
     success "Cursor configured."
 }
 
+configure_opencode_core() {
+    local use_lazy="$1"
+    local skill_mode="$2"
+    local mcp_configured=false
+
+    if command -v opencode &>/dev/null; then
+        local -a mcp_command
+        if [[ "$use_lazy" == true ]]; then
+            mcp_command=("$REPO_DIR/install.sh" "--mcp-proxy")
+        else
+            mcp_command=(python3 "$HARNESS_PATH" "--mcp")
+        fi
+
+        if opencode mcp add rvs --global -- "${mcp_command[@]}" >/dev/null; then
+            mcp_configured=true
+        else
+            warn "Failed to configure the OpenCode MCP server."
+        fi
+    else
+        warn "OpenCode CLI not found. Skipping MCP configuration."
+    fi
+
+    attach_skill_to_dir "$OPENCODE_CONFIG_DIR/skills/rvs" "OpenCode" "$skill_mode"
+    if [[ "$mcp_configured" == true ]]; then
+        success "OpenCode configured."
+    else
+        success "OpenCode skill attached."
+    fi
+}
+
+# OpenCode V2 has no MCP remove command, so remove the global entry directly.
+remove_opencode_mcp_server() {
+    local config_file="$1"
+    [[ -f "$config_file" ]] || return 0
+
+    local temp_config="${config_file}.tmp.$$"
+
+    # Keep JSONC comments/trailing commas by removing only the multiline rvs block.
+    if [[ "$config_file" == *.jsonc ]]; then
+        local removing=false
+        local removed=false
+        local entry_indent=""
+        local in_servers=false
+        local servers_indent=""
+        local line=""
+        local servers_pattern='^([[:space:]]*)"servers"[[:space:]]*:[[:space:]]*\{'
+        local rvs_pattern='^([[:space:]]*)"rvs"[[:space:]]*:[[:space:]]*\{'
+        local close_pattern='^([[:space:]]*)\}[[:space:]]*,?[[:space:]]*(//.*)?$'
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$in_servers" == false && "$line" =~ $servers_pattern ]]; then
+                in_servers=true
+                servers_indent="${BASH_REMATCH[1]}"
+            elif [[ "$in_servers" == true && "$line" =~ $close_pattern ]]; then
+                [[ "${BASH_REMATCH[1]}" == "$servers_indent" ]] && in_servers=false
+            fi
+
+            if [[ "$removing" == false && "$in_servers" == true && "$line" =~ $rvs_pattern ]]; then
+                removing=true
+                removed=true
+                entry_indent="${BASH_REMATCH[1]}"
+                continue
+            fi
+
+            if [[ "$removing" == true ]]; then
+                if [[ "$line" =~ $close_pattern ]]; then
+                    [[ "${BASH_REMATCH[1]}" == "$entry_indent" ]] && removing=false
+                fi
+                continue
+            fi
+
+            printf '%s\n' "$line"
+        done < "$config_file" > "$temp_config"
+
+        if [[ "$removed" == true && "$removing" == false ]]; then
+            mv -f "$temp_config" "$config_file"
+        else
+            rm -f "$temp_config"
+        fi
+    elif jq 'del(.mcp.servers.rvs)' "$config_file" > "$temp_config" 2>/dev/null; then
+        mv -f "$temp_config" "$config_file"
+    else
+        rm -f "$temp_config"
+    fi
+}
+
 # =============================================================================
 # 7. GitHub Repository Sync & On-Demand Upgrade
 # =============================================================================
@@ -818,6 +909,10 @@ perform_uninstall() {
         fi
     fi
 
+    remove_opencode_mcp_server "$OPENCODE_CONFIG_DIR/opencode.json"
+    remove_opencode_mcp_server "$OPENCODE_CONFIG_DIR/opencode.jsonc"
+    rm -rf "$OPENCODE_CONFIG_DIR/skills/rvs"
+
     rm -f "$HOME/.local/bin/rvs" "$MANUAL_CONFIG_FILE"
     rm -rf "$CACHE_DIR"
 
@@ -838,14 +933,15 @@ run_installation_wizard() {
     echo "  2) Google Antigravity only"
     echo "  3) Claude (Desktop & CLI) only"
     echo "  4) Cursor IDE only"
-    echo "  5) Manual export only (creates rvs_mcp_config.json, no auto-config)"
-    echo "  6) Skip"
+    echo "  5) OpenCode only"
+    echo "  6) Manual export only (creates rvs_mcp_config.json, no auto-config)"
+    echo "  7) Skip"
     local agent_choice="1"
-    prompt_input "  Select [1-6] (default: 1): " "1" agent_choice
+    prompt_input "  Select [1-7] (default: 1): " "1" agent_choice
 
     # Step 2: Skill Linking Method (if not manual or skip)
     local skill_mode="symlink"
-    if [[ "$agent_choice" =~ ^[1-4]$ ]]; then
+    if [[ "$agent_choice" =~ ^[1-5]$ ]]; then
         echo ""
         echo -e "${C_BOLD}[2/3] Skill Linking Mode${C_RESET}"
         echo "  1) Symlink (recommended - auto-syncs on git pull)"
@@ -857,7 +953,7 @@ run_installation_wizard() {
 
     # Step 3: Background Update Check
     local use_lazy=false
-    if [[ "$agent_choice" =~ ^[1-4]$ ]]; then
+    if [[ "$agent_choice" =~ ^[1-5]$ ]]; then
         echo ""
         echo -e "${C_BOLD}[3/3] Auto-Update Check${C_RESET}"
         echo "  Checks GitHub tags in background when MCP launches (max once/24h, non-blocking)."
@@ -873,8 +969,8 @@ run_installation_wizard() {
     echo "Summary:"
     echo "  - rvs CLI Status   : $([[ -L "$HOME/.local/bin/rvs" ]] && echo "Symlink verified" || echo "Checked")"
     echo "  - Target agents    : Option $agent_choice"
-    [[ "$agent_choice" =~ ^[1-4]$ ]] && echo "  - Skill mode       : $skill_mode"
-    [[ "$agent_choice" =~ ^[1-4]$ ]] && echo "  - Auto-update check: $([ "$use_lazy" = true ] && echo "enabled (notify-only, 24h)" || echo "disabled")"
+    [[ "$agent_choice" =~ ^[1-5]$ ]] && echo "  - Skill mode       : $skill_mode"
+    [[ "$agent_choice" =~ ^[1-5]$ ]] && echo "  - Auto-update check: $([ "$use_lazy" = true ] && echo "enabled (notify-only, 24h)" || echo "disabled")"
     echo -e "${C_DIM}------------------------------------------------------------${C_RESET}"
 
     local confirm_apply="Y"
@@ -888,16 +984,19 @@ run_installation_wizard() {
     local has_antigravity=false
     local has_claude=false
     local has_cursor=false
+    local has_opencode=false
     [[ -d "$HOME/.gemini" ]] && has_antigravity=true
     (command -v claude &>/dev/null || [[ -d "$HOME/.config/Claude" || -d "$HOME/Library/Application Support/Claude" ]]) && has_claude=true
     ([[ -d "$HOME/.cursor" || -d "$HOME/Library/Application Support/Cursor" || -d "$HOME/.config/Cursor" ]]) && has_cursor=true
+    (command -v opencode &>/dev/null || [[ -d "$OPENCODE_CONFIG_DIR" ]]) && has_opencode=true
 
     case "$agent_choice" in
         1)
             [[ "$has_antigravity" == true ]] && configure_antigravity_core "$use_lazy" "$skill_mode"
             [[ "$has_claude" == true ]] && configure_claude_core "$use_lazy" "$skill_mode"
             [[ "$has_cursor" == true ]] && configure_cursor_core "$use_lazy"
-            if [[ "$has_antigravity" == false && "$has_claude" == false && "$has_cursor" == false ]]; then
+            [[ "$has_opencode" == true ]] && configure_opencode_core "$use_lazy" "$skill_mode"
+            if [[ "$has_antigravity" == false && "$has_claude" == false && "$has_cursor" == false && "$has_opencode" == false ]]; then
                 configure_antigravity_core "$use_lazy" "$skill_mode"
                 configure_claude_core "$use_lazy" "$skill_mode"
             fi
@@ -912,9 +1011,12 @@ run_installation_wizard() {
             configure_cursor_core "$use_lazy"
             ;;
         5)
-            export_manual_mcp_config
+            configure_opencode_core "$use_lazy" "$skill_mode"
             ;;
         6)
+            export_manual_mcp_config
+            ;;
+        7)
             info "Skipped agent configuration."
             ;;
         *)
