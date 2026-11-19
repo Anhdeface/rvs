@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::error::AppError;
+use crate::apk::sanitize::sanitize_identifier;
 
 /// Structured summary of an AndroidManifest.xml file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +26,10 @@ pub fn decode_raw_manifest(bytes: &[u8]) -> Result<String, AppError> {
         return Err(AppError::ZeroByteFile("Manifest data is empty (0 bytes)".to_string()));
     }
     if is_binary_axml(bytes) {
+        let normalized = normalize_axml(bytes);
+        if let Ok(xml) = asc_axml::decode(&normalized) {
+            return Ok(xml);
+        }
         if let Ok(xml) = asc_axml::decode(bytes) {
             return Ok(xml);
         }
@@ -35,6 +40,10 @@ pub fn decode_raw_manifest(bytes: &[u8]) -> Result<String, AppError> {
         }
     }
     // Fallback attempt with asc_axml
+    let normalized = normalize_axml(bytes);
+    if let Ok(xml) = asc_axml::decode(&normalized) {
+        return Ok(xml);
+    }
     if let Ok(xml) = asc_axml::decode(bytes) {
         return Ok(xml);
     }
@@ -47,11 +56,137 @@ pub fn decode_raw_manifest(bytes: &[u8]) -> Result<String, AppError> {
 ///
 /// In Android AXML, the document begins with a `ResXMLTree_header`:
 /// - Chunk type: `RES_XML_TYPE = 0x0003` (2 bytes, little-endian: `0x03, 0x00`)
-/// - Header size: 8 bytes (2 bytes, little-endian: `0x08, 0x00`)
-///
-/// Combined 32-bit little-endian value: `0x00080003`.
+/// - Header size: 8 bytes (2 bytes, little-endian: `0x08, 0x00`), or padded (e.g. 0x0C, 0x1C)
 pub fn is_binary_axml(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes[0] == 0x03 && bytes[1] == 0x00 && bytes[2] == 0x08 && bytes[3] == 0x00
+    if bytes.len() < 8 {
+        return false;
+    }
+    let chunk_type = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if chunk_type != 0x0003 {
+        return false;
+    }
+    let header_size = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+    let total_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    header_size >= 8 && header_size <= total_size && total_size >= 8
+}
+
+/// Helper to clamp an embedded string pool chunk's stringCount to available bounds
+/// and sanitize out-of-bounds offsets to prevent panics in downstream decoders.
+pub(crate) fn normalize_string_pool_chunk(chunk_slice: &[u8], c_header_size: usize) -> Vec<u8> {
+    let mut pool_chunk = chunk_slice.to_vec();
+    if pool_chunk.len() >= 28 {
+        let declared_count = u32::from_le_bytes([
+            pool_chunk[8],
+            pool_chunk[9],
+            pool_chunk[10],
+            pool_chunk[11],
+        ]) as usize;
+        let strings_start = u32::from_le_bytes([
+            pool_chunk[20],
+            pool_chunk[21],
+            pool_chunk[22],
+            pool_chunk[23],
+        ]) as usize;
+        let offsets_start = c_header_size.max(28);
+        let offsets_limit = if strings_start >= offsets_start && strings_start <= pool_chunk.len() {
+            strings_start
+        } else {
+            pool_chunk.len()
+        };
+        let available = (offsets_limit.saturating_sub(offsets_start)) / 4;
+        let count = declared_count.min(available);
+        if count != declared_count {
+            pool_chunk[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+        }
+
+        // Clamp out-of-bounds offsets to 0
+        for i in 0..count {
+            let off_pos = offsets_start + i * 4;
+            if off_pos + 4 <= pool_chunk.len() {
+                let str_off = u32::from_le_bytes([
+                    pool_chunk[off_pos],
+                    pool_chunk[off_pos + 1],
+                    pool_chunk[off_pos + 2],
+                    pool_chunk[off_pos + 3],
+                ]) as usize;
+                if strings_start + str_off >= pool_chunk.len() {
+                    pool_chunk[off_pos..off_pos + 4].copy_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
+    }
+    pool_chunk
+}
+
+/// Normalizes an Android binary XML (AXML) buffer by:
+/// 1. Stripping root `ResXMLTree_header` padding when `header_size > 8` so decoders expecting 8-byte root succeed.
+/// 2. Safely skipping unknown or corrupt chunks (`0x0000`, `0xFFFF`, or `header_size > size`).
+/// 3. Clamping anomalous `stringCount` and OOB offsets in embedded `RES_STRING_POOL_TYPE` chunks.
+pub fn normalize_axml(bytes: &[u8]) -> Vec<u8> {
+    if !is_binary_axml(bytes) {
+        return bytes.to_vec();
+    }
+    let header_size = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+    let declared_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let file_size = if declared_size >= header_size && declared_size <= bytes.len() {
+        declared_size
+    } else {
+        bytes.len()
+    };
+
+    if header_size < 8 || header_size > file_size {
+        return bytes.to_vec();
+    }
+
+    let mut valid_chunks = Vec::new();
+    let mut p = header_size;
+
+    while p + 8 <= file_size {
+        let chunk_type = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+        let chunk_h_size = u16::from_le_bytes([bytes[p + 2], bytes[p + 3]]) as usize;
+        let chunk_size = u32::from_le_bytes([
+            bytes[p + 4],
+            bytes[p + 5],
+            bytes[p + 6],
+            bytes[p + 7],
+        ]) as usize;
+
+        if chunk_size < 8 || chunk_h_size < 8 || p + chunk_size > bytes.len() {
+            break;
+        }
+
+        // Malformed headerSize exceeding chunk_size
+        if chunk_h_size > chunk_size {
+            p += chunk_size;
+            continue;
+        }
+
+        let chunk_slice = &bytes[p..p + chunk_size];
+
+        match chunk_type {
+            0x0001 => {
+                // RES_STRING_POOL_TYPE
+                valid_chunks.extend_from_slice(&normalize_string_pool_chunk(chunk_slice, chunk_h_size));
+            }
+            0x0180 | 0x0100..=0x0104 => {
+                // RES_XML_RESOURCE_MAP_TYPE, namespace, element, and cdata chunks
+                valid_chunks.extend_from_slice(chunk_slice);
+            }
+            _ => {
+                // Skip ALL unknown chunk types (0x0000, 0xFFFF, 0x1234, etc.)
+            }
+        }
+
+        p += chunk_size;
+    }
+
+    let mut normalized = Vec::with_capacity(8 + valid_chunks.len());
+    normalized.extend_from_slice(&0x0003u16.to_le_bytes()); // RES_XML_TYPE
+    normalized.extend_from_slice(&8u16.to_le_bytes());      // standard header_size = 8
+    let total_len = (8 + valid_chunks.len()) as u32;
+    normalized.extend_from_slice(&total_len.to_le_bytes());
+    normalized.extend_from_slice(&valid_chunks);
+    normalized
 }
 
 impl ManifestInfo {
@@ -67,17 +202,38 @@ impl ManifestInfo {
         let is_axml = is_binary || is_binary_axml(bytes);
 
         if is_axml {
+            let normalized = normalize_axml(bytes);
+            let input_bytes = if is_binary_axml(&normalized) {
+                normalized.as_slice()
+            } else {
+                bytes
+            };
+
             // 1. Try parsing binary AXML element tree directly
-            if let Ok(tree) = asc_axml::parse_tree(bytes, None) {
+            if let Ok(tree) = asc_axml::parse_tree(input_bytes, None) {
                 if let Ok(info) = Self::from_axml_element(&tree) {
                     return Ok(info);
                 }
             }
+            if input_bytes != bytes {
+                if let Ok(tree) = asc_axml::parse_tree(bytes, None) {
+                    if let Ok(info) = Self::from_axml_element(&tree) {
+                        return Ok(info);
+                    }
+                }
+            }
 
             // 2. Try decoding AXML to string with asc_axml, then parse XML
-            if let Ok(decoded_xml) = asc_axml::decode(bytes) {
+            if let Ok(decoded_xml) = asc_axml::decode(input_bytes) {
                 if let Ok(info) = Self::from_xml_str(&decoded_xml) {
                     return Ok(info);
+                }
+            }
+            if input_bytes != bytes {
+                if let Ok(decoded_xml) = asc_axml::decode(bytes) {
+                    if let Ok(info) = Self::from_xml_str(&decoded_xml) {
+                        return Ok(info);
+                    }
                 }
             }
 
@@ -156,13 +312,13 @@ impl ManifestInfo {
                     match tag_bytes {
                         b"manifest" => {
                             if let Some(pkg) = get_attr("package") {
-                                package_name = pkg;
+                                package_name = sanitize_identifier(&pkg);
                             }
                             if let Some(vc) = get_attr("versionCode").and_then(|s| parse_int(&s)) {
                                 version_code = Some(vc);
                             }
                             if let Some(vn) = get_attr("versionName") {
-                                version_name = Some(vn);
+                                version_name = Some(sanitize_identifier(&vn));
                             }
                         }
                         b"uses-sdk" => {
@@ -175,8 +331,9 @@ impl ManifestInfo {
                         }
                         b"uses-permission" | b"permission" => {
                             if let Some(name) = get_attr("name") {
-                                if !name.is_empty() && !permissions.contains(&name) {
-                                    permissions.push(name);
+                                let clean = sanitize_identifier(&name);
+                                if !clean.is_empty() && !permissions.contains(&clean) {
+                                    permissions.push(clean);
                                 }
                             }
                         }
@@ -187,29 +344,33 @@ impl ManifestInfo {
                         }
                         b"activity" | b"activity-alias" => {
                             if let Some(name) = get_attr("name") {
-                                if !name.is_empty() && !activities.contains(&name) {
-                                    activities.push(name);
+                                let clean = sanitize_identifier(&name);
+                                if !clean.is_empty() && !activities.contains(&clean) {
+                                    activities.push(clean);
                                 }
                             }
                         }
                         b"service" => {
                             if let Some(name) = get_attr("name") {
-                                if !name.is_empty() && !services.contains(&name) {
-                                    services.push(name);
+                                let clean = sanitize_identifier(&name);
+                                if !clean.is_empty() && !services.contains(&clean) {
+                                    services.push(clean);
                                 }
                             }
                         }
                         b"receiver" => {
                             if let Some(name) = get_attr("name") {
-                                if !name.is_empty() && !receivers.contains(&name) {
-                                    receivers.push(name);
+                                let clean = sanitize_identifier(&name);
+                                if !clean.is_empty() && !receivers.contains(&clean) {
+                                    receivers.push(clean);
                                 }
                             }
                         }
                         b"provider" => {
                             if let Some(name) = get_attr("name") {
-                                if !name.is_empty() && !providers.contains(&name) {
-                                    providers.push(name);
+                                let clean = sanitize_identifier(&name);
+                                if !clean.is_empty() && !providers.contains(&clean) {
+                                    providers.push(clean);
                                 }
                             }
                         }
@@ -244,14 +405,14 @@ impl ManifestInfo {
     /// Extract `ManifestInfo` from an `asc_axml::Element` tree.
     fn from_axml_element(root: &asc_axml::Element) -> Result<Self, AppError> {
         let package_name = find_attr(root, "package")
-            .map(|a| a.value.trim().to_string())
+            .map(|a| sanitize_identifier(a.value.trim()))
             .unwrap_or_default();
 
         let version_code = find_attr(root, "versionCode")
             .and_then(|a| a.as_int().map(|v| v as u32).or_else(|| parse_int(&a.value)));
 
         let version_name = find_attr(root, "versionName")
-            .map(|a| a.value.trim().to_string());
+            .map(|a| sanitize_identifier(a.value.trim()));
 
         let mut min_sdk_version = None;
         let mut target_sdk_version = None;
@@ -278,7 +439,7 @@ impl ManifestInfo {
                     }
                 }
                 "uses-permission" | "permission" => {
-                    if let Some(name) = find_attr(child, "name").map(|a| a.value.trim().to_string()) {
+                    if let Some(name) = find_attr(child, "name").map(|a| sanitize_identifier(a.value.trim())) {
                         if !name.is_empty() && !permissions.contains(&name) {
                             permissions.push(name);
                         }
@@ -294,28 +455,28 @@ impl ManifestInfo {
                     for app_child in &child.children {
                         match app_child.name.as_str() {
                             "activity" | "activity-alias" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| a.value.trim().to_string()) {
+                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
                                     if !name.is_empty() && !activities.contains(&name) {
                                         activities.push(name);
                                     }
                                 }
                             }
                             "service" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| a.value.trim().to_string()) {
+                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
                                     if !name.is_empty() && !services.contains(&name) {
                                         services.push(name);
                                     }
                                 }
                             }
                             "receiver" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| a.value.trim().to_string()) {
+                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
                                     if !name.is_empty() && !receivers.contains(&name) {
                                         receivers.push(name);
                                     }
                                 }
                             }
                             "provider" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| a.value.trim().to_string()) {
+                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
                                     if !name.is_empty() && !providers.contains(&name) {
                                         providers.push(name);
                                     }
@@ -457,6 +618,63 @@ mod tests {
         assert!(!is_binary_axml(b"<?xml"));
         assert!(!is_binary_axml(b"<manifest"));
         assert!(is_binary_axml(&[0x03, 0x00, 0x08, 0x00, 0x50, 0x00, 0x00, 0x00]));
+        // Padded header sizes (0x0C = 12, 0x1C = 28)
+        assert!(is_binary_axml(&[0x03, 0x00, 0x0C, 0x00, 0x50, 0x00, 0x00, 0x00]));
+        assert!(is_binary_axml(&[0x03, 0x00, 0x1C, 0x00, 0x50, 0x00, 0x00, 0x00]));
+        // Invalid header sizes
+        assert!(!is_binary_axml(&[0x03, 0x00, 0x04, 0x00, 0x50, 0x00, 0x00, 0x00]));
+        assert!(!is_binary_axml(&[0x03, 0x00, 0x60, 0x00, 0x50, 0x00, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn test_normalize_axml_padded_and_unknown_chunks() {
+        // Construct synthetic AXML with padded root header (0x1C = 28) and unknown chunk 0xFFFF
+        let mut raw = Vec::new();
+        // Root header: type 0x0003, header_size 28, total_size 28 + 16 = 44
+        raw.extend_from_slice(&0x0003u16.to_le_bytes());
+        raw.extend_from_slice(&28u16.to_le_bytes());
+        raw.extend_from_slice(&44u32.to_le_bytes());
+        raw.extend_from_slice(&[0xCCu8; 20]); // 20 bytes padding
+
+        // Unknown chunk: type 0xFFFF, header_size 8, size 16
+        raw.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        raw.extend_from_slice(&8u16.to_le_bytes());
+        raw.extend_from_slice(&16u32.to_le_bytes());
+        raw.extend_from_slice(&[0xAAu8; 8]);
+
+        let normalized = normalize_axml(&raw);
+        assert_eq!(&normalized[0..2], &0x0003u16.to_le_bytes());
+        assert_eq!(&normalized[2..4], &8u16.to_le_bytes());
+        // Unknown chunk 0xFFFF was skipped, so total size is just the 8-byte root header
+        assert_eq!(&normalized[4..8], &8u32.to_le_bytes());
+        assert_eq!(normalized.len(), 8);
+    }
+
+    #[test]
+    fn test_normalize_axml_arbitrary_unknown_chunks() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0x0003u16.to_le_bytes()); // RES_XML_TYPE
+        raw.extend_from_slice(&8u16.to_le_bytes());      // header_size = 8
+        let total = 8 + 16 + 16;
+        raw.extend_from_slice(&(total as u32).to_le_bytes());
+
+        // Arbitrary unknown chunk 0x1234
+        raw.extend_from_slice(&0x1234u16.to_le_bytes());
+        raw.extend_from_slice(&8u16.to_le_bytes());
+        raw.extend_from_slice(&16u32.to_le_bytes());
+        raw.extend_from_slice(&[0x11u8; 8]);
+
+        // Arbitrary unknown chunk 0xABCD
+        raw.extend_from_slice(&0xABCDu16.to_le_bytes());
+        raw.extend_from_slice(&8u16.to_le_bytes());
+        raw.extend_from_slice(&16u32.to_le_bytes());
+        raw.extend_from_slice(&[0x22u8; 8]);
+
+        let normalized = normalize_axml(&raw);
+        assert_eq!(&normalized[0..2], &0x0003u16.to_le_bytes());
+        assert_eq!(&normalized[2..4], &8u16.to_le_bytes());
+        assert_eq!(&normalized[4..8], &8u32.to_le_bytes()); // both unknown chunks skipped
+        assert_eq!(normalized.len(), 8);
     }
 
     #[test]

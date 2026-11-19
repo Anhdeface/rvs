@@ -9,6 +9,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::apk::container::{ApkPackage, ApkSource};
+use crate::apk::sanitize::{decode_mutf8_lossy, sanitize_identifier};
+
+/// Source position record from Dalvik debug_info_item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexSourcePosition {
+    pub address: u32,
+    pub line: u32,
+}
+
+/// Local variable record from Dalvik debug_info_item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexLocalVariable {
+    pub register: u32,
+    pub name: Option<String>,
+    pub type_descriptor: Option<String>,
+    pub signature: Option<String>,
+    pub start_addr: u32,
+    pub end_addr: Option<u32>,
+}
+
+/// Autonomous parsed debug information for a Dalvik method.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexDebugInfo {
+    pub line_start: u32,
+    pub parameter_names: Vec<Option<String>>,
+    pub positions: Vec<DexSourcePosition>,
+    pub locals: Vec<DexLocalVariable>,
+    pub source_file: Option<String>,
+}
 
 /// Summary representation of a Dalvik method inside a DEX class.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +51,8 @@ pub struct DexMethodSummary {
     pub registers_size: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insns_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_info: Option<DexDebugInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disassembly: Option<Vec<DalvikInstruction>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,6 +125,459 @@ fn read_uleb128(bytes: &[u8], offset: &mut usize) -> Option<u64> {
     None
 }
 
+/// Helper to read a signed LEB128 integer from a byte slice.
+fn read_sleb128(bytes: &[u8], offset: &mut usize) -> Option<i64> {
+    let mut result = 0i64;
+    let mut shift = 0;
+    let mut byte;
+    loop {
+        if *offset >= bytes.len() {
+            return None;
+        }
+        byte = bytes[*offset];
+        *offset += 1;
+        result |= ((byte & 0x7f) as i64) << shift;
+        shift += 7;
+        if (byte & 0x80) == 0 {
+            break;
+        }
+        if shift >= 64 {
+            return None;
+        }
+    }
+    if (shift < 64) && (byte & 0x40) != 0 {
+        result |= !0i64 << shift;
+    }
+    Some(result)
+}
+
+/// Pure-Rust Adler-32 implementation (RFC 1950) for Dalvik DEX checksum recalculation.
+pub fn adler32(data: &[u8]) -> u32 {
+    let mut s1: u32 = 1;
+    let mut s2: u32 = 0;
+    for chunk in data.chunks(5552) {
+        for &b in chunk {
+            s1 += b as u32;
+            s2 += s1;
+        }
+        s1 %= 65521;
+        s2 %= 65521;
+    }
+    (s2 << 16) | s1
+}
+
+/// Pure-Rust SHA-1 implementation (RFC 3174) for Dalvik DEX signature recalculation.
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h0 = 0x67452301u32;
+    let mut h1 = 0xEFCDAB89u32;
+    let mut h2 = 0x98BADCFEu32;
+    let mut h3 = 0x10325476u32;
+    let mut h4 = 0xC3D2E1F0u32;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for (i, &w_val) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w_val);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
+}
+
+/// Validates whether a debug_info_item header can be read cleanly.
+fn is_debug_info_header_valid(bytes: &[u8], debug_info_off: usize, string_ids_size: usize) -> bool {
+    let mut off = debug_info_off;
+    if read_uleb128(bytes, &mut off).is_none() {
+        return false;
+    }
+    let params_size = match read_uleb128(bytes, &mut off) {
+        Some(v) => v as usize,
+        None => return false,
+    };
+    if params_size > bytes.len().saturating_sub(off) || params_size > 65535 {
+        return false;
+    }
+    for _ in 0..params_size {
+        let sid = match read_uleb128(bytes, &mut off) {
+            Some(v) => v,
+            None => return false,
+        };
+        if sid > 0 && (sid - 1) as usize >= string_ids_size {
+            return false;
+        }
+    }
+    true
+}
+
+/// Inspects method code items in raw DEX bytes and sanitizes corrupted debug info offsets.
+/// If `debug_info_off` points outside the data section or beyond the buffer, zeroes it out
+/// and recomputes the SHA-1 and Adler32 checksums in the DEX header.
+pub fn normalize_dex_debug_info_offsets(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() < 0x70 || !bytes.starts_with(b"dex\n") {
+        return bytes.to_vec();
+    }
+
+    let string_ids_size = u32::from_le_bytes([bytes[0x38], bytes[0x39], bytes[0x3A], bytes[0x3B]]) as usize;
+    let class_defs_size = u32::from_le_bytes([bytes[0x60], bytes[0x61], bytes[0x62], bytes[0x63]]) as usize;
+    let class_defs_off = u32::from_le_bytes([bytes[0x64], bytes[0x65], bytes[0x66], bytes[0x67]]) as usize;
+    let data_size = u32::from_le_bytes([bytes[0x68], bytes[0x69], bytes[0x6A], bytes[0x6B]]) as usize;
+    let data_off = u32::from_le_bytes([bytes[0x6C], bytes[0x6D], bytes[0x6E], bytes[0x6F]]) as usize;
+
+    let mut normalized = bytes.to_vec();
+    let mut modified = false;
+    let data_end = data_off.saturating_add(data_size).min(normalized.len());
+
+    let max_class_defs = (normalized.len().saturating_sub(class_defs_off)) / 32;
+    let defs_count = class_defs_size.min(max_class_defs);
+
+    for i in 0..defs_count {
+        let def_off = class_defs_off + i * 32;
+        if def_off + 28 > normalized.len() {
+            break;
+        }
+        let class_data_off = u32::from_le_bytes([
+            normalized[def_off + 24],
+            normalized[def_off + 25],
+            normalized[def_off + 26],
+            normalized[def_off + 27],
+        ]) as usize;
+        if class_data_off == 0 || class_data_off >= normalized.len() {
+            continue;
+        }
+
+        let (direct, virt) = extract_method_code_offsets(&normalized, class_data_off);
+        for code_off in direct.into_iter().chain(virt).flatten() {
+            let c_off = code_off as usize;
+            if c_off + 12 <= normalized.len() {
+                let dbg_off = u32::from_le_bytes([
+                    normalized[c_off + 8],
+                    normalized[c_off + 9],
+                    normalized[c_off + 10],
+                    normalized[c_off + 11],
+                ]) as usize;
+                if dbg_off != 0
+                    && (dbg_off < data_off
+                        || dbg_off >= data_end
+                        || dbg_off >= normalized.len()
+                        || !is_debug_info_header_valid(&normalized, dbg_off, string_ids_size))
+                {
+                    normalized[c_off + 8..c_off + 12].copy_from_slice(&[0, 0, 0, 0]);
+                    modified = true;
+                }
+            }
+        }
+    }
+
+    if modified && normalized.len() >= 32 {
+        let sha1_digest = sha1(&normalized[32..]);
+        normalized[12..32].copy_from_slice(&sha1_digest);
+        let adler = adler32(&normalized[12..]);
+        normalized[8..12].copy_from_slice(&adler.to_le_bytes());
+    }
+
+    normalized
+}
+
+/// Autonomous, resilient Dalvik debug_info_item bytecode state machine parser.
+///
+/// Tolerates truncated streams, missing DBG_END_SEQUENCE, out-of-bounds register indices,
+/// out-of-bounds string IDs, and negative line transitions without panicking.
+pub fn parse_debug_info_resilient(
+    bytes: &[u8],
+    debug_info_off: usize,
+    strings: &[String],
+    registers_size: u16,
+) -> Option<DexDebugInfo> {
+    if debug_info_off >= bytes.len() || (debug_info_off == 0 && bytes.starts_with(b"dex\n")) {
+        return None;
+    }
+
+    let mut off = debug_info_off;
+    let line_start = read_uleb128(bytes, &mut off)? as u32;
+    let parameters_size = read_uleb128(bytes, &mut off)? as usize;
+
+    let max_params = (bytes.len().saturating_sub(off)).min(65535).min(registers_size as usize + 256);
+    let count = parameters_size.min(max_params);
+
+    let mut parameter_names = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        match read_uleb128(bytes, &mut off) {
+            Some(0) => parameter_names.push(None),
+            Some(val) => {
+                let idx = (val - 1) as usize;
+                parameter_names.push(strings.get(idx).cloned());
+            }
+            None => break,
+        }
+    }
+
+    let mut address: u32 = 0;
+    let mut line: u32 = line_start;
+    let mut source_file: Option<String> = None;
+    let mut positions: Vec<DexSourcePosition> = Vec::new();
+    let mut locals: Vec<DexLocalVariable> = Vec::new();
+
+    let max_regs = (registers_size as usize).clamp(32, 1024);
+    let mut active_locals: Vec<Option<DexLocalVariable>> = vec![None; max_regs];
+
+    const MAX_DEBUG_OPS: usize = 100_000;
+    let mut ops_count = 0;
+
+    while off < bytes.len() && ops_count < MAX_DEBUG_OPS {
+        ops_count += 1;
+        let opcode = bytes[off];
+        off += 1;
+
+        match opcode {
+            0x00 => break, // DBG_END_SEQUENCE
+            0x01 => {
+                let addr_diff = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as u32,
+                    None => break,
+                };
+                address = address.saturating_add(addr_diff);
+            }
+            0x02 => {
+                let line_diff = match read_sleb128(bytes, &mut off) {
+                    Some(v) => v,
+                    None => break,
+                };
+                line = (line as i64)
+                    .saturating_add(line_diff)
+                    .clamp(1, u32::MAX as i64) as u32;
+            }
+            0x03 => {
+                let reg = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let name_idx = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let type_idx = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let name = if name_idx > 0 { strings.get(name_idx - 1).cloned() } else { None };
+                let type_desc = if type_idx > 0 { strings.get(type_idx - 1).cloned() } else { None };
+
+                if reg < active_locals.len() {
+                    active_locals[reg] = Some(DexLocalVariable {
+                        register: reg as u32,
+                        name,
+                        type_descriptor: type_desc,
+                        signature: None,
+                        start_addr: address,
+                        end_addr: None,
+                    });
+                }
+            }
+            0x04 => {
+                let reg = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let name_idx = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let type_idx = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let sig_idx = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                let name = if name_idx > 0 { strings.get(name_idx - 1).cloned() } else { None };
+                let type_desc = if type_idx > 0 { strings.get(type_idx - 1).cloned() } else { None };
+                let sig = if sig_idx > 0 { strings.get(sig_idx - 1).cloned() } else { None };
+
+                if reg < active_locals.len() {
+                    active_locals[reg] = Some(DexLocalVariable {
+                        register: reg as u32,
+                        name,
+                        type_descriptor: type_desc,
+                        signature: sig,
+                        start_addr: address,
+                        end_addr: None,
+                    });
+                }
+            }
+            0x05 => {
+                let reg = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                if reg < active_locals.len() {
+                    if let Some(mut loc) = active_locals[reg].take() {
+                        loc.end_addr = Some(address);
+                        locals.push(loc);
+                    }
+                }
+            }
+            0x06 => {
+                let reg = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                if reg < active_locals.len() {
+                    if let Some(loc) = &mut active_locals[reg] {
+                        loc.start_addr = address;
+                    }
+                }
+            }
+            0x07 => {} // DBG_SET_PROLOGUE_END
+            0x08 => {} // DBG_SET_EPILOGUE_BEGIN
+            0x09 => {
+                let name_idx = match read_uleb128(bytes, &mut off) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
+                source_file = if name_idx > 0 { strings.get(name_idx - 1).cloned() } else { None };
+            }
+            0x0a..=0xff => {
+                let adjusted = (opcode - 0x0a) as u32;
+                let line_diff = ((adjusted % 15) as i32) - 4;
+                let addr_diff = adjusted / 15;
+                address = address.saturating_add(addr_diff);
+                line = (line as i64)
+                    .saturating_add(line_diff as i64)
+                    .clamp(1, u32::MAX as i64) as u32;
+                positions.push(DexSourcePosition { address, line });
+            }
+        }
+    }
+
+    for loc in active_locals.into_iter().flatten() {
+        let mut closed = loc;
+        if closed.end_addr.is_none() {
+            closed.end_addr = Some(address);
+        }
+        locals.push(closed);
+    }
+
+    Some(DexDebugInfo {
+        line_start,
+        parameter_names,
+        positions,
+        locals,
+        source_file,
+    })
+}
+
+/// Resiliently extracts the entire string pool from raw DEX binary bytes.
+///
+/// Bypasses `dex-0.5.0`'s strict `cesu8` validator, ensuring that malformed strings,
+/// 2-byte nulls, and unpaired surrogates are decoded without panicking or dropping items.
+pub fn extract_dex_strings_resilient(bytes: &[u8]) -> Vec<String> {
+    if bytes.len() < 0x70 || !bytes.starts_with(b"dex\n") {
+        return Vec::new();
+    }
+
+    let string_ids_size = u32::from_le_bytes([bytes[0x38], bytes[0x39], bytes[0x3A], bytes[0x3B]]) as usize;
+    let string_ids_off = u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+
+    if string_ids_off >= bytes.len() {
+        return Vec::new();
+    }
+
+    // Guard against integer overflow / memory exhaustion on adversarial stringCount
+    let max_possible = (bytes.len().saturating_sub(string_ids_off)) / 4;
+    let count = string_ids_size.min(max_possible).min(500_000);
+
+    let mut strings = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let entry_off = string_ids_off + i * 4;
+        if entry_off + 4 > bytes.len() {
+            strings.push(String::new());
+            continue;
+        }
+
+        let data_off = u32::from_le_bytes([
+            bytes[entry_off],
+            bytes[entry_off + 1],
+            bytes[entry_off + 2],
+            bytes[entry_off + 3],
+        ]) as usize;
+
+        if data_off >= bytes.len() {
+            strings.push(String::new());
+            continue;
+        }
+
+        let mut off = data_off;
+        // Skip ULEB128 utf16_size
+        if read_uleb128(bytes, &mut off).is_none() {
+            strings.push(String::new());
+            continue;
+        }
+
+        // Scan for null terminator 0x00
+        let start = off;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != 0 {
+            end += 1;
+        }
+
+        let raw = &bytes[start..end];
+        strings.push(decode_mutf8_lossy(raw));
+    }
+
+    strings
+}
+
 /// Extracts direct and virtual method code offsets from `ClassDataItem` raw bytes.
 /// Returns (direct_offsets, virtual_offsets).
 fn extract_method_code_offsets(bytes: &[u8], class_data_off: usize) -> (Vec<Option<u64>>, Vec<Option<u64>>) {
@@ -122,20 +606,29 @@ fn extract_method_code_offsets(bytes: &[u8], class_data_off: usize) -> (Vec<Opti
         None => return (direct_offsets, virtual_offsets),
     };
 
+    let max_items = bytes.len().saturating_sub(off);
+    let s_len = static_fields_len.min(max_items);
+    let i_len = instance_fields_len.min(max_items);
+    let d_len = direct_methods_len.min(max_items);
+    let v_len = virtual_methods_len.min(max_items);
+
     // Skip static fields: field_idx_diff (uleb128), access_flags (uleb128)
-    for _ in 0..static_fields_len {
+    for _ in 0..s_len {
+        if off >= bytes.len() { break; }
         read_uleb128(bytes, &mut off);
         read_uleb128(bytes, &mut off);
     }
 
     // Skip instance fields: field_idx_diff (uleb128), access_flags (uleb128)
-    for _ in 0..instance_fields_len {
+    for _ in 0..i_len {
+        if off >= bytes.len() { break; }
         read_uleb128(bytes, &mut off);
         read_uleb128(bytes, &mut off);
     }
 
     // Direct methods: method_idx_diff (uleb128), access_flags (uleb128), code_off (uleb128)
-    for _ in 0..direct_methods_len {
+    for _ in 0..d_len {
+        if off >= bytes.len() { break; }
         read_uleb128(bytes, &mut off);
         read_uleb128(bytes, &mut off);
         let code_off = read_uleb128(bytes, &mut off).unwrap_or(0);
@@ -143,7 +636,8 @@ fn extract_method_code_offsets(bytes: &[u8], class_data_off: usize) -> (Vec<Opti
     }
 
     // Virtual methods: method_idx_diff (uleb128), access_flags (uleb128), code_off (uleb128)
-    for _ in 0..virtual_methods_len {
+    for _ in 0..v_len {
+        if off >= bytes.len() { break; }
         read_uleb128(bytes, &mut off);
         read_uleb128(bytes, &mut off);
         let code_off = read_uleb128(bytes, &mut off).unwrap_or(0);
@@ -172,15 +666,14 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
         )));
     }
 
-    let dex = dex::DexReader::from_vec(bytes.to_vec()).map_err(|e| {
+    let normalized_bytes = normalize_dex_debug_info_offsets(bytes);
+
+    let dex = dex::DexReader::from_vec(normalized_bytes.clone()).map_err(|e| {
         AppError::InvalidBinary(format!("Failed to parse DEX '{}': {}", file_name, e))
     })?;
 
-    // Collect string pool
-    let strings: Vec<String> = dex
-        .strings()
-        .filter_map(|s| s.ok().map(|ds| ds.to_string()))
-        .collect();
+    // Collect string pool using resilient MUTF-8 decoder
+    let strings = extract_dex_strings_resilient(&normalized_bytes);
     let strings_count = strings.len();
 
     // Map class definitions with code offsets
@@ -188,33 +681,29 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
     let mut total_methods_count = 0;
 
     for (class_def_res, class_res) in dex.class_defs().zip(dex.classes()) {
-        let class_def = class_def_res.map_err(|e| {
-            AppError::InvalidBinary(format!(
-                "Failed to read ClassDefItem in '{}': {}",
-                file_name, e
-            ))
-        })?;
+        let class_def = match class_def_res {
+            Ok(cd) => cd,
+            Err(_) => continue,
+        };
 
-        let class = class_res.map_err(|e| {
-            AppError::InvalidBinary(format!(
-                "Failed to parse Class in '{}': {}",
-                file_name, e
-            ))
-        })?;
+        let class = match class_res {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
 
-        let class_name = class.jtype().type_descriptor().to_string();
+        let class_name = sanitize_identifier(class.jtype().type_descriptor());
 
         let super_class = class.super_class().and_then(|id| {
             dex.get_type(id)
                 .ok()
-                .map(|t| t.type_descriptor().to_string())
+                .map(|t| sanitize_identifier(t.type_descriptor()))
         });
 
         let access_flags = class.access_flags().bits();
 
         // Extract code offsets for direct and virtual methods from class_data
         let (direct_offsets, virtual_offsets) = if class_def.class_data_off() != 0 {
-            extract_method_code_offsets(bytes, class_def.class_data_off() as usize)
+            extract_method_code_offsets(&normalized_bytes, class_def.class_data_off() as usize)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -224,40 +713,51 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
 
         // Collect fields
         for f in class.static_fields() {
-            class_fields.push(f.name().to_string());
+            class_fields.push(sanitize_identifier(f.name()));
         }
         for f in class.instance_fields() {
-            class_fields.push(f.name().to_string());
+            class_fields.push(sanitize_identifier(f.name()));
         }
 
         // Direct methods
         for (idx, m) in class.direct_methods().iter().enumerate() {
-            let name = m.name().to_string();
+            let name = sanitize_identifier(m.name());
             let params_str: String = m
                 .params()
                 .iter()
-                .map(|p| p.type_descriptor().to_string())
+                .map(|p| sanitize_identifier(p.type_descriptor()))
                 .collect();
-            let signature = format!("({}){}", params_str, m.return_type().type_descriptor());
+            let signature = format!("({}){}", params_str, sanitize_identifier(m.return_type().type_descriptor()));
             let m_access = m.access_flags().bits() as u32;
             let code_offset = direct_offsets.get(idx).copied().flatten();
 
-            let (registers_size, insns_size) = if let Some(off) = code_offset {
+            let (registers_size, insns_size, debug_info) = if let Some(off) = code_offset {
                 let off_usize = off as usize;
-                if off_usize + 16 <= bytes.len() {
-                    let reg_sz = u16::from_le_bytes([bytes[off_usize], bytes[off_usize + 1]]);
+                if off_usize + 16 <= normalized_bytes.len() {
+                    let reg_sz = u16::from_le_bytes([normalized_bytes[off_usize], normalized_bytes[off_usize + 1]]);
+                    let dbg_off = u32::from_le_bytes([
+                        normalized_bytes[off_usize + 8],
+                        normalized_bytes[off_usize + 9],
+                        normalized_bytes[off_usize + 10],
+                        normalized_bytes[off_usize + 11],
+                    ]) as usize;
                     let ins_sz = u32::from_le_bytes([
-                        bytes[off_usize + 12],
-                        bytes[off_usize + 13],
-                        bytes[off_usize + 14],
-                        bytes[off_usize + 15],
+                        normalized_bytes[off_usize + 12],
+                        normalized_bytes[off_usize + 13],
+                        normalized_bytes[off_usize + 14],
+                        normalized_bytes[off_usize + 15],
                     ]);
-                    (Some(reg_sz), Some(ins_sz))
+                    let dbg = if dbg_off > 0 {
+                        parse_debug_info_resilient(&normalized_bytes, dbg_off, &strings, reg_sz)
+                    } else {
+                        None
+                    };
+                    (Some(reg_sz), Some(ins_sz), dbg)
                 } else {
-                    (None, None)
+                    (None, None, None)
                 }
             } else {
-                (None, None)
+                (None, None, None)
             };
 
             class_methods.push(DexMethodSummary {
@@ -267,6 +767,7 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
                 code_offset,
                 registers_size,
                 insns_size,
+                debug_info,
                 disassembly: None,
                 smali: None,
                 decompiled: None,
@@ -275,32 +776,43 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
 
         // Virtual methods
         for (idx, m) in class.virtual_methods().iter().enumerate() {
-            let name = m.name().to_string();
+            let name = sanitize_identifier(m.name());
             let params_str: String = m
                 .params()
                 .iter()
-                .map(|p| p.type_descriptor().to_string())
+                .map(|p| sanitize_identifier(p.type_descriptor()))
                 .collect();
-            let signature = format!("({}){}", params_str, m.return_type().type_descriptor());
+            let signature = format!("({}){}", params_str, sanitize_identifier(m.return_type().type_descriptor()));
             let m_access = m.access_flags().bits() as u32;
             let code_offset = virtual_offsets.get(idx).copied().flatten();
 
-            let (registers_size, insns_size) = if let Some(off) = code_offset {
+            let (registers_size, insns_size, debug_info) = if let Some(off) = code_offset {
                 let off_usize = off as usize;
-                if off_usize + 16 <= bytes.len() {
-                    let reg_sz = u16::from_le_bytes([bytes[off_usize], bytes[off_usize + 1]]);
+                if off_usize + 16 <= normalized_bytes.len() {
+                    let reg_sz = u16::from_le_bytes([normalized_bytes[off_usize], normalized_bytes[off_usize + 1]]);
+                    let dbg_off = u32::from_le_bytes([
+                        normalized_bytes[off_usize + 8],
+                        normalized_bytes[off_usize + 9],
+                        normalized_bytes[off_usize + 10],
+                        normalized_bytes[off_usize + 11],
+                    ]) as usize;
                     let ins_sz = u32::from_le_bytes([
-                        bytes[off_usize + 12],
-                        bytes[off_usize + 13],
-                        bytes[off_usize + 14],
-                        bytes[off_usize + 15],
+                        normalized_bytes[off_usize + 12],
+                        normalized_bytes[off_usize + 13],
+                        normalized_bytes[off_usize + 14],
+                        normalized_bytes[off_usize + 15],
                     ]);
-                    (Some(reg_sz), Some(ins_sz))
+                    let dbg = if dbg_off > 0 {
+                        parse_debug_info_resilient(&normalized_bytes, dbg_off, &strings, reg_sz)
+                    } else {
+                        None
+                    };
+                    (Some(reg_sz), Some(ins_sz), dbg)
                 } else {
-                    (None, None)
+                    (None, None, None)
                 }
             } else {
-                (None, None)
+                (None, None, None)
             };
 
             class_methods.push(DexMethodSummary {
@@ -310,6 +822,7 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
                 code_offset,
                 registers_size,
                 insns_size,
+                debug_info,
                 disassembly: None,
                 smali: None,
                 decompiled: None,
@@ -444,17 +957,194 @@ pub fn disassemble_dalvik_method(
     }
 }
 
+/// Returns true if the Dalvik instruction represents an unconditional terminal or jump
+/// where sequential control flow never falls through.
+pub fn is_unconditional_control_flow(inst: &DalvikInstruction) -> bool {
+    let op = inst.opcode.trim();
+    if op == "return-void"
+        || op.starts_with("return ")
+        || op.starts_with("return-wide ")
+        || op.starts_with("return-object ")
+        || op == "throw"
+        || op.starts_with("throw ")
+        || op == "goto"
+        || op.starts_with("goto ")
+        || op.starts_with("goto/16 ")
+        || op.starts_with("goto/32 ")
+    {
+        return true;
+    }
+    inst.ins_type.as_deref() == Some("ret")
+}
+
+/// Returns true if radare2 marked the Dalvik instruction as invalid/null/illegal opcode.
+pub fn is_invalid_instruction(inst: &DalvikInstruction) -> bool {
+    let op = inst.opcode.trim();
+    let dis = inst.disasm.trim();
+    op == "invalid"
+        || dis == "invalid"
+        || dis.starts_with("invalid")
+        || inst.ins_type.as_deref() == Some("null")
+        || inst.ins_type.as_deref() == Some("ill")
+}
+
 /// Disassembles Dalvik bytecode strictly bounded to `insns_size * 2` bytes,
 /// preventing instruction spillover across method boundaries.
+/// When invalid opcodes or gaps follow unconditional control flow, falls back to `.byte 0xXX`.
 pub fn disassemble_dalvik_bounded(
     dex_path: &Path,
     instruction_addr: u64,
     insns_size: u32,
 ) -> Result<Vec<DalvikInstruction>, AppError> {
-    let count = (insns_size as usize).max(1);
-    let raw = disassemble_dalvik_at(dex_path, instruction_addr, count)?;
+    if !dex_path.exists() {
+        return Err(AppError::FileNotFound(dex_path.display().to_string()));
+    }
+    if insns_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let file_bytes = std::fs::read(dex_path).ok();
     let max_addr = instruction_addr + (insns_size as u64) * 2;
-    Ok(raw.into_iter().filter(|i| i.addr >= instruction_addr && i.addr < max_addr).collect())
+    let count = (insns_size as usize).max(1);
+
+    let raw_res = disassemble_dalvik_at(dex_path, instruction_addr, count);
+
+    // If radare2 fails on a method, convert method bytecode range to .byte 0xXX instructions
+    let raw = match raw_res {
+        Ok(insts) => insts,
+        Err(_) => {
+            if let Some(bytes) = &file_bytes {
+                let start = (instruction_addr as usize).min(bytes.len());
+                let end = (max_addr as usize).min(bytes.len());
+                let mut fallback = Vec::with_capacity(end.saturating_sub(start));
+                for (i, &b) in bytes[start..end].iter().enumerate() {
+                    fallback.push(DalvikInstruction {
+                        addr: instruction_addr + i as u64,
+                        opcode: ".byte".to_string(),
+                        disasm: format!(".byte {:#04x}", b),
+                        bytes: Some(format!("{:02x}", b)),
+                        ins_type: Some("data".to_string()),
+                    });
+                }
+                return Ok(fallback);
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+    };
+
+    let filtered: Vec<DalvikInstruction> = raw
+        .into_iter()
+        .filter(|i| i.addr >= instruction_addr && i.addr < max_addr)
+        .collect();
+
+    // If no instructions were disassembled but insns_size > 0, fallback to raw bytes
+    if filtered.is_empty() && insns_size > 0 {
+        if let Some(bytes) = &file_bytes {
+            let start = (instruction_addr as usize).min(bytes.len());
+            let end = (max_addr as usize).min(bytes.len());
+            let mut fallback = Vec::with_capacity(end.saturating_sub(start));
+            for (i, &b) in bytes[start..end].iter().enumerate() {
+                fallback.push(DalvikInstruction {
+                    addr: instruction_addr + i as u64,
+                    opcode: ".byte".to_string(),
+                    disasm: format!(".byte {:#04x}", b),
+                    bytes: Some(format!("{:02x}", b)),
+                    ins_type: Some("data".to_string()),
+                });
+            }
+            return Ok(fallback);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut current_addr = instruction_addr;
+
+    for inst in filtered {
+        if inst.addr < current_addr {
+            continue;
+        }
+
+        // Gap before instruction
+        if inst.addr > current_addr {
+            if let Some(bytes) = &file_bytes {
+                let gap_start = (current_addr as usize).min(bytes.len());
+                let gap_end = (inst.addr as usize).min(bytes.len());
+                for (i, &b) in bytes[gap_start..gap_end].iter().enumerate() {
+                    out.push(DalvikInstruction {
+                        addr: current_addr + i as u64,
+                        opcode: ".byte".to_string(),
+                        disasm: format!(".byte {:#04x}", b),
+                        bytes: Some(format!("{:02x}", b)),
+                        ins_type: Some("data".to_string()),
+                    });
+                }
+            }
+        }
+
+        let inst_len = inst
+            .bytes
+            .as_ref()
+            .map(|s| s.len() / 2)
+            .unwrap_or(2)
+            .max(1) as u64;
+        let inst_end = (inst.addr + inst_len).min(max_addr);
+
+        if is_invalid_instruction(&inst) {
+            if let Some(bytes) = &file_bytes {
+                let start = (inst.addr as usize).min(bytes.len());
+                let end = (inst_end as usize).min(bytes.len());
+                for (i, &b) in bytes[start..end].iter().enumerate() {
+                    out.push(DalvikInstruction {
+                        addr: inst.addr + i as u64,
+                        opcode: ".byte".to_string(),
+                        disasm: format!(".byte {:#04x}", b),
+                        bytes: Some(format!("{:02x}", b)),
+                        ins_type: Some("data".to_string()),
+                    });
+                }
+            } else if let Some(hex) = &inst.bytes {
+                for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+                    if let Ok(s) = std::str::from_utf8(chunk) {
+                        if let Ok(b) = u8::from_str_radix(s, 16) {
+                            out.push(DalvikInstruction {
+                                addr: inst.addr + i as u64,
+                                opcode: ".byte".to_string(),
+                                disasm: format!(".byte {:#04x}", b),
+                                bytes: Some(format!("{:02x}", b)),
+                                ins_type: Some("data".to_string()),
+                            });
+                        }
+                    }
+                }
+            } else {
+                out.push(inst);
+            }
+        } else {
+            out.push(inst);
+        }
+
+        current_addr = inst_end;
+    }
+
+    // Trailing gap up to max_addr
+    if current_addr < max_addr {
+        if let Some(bytes) = &file_bytes {
+            let gap_start = (current_addr as usize).min(bytes.len());
+            let gap_end = (max_addr as usize).min(bytes.len());
+            for (i, &b) in bytes[gap_start..gap_end].iter().enumerate() {
+                out.push(DalvikInstruction {
+                    addr: current_addr + i as u64,
+                    opcode: ".byte".to_string(),
+                    disasm: format!(".byte {:#04x}", b),
+                    bytes: Some(format!("{:02x}", b)),
+                    ins_type: Some("data".to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Formats class access flags into Smali syntax keywords.
@@ -505,12 +1195,29 @@ pub fn format_method_smali(m: &DexMethodSummary) -> String {
 
     if let Some(instructions) = &m.disassembly {
         for inst in instructions {
-            let line = if !inst.disasm.is_empty() {
-                &inst.disasm
+            if inst.opcode == ".byte" || inst.disasm.starts_with(".byte") {
+                let line = if !inst.disasm.is_empty() { &inst.disasm } else { &inst.opcode };
+                out.push_str(&format!("    {}\n", line));
+            } else if is_invalid_instruction(inst) {
+                if let Some(hex) = &inst.bytes {
+                    for chunk in hex.as_bytes().chunks(2) {
+                        if let Ok(s) = std::str::from_utf8(chunk) {
+                            if let Ok(b) = u8::from_str_radix(s, 16) {
+                                out.push_str(&format!("    .byte {:#04x}\n", b));
+                            }
+                        }
+                    }
+                } else {
+                    out.push_str("    .byte 0x00\n");
+                }
             } else {
-                &inst.opcode
-            };
-            out.push_str(&format!("    {}\n", line));
+                let line = if !inst.disasm.is_empty() {
+                    &inst.disasm
+                } else {
+                    &inst.opcode
+                };
+                out.push_str(&format!("    {}\n", line));
+            }
         }
     }
 
@@ -772,6 +1479,7 @@ mod tests {
             code_offset: Some(100),
             registers_size: Some(2),
             insns_size: Some(1),
+            debug_info: None,
             disassembly: Some(vec![DalvikInstruction {
                 addr: 116,
                 opcode: "return-void".to_string(),
@@ -797,5 +1505,133 @@ mod tests {
         assert_eq!(insns.len(), 2);
         assert_eq!(insns[0].addr, 108012);
         assert_eq!(insns[1].addr, 108016);
+    }
+
+    #[test]
+    fn test_adler32_and_sha1() {
+        let data = b"Dalvik DEX Checksum Test";
+        let adler = adler32(data);
+        assert!(adler > 0);
+        let digest = sha1(data);
+        assert_eq!(digest.len(), 20);
+    }
+
+    #[test]
+    fn test_parse_debug_info_resilient_truncated() {
+        // Truncated header
+        assert!(parse_debug_info_resilient(&[], 0, &[], 2).is_none());
+        assert!(parse_debug_info_resilient(&[0x01], 10, &[], 2).is_none());
+
+        // line_start = 1 (0x01), parameters_size = 1 (0x01), parameter name = 1 (0x01, idx 0)
+        // Missing DBG_END_SEQUENCE (0x00)
+        let bytes = vec![0x01, 0x01, 0x01, 0x0a]; // 0x0a is special opcode
+        let strings = vec!["param0".to_string()];
+        let debug = parse_debug_info_resilient(&bytes, 0, &strings, 4);
+        assert!(debug.is_some());
+        let info = debug.unwrap();
+        assert_eq!(info.line_start, 1);
+        assert_eq!(info.parameter_names.len(), 1);
+        assert_eq!(info.parameter_names[0], Some("param0".to_string()));
+        assert!(!info.positions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_debug_info_resilient_advance_line_and_locals() {
+        // line_start = 10, params_size = 0
+        // 0x02 (DBG_ADVANCE_LINE) + sleb128(-5) -> line = 5
+        // 0x03 (DBG_START_LOCAL) + reg 0 + name_idx 1 (idx 0) + type_idx 2 (idx 1)
+        // 0x01 (DBG_ADVANCE_PC) + uleb128(4) -> addr = 4
+        // 0x05 (DBG_END_LOCAL) + reg 0
+        // 0x00 (DBG_END_SEQUENCE)
+        let bytes = vec![
+            10, 0, // header
+            0x02, 0x7b, // line_diff = -5
+            0x03, 0x00, 0x01, 0x02, // start local
+            0x01, 0x04, // advance PC by 4
+            0x05, 0x00, // end local reg 0
+            0x00, // end sequence
+        ];
+        let strings = vec!["myVar".to_string(), "I".to_string()];
+        let debug = parse_debug_info_resilient(&bytes, 0, &strings, 2).unwrap();
+        assert_eq!(debug.line_start, 10);
+        assert_eq!(debug.locals.len(), 1);
+        assert_eq!(debug.locals[0].name.as_deref(), Some("myVar"));
+        assert_eq!(debug.locals[0].type_descriptor.as_deref(), Some("I"));
+        assert_eq!(debug.locals[0].start_addr, 0);
+        assert_eq!(debug.locals[0].end_addr, Some(4));
+    }
+
+    #[test]
+    fn test_is_unconditional_control_flow() {
+        let ret = DalvikInstruction {
+            addr: 0,
+            opcode: "return-void".to_string(),
+            disasm: "return-void".to_string(),
+            bytes: None,
+            ins_type: Some("ret".to_string()),
+        };
+        assert!(is_unconditional_control_flow(&ret));
+
+        let goto = DalvikInstruction {
+            addr: 0,
+            opcode: "goto +4".to_string(),
+            disasm: "goto +4".to_string(),
+            bytes: None,
+            ins_type: Some("jmp".to_string()),
+        };
+        assert!(is_unconditional_control_flow(&goto));
+
+        let if_eq = DalvikInstruction {
+            addr: 0,
+            opcode: "if-eqz v0, +4".to_string(),
+            disasm: "if-eqz v0, +4".to_string(),
+            bytes: None,
+            ins_type: Some("cjmp".to_string()),
+        };
+        assert!(!is_unconditional_control_flow(&if_eq));
+    }
+
+    #[test]
+    fn test_parse_debug_info_extreme_line_arithmetic() {
+        let strings = vec!["test.java".to_string()];
+
+        // 1. DBG_ADVANCE_LINE with i64::MAX saturates without panic
+        let mut stream1 = vec![0x01, 0x00, 0x02];
+        let mut val = i64::MAX;
+        let mut more = true;
+        while more {
+            let mut byte = (val & 0x7f) as u8;
+            val >>= 7;
+            let sign_bit = (byte & 0x40) != 0;
+            if (val == 0 && !sign_bit) || (val == -1 && sign_bit) {
+                more = false;
+            } else {
+                byte |= 0x80;
+            }
+            stream1.push(byte);
+        }
+        stream1.push(0x00);
+        let res1 = parse_debug_info_resilient(&stream1, 0, &strings, 4);
+        assert!(res1.is_some());
+        let info1 = res1.unwrap();
+        assert_eq!(info1.line_start, 1);
+
+        // 2. Special opcode with line_start = 0x7FFFFFFF (i32::MAX) saturating without panic
+        let stream2 = vec![0xff, 0xff, 0xff, 0xff, 0x07, 0x00, 0x12, 0x00];
+        let res2 = parse_debug_info_resilient(&stream2, 0, &strings, 4);
+        assert!(res2.is_some());
+        let info2 = res2.unwrap();
+        assert_eq!(info2.line_start, 0x7fffffff);
+        assert_eq!(info2.positions.len(), 1);
+        assert_eq!(info2.positions[0].line, 0x7fffffff + 4);
+
+        // 3. Special opcode with line_start = 0x80000000 clamping without panic
+        let stream3 = vec![0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x0a, 0x00];
+        let res3 = parse_debug_info_resilient(&stream3, 0, &strings, 4);
+        assert!(res3.is_some());
+        let info3 = res3.unwrap();
+        assert_eq!(info3.line_start, 0x80000000);
+        assert_eq!(info3.positions.len(), 1);
+        assert_eq!(info3.positions[0].line, 0x80000000 - 4);
     }
 }

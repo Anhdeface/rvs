@@ -900,6 +900,9 @@ pub struct SyntheticApkBuilder {
     temp_dir: TempDir,
     apk_path: PathBuf,
     entries: Vec<(String, Vec<u8>)>,
+    fake_encryption_lfh: bool,
+    fake_encryption_cd: bool,
+    raw_mutations: Vec<Box<dyn FnOnce(&mut Vec<u8>)>>,
 }
 
 impl SyntheticApkBuilder {
@@ -910,6 +913,9 @@ impl SyntheticApkBuilder {
             temp_dir,
             apk_path,
             entries: Vec::new(),
+            fake_encryption_lfh: false,
+            fake_encryption_cd: false,
+            raw_mutations: Vec::new(),
         }
     }
 
@@ -972,19 +978,505 @@ impl SyntheticApkBuilder {
             .with_native_so("arm64-v8a", "libapp.so", b"\x7fELF_libapp")
     }
 
+    pub fn with_fake_encryption(mut self, lfh: bool, cd: bool) -> Self {
+        self.fake_encryption_lfh = lfh;
+        self.fake_encryption_cd = cd;
+        self
+    }
+
+    pub fn with_path_traversal_entry(self, name: &str, content: &[u8]) -> Self {
+        self.with_file(name, content)
+    }
+
+    pub fn with_arsc(self, arsc_bytes: &[u8]) -> Self {
+        self.with_file("resources.arsc", arsc_bytes)
+    }
+
+    pub fn with_andresguard_structure(
+        self,
+        _resource_id: u32,
+        obfuscated_path: &str,
+        content: &[u8],
+    ) -> Self {
+        let dummy_arsc = synthesize_resilient_arsc_bytes(false, false, false);
+        self.with_file(obfuscated_path, content)
+            .with_arsc(&dummy_arsc)
+            .with_manifest("com.example.andresguard")
+    }
+
+    pub fn with_raw_mutation<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut Vec<u8>) + 'static,
+    {
+        self.raw_mutations.push(Box::new(f));
+        self
+    }
+
     pub fn build(self) -> (TempDir, PathBuf) {
         use std::io::Write;
-        let file = fs::File::create(&self.apk_path).expect("Failed to create apk file");
-        let mut zip = zip::ZipWriter::new(file);
-        let opt = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (name, content) in &self.entries {
-            zip.start_file(name, opt).expect("Failed to start zip file");
-            zip.write_all(content).expect("Failed to write zip content");
+        let mut zip_bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            let opt = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, content) in &self.entries {
+                zip.start_file(name, opt).expect("Failed to start zip file");
+                zip.write_all(content).expect("Failed to write zip content");
+            }
+            zip.finish().expect("Failed to finish zip file");
         }
-        zip.finish().expect("Failed to finish zip file");
+
+        if self.fake_encryption_lfh {
+            apply_zip_lfh_fake_encryption(&mut zip_bytes);
+        }
+        if self.fake_encryption_cd {
+            apply_zip_cd_fake_encryption(&mut zip_bytes);
+        }
+        for mutation in self.raw_mutations {
+            mutation(&mut zip_bytes);
+        }
+
+        fs::write(&self.apk_path, &zip_bytes).expect("Failed to write apk file");
         (self.temp_dir, self.apk_path)
     }
+}
+
+/// Sets GPBF bit 0 (0x0001) in ZIP Local File Headers (LFH) at offset +6
+pub fn apply_zip_lfh_fake_encryption(bytes: &mut [u8]) {
+    let sig = [0x50, 0x4B, 0x03, 0x04];
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 30 <= len {
+        if bytes[i..i + 4] == sig {
+            bytes[i + 6] |= 0x01;
+            let name_len = u16::from_le_bytes([bytes[i + 26], bytes[i + 27]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+            i += 30 + name_len + extra_len;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Sets GPBF bit 0 (0x0001) in ZIP Central Directory File Headers (CDFH) at offset +8
+pub fn apply_zip_cd_fake_encryption(bytes: &mut [u8]) {
+    let sig = [0x50, 0x4B, 0x01, 0x02];
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 46 <= len {
+        if bytes[i..i + 4] == sig {
+            bytes[i + 8] |= 0x01;
+            let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[i + 30], bytes[i + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([bytes[i + 32], bytes[i + 33]]) as usize;
+            i += 46 + name_len + extra_len + comment_len;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Synthesize an APK container with fake encryption bit 0 set in LFH, CD, or both
+pub fn synthesize_fake_encryption_apk(
+    entries: &[(&str, &[u8])],
+    lfh_bit: bool,
+    cd_bit: bool,
+) -> (TempDir, PathBuf) {
+    let mut builder = SyntheticApkBuilder::new("fake_encryption.apk")
+        .with_fake_encryption(lfh_bit, cd_bit);
+    for (name, content) in entries {
+        builder = builder.with_file(name, content);
+    }
+    builder.build()
+}
+
+/// Pure-Rust Adler-32 implementation for Dalvik DEX checksum validation
+pub fn adler32(data: &[u8]) -> u32 {
+    let mut s1: u32 = 1;
+    let mut s2: u32 = 0;
+    for &b in data {
+        s1 = (s1 + b as u32) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    (s2 << 16) | s1
+}
+
+/// Pure-Rust SHA-1 implementation (RFC 3174) for Dalvik DEX header hashing
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h0 = 0x67452301u32;
+    let mut h1 = 0xEFCDAB89u32;
+    let mut h2 = 0x98BADCFEu32;
+    let mut h3 = 0x10325476u32;
+    let mut h4 = 0xC3D2E1F0u32;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a.rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
+}
+
+/// Recomputes SHA-1 and Adler-32 checksums in a DEX byte buffer in-place
+pub fn recompute_dex_checksums(bytes: &mut [u8]) {
+    if bytes.len() < 32 {
+        return;
+    }
+    let sha1_digest = sha1(&bytes[32..]);
+    bytes[12..32].copy_from_slice(&sha1_digest);
+
+    let adler = adler32(&bytes[12..]);
+    bytes[8..12].copy_from_slice(&adler.to_le_bytes());
+}
+
+/// Encodes an unsigned integer as ULEB128
+pub fn encode_uleb128(mut value: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Synthesize a minimal valid DEX file with arbitrary MUTF-8 string sequences
+pub fn synthesize_mutf8_dex(strings: &[&[u8]]) -> Vec<u8> {
+    let header_size = 0x70usize;
+    let string_ids_size = strings.len();
+    let string_ids_off = header_size;
+
+    let mut string_data_bytes = Vec::new();
+    let mut string_data_offsets = Vec::new();
+    let current_data_off = string_ids_off + (string_ids_size * 4);
+
+    for s in strings {
+        let utf16_len = s.len() as u32;
+        let mut encoded = encode_uleb128(utf16_len);
+        encoded.extend_from_slice(s);
+        encoded.push(0x00);
+
+        string_data_offsets.push(current_data_off + string_data_bytes.len());
+        string_data_bytes.extend_from_slice(&encoded);
+    }
+
+    while (string_data_bytes.len() % 4) != 0 {
+        string_data_bytes.push(0);
+    }
+
+    let map_off = current_data_off + string_data_bytes.len();
+    let map_items: [(u16, u16, u32, u32); 4] = [
+        (0x0000, 0, 1, 0),
+        (0x0001, 0, string_ids_size as u32, string_ids_off as u32),
+        (0x2002, 0, string_ids_size as u32, current_data_off as u32),
+        (0x1000, 0, 1, map_off as u32),
+    ];
+
+    let mut map_data = Vec::new();
+    map_data.extend_from_slice(&(map_items.len() as u32).to_le_bytes());
+    for (itype, unused, isize, ioff) in map_items {
+        map_data.extend_from_slice(&itype.to_le_bytes());
+        map_data.extend_from_slice(&unused.to_le_bytes());
+        map_data.extend_from_slice(&isize.to_le_bytes());
+        map_data.extend_from_slice(&ioff.to_le_bytes());
+    }
+
+    let file_size = map_off + map_data.len();
+    let data_off = current_data_off;
+    let data_size = file_size - current_data_off;
+
+    let mut header = vec![0u8; header_size];
+    header[0..8].copy_from_slice(b"dex\n035\0");
+    header[0x20..0x24].copy_from_slice(&(file_size as u32).to_le_bytes());
+    header[0x24..0x28].copy_from_slice(&(header_size as u32).to_le_bytes());
+    header[0x28..0x2C].copy_from_slice(&0x12345678u32.to_le_bytes());
+    header[0x34..0x38].copy_from_slice(&(map_off as u32).to_le_bytes());
+    header[0x38..0x3C].copy_from_slice(&(string_ids_size as u32).to_le_bytes());
+    header[0x3C..0x40].copy_from_slice(&(string_ids_off as u32).to_le_bytes());
+    header[0x68..0x6C].copy_from_slice(&(data_size as u32).to_le_bytes());
+    header[0x6C..0x70].copy_from_slice(&(data_off as u32).to_le_bytes());
+
+    let mut string_ids_table = Vec::new();
+    for soff in string_data_offsets {
+        string_ids_table.extend_from_slice(&(soff as u32).to_le_bytes());
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&header);
+    payload.extend_from_slice(&string_ids_table);
+    payload.extend_from_slice(&string_data_bytes);
+    payload.extend_from_slice(&map_data);
+
+    recompute_dex_checksums(&mut payload);
+    payload
+}
+
+/// Synthesize a DEX file containing invalid Dalvik opcodes in dead code after return-void
+pub fn synthesize_dead_code_dex(dead_bytes: &[u8], corrupt_debug: bool) -> Vec<u8> {
+    let src = fixture_path("sample_classes.dex");
+    let mut data = fs::read(&src).expect("Failed to read sample_classes.dex fixture");
+
+    let pattern = [0x0e, 0x00];
+    if let Some(pos) = data.windows(2).position(|w| w == pattern) {
+        let dead_len = dead_bytes.len().min(16);
+        let replace_start = pos + 2;
+        if replace_start + dead_len <= data.len() {
+            data[replace_start..replace_start + dead_len].copy_from_slice(&dead_bytes[..dead_len]);
+        }
+    }
+
+    if corrupt_debug && data.len() > 107944 {
+        data[107940..107944].copy_from_slice(&0x00010000u32.to_le_bytes());
+    }
+
+    recompute_dex_checksums(&mut data);
+    data
+}
+
+/// Synthesize an Android binary resources.arsc table with optional padded header, fake chunks, and corrupt offsets
+pub fn synthesize_resilient_arsc_bytes(
+    pad_header_size: bool,
+    inject_unknown_chunks: bool,
+    corrupt_offsets: bool,
+) -> Vec<u8> {
+    fn build_pool(strings: &[&str], corrupt: bool) -> Vec<u8> {
+        let mut offsets = Vec::new();
+        let mut str_data = Vec::new();
+
+        for s in strings {
+            offsets.push(str_data.len() as u32);
+            let s_bytes = s.as_bytes();
+            str_data.push((s.len() & 0x7F) as u8);
+            str_data.push((s_bytes.len() & 0x7F) as u8);
+            str_data.extend_from_slice(s_bytes);
+            str_data.push(0);
+        }
+        while (str_data.len() % 4) != 0 {
+            str_data.push(0);
+        }
+
+        let h_size = 28u16;
+        let count = if corrupt {
+            0xFFFFu32
+        } else {
+            strings.len() as u32
+        };
+        let start = (h_size as usize) + (strings.len() * 4);
+        let total = (start + str_data.len()) as u32;
+
+        let mut h = Vec::new();
+        h.extend_from_slice(&0x0001u16.to_le_bytes());
+        h.extend_from_slice(&h_size.to_le_bytes());
+        h.extend_from_slice(&total.to_le_bytes());
+        h.extend_from_slice(&count.to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(&0x00000100u32.to_le_bytes());
+        h.extend_from_slice(&(start as u32).to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes());
+
+        for (idx, &off) in offsets.iter().enumerate() {
+            if corrupt && idx == offsets.len() - 1 {
+                h.extend_from_slice(&0x7FFFFFFFu32.to_le_bytes());
+            } else {
+                h.extend_from_slice(&off.to_le_bytes());
+            }
+        }
+
+        h.extend_from_slice(&str_data);
+        h
+    }
+
+    let global_pool = build_pool(&["app_name", "SyntheticTarget", "res/values/strings.xml", "r/d/a.png"], corrupt_offsets);
+    let type_pool = build_pool(&["attr", "string", "xml", "drawable"], false);
+    let key_pool = build_pool(&["app_name", "welcome_message", "api_endpoint", "icon"], false);
+
+    let pkg_h_size = 288u16;
+    let type_off = pkg_h_size as u32;
+    let key_off = type_off + (type_pool.len() as u32);
+    let pkg_total = key_off + (key_pool.len() as u32);
+
+    let pkg_name = "com.example.synthetic.target";
+    let mut pkg_name_utf16 = Vec::new();
+    for c in pkg_name.encode_utf16() {
+        pkg_name_utf16.extend_from_slice(&c.to_le_bytes());
+    }
+    while pkg_name_utf16.len() < 256 {
+        pkg_name_utf16.push(0);
+    }
+    pkg_name_utf16.truncate(256);
+
+    let mut pkg_chunk = Vec::new();
+    pkg_chunk.extend_from_slice(&0x0200u16.to_le_bytes());
+    pkg_chunk.extend_from_slice(&pkg_h_size.to_le_bytes());
+    pkg_chunk.extend_from_slice(&pkg_total.to_le_bytes());
+    pkg_chunk.extend_from_slice(&0x7Fu32.to_le_bytes());
+    pkg_chunk.extend_from_slice(&pkg_name_utf16);
+    pkg_chunk.extend_from_slice(&type_off.to_le_bytes());
+    pkg_chunk.extend_from_slice(&0u32.to_le_bytes());
+    pkg_chunk.extend_from_slice(&key_off.to_le_bytes());
+    pkg_chunk.extend_from_slice(&0u32.to_le_bytes());
+    pkg_chunk.extend_from_slice(&0u32.to_le_bytes());
+    pkg_chunk.extend_from_slice(&type_pool);
+    pkg_chunk.extend_from_slice(&key_pool);
+
+    let mut unknown_chunks = Vec::new();
+    if inject_unknown_chunks {
+        unknown_chunks.extend_from_slice(&0x0000u16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&8u16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&16u32.to_le_bytes());
+        unknown_chunks.extend_from_slice(&[0u8; 8]);
+
+        unknown_chunks.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&8u16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&24u32.to_le_bytes());
+        unknown_chunks.extend_from_slice(&[0xAAu8; 16]);
+    }
+
+    let table_h_size = if pad_header_size { 28u16 } else { 12u16 };
+    let table_total = (table_h_size as usize)
+        + unknown_chunks.len()
+        + global_pool.len()
+        + pkg_chunk.len();
+
+    let mut table_header = Vec::new();
+    table_header.extend_from_slice(&0x0002u16.to_le_bytes());
+    table_header.extend_from_slice(&table_h_size.to_le_bytes());
+    table_header.extend_from_slice(&(table_total as u32).to_le_bytes());
+    table_header.extend_from_slice(&1u32.to_le_bytes());
+
+    if pad_header_size {
+        table_header.extend_from_slice(&[0xCCu8; 16]);
+    }
+
+    let mut full_arsc = Vec::new();
+    full_arsc.extend_from_slice(&table_header);
+    full_arsc.extend_from_slice(&unknown_chunks);
+    full_arsc.extend_from_slice(&global_pool);
+    full_arsc.extend_from_slice(&pkg_chunk);
+    full_arsc
+}
+
+/// Synthesize an Android binary resources.arsc table containing mixed UTF-16LE surrogate and ASCII stream
+pub fn synthesize_utf16_surrogate_arsc_bytes() -> Vec<u8> {
+    let mut arsc = synthesize_resilient_arsc_bytes(false, false, false);
+    // Find the package name UTF-16LE characters for "synthetic" and inject unpaired surrogate bytes
+    let target: Vec<u8> = "synthetic".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    if let Some(pos) = arsc.windows(target.len()).position(|w| w == target.as_slice()) {
+        let surrogate = utf16le_unpaired_low_surrogate();
+        arsc[pos..pos + surrogate.len()].copy_from_slice(surrogate);
+    }
+    arsc
+}
+
+/// Helper returning Dalvik MUTF-8 2-byte null encoding (0xC0, 0x80)
+pub fn mutf8_two_byte_null() -> &'static [u8] {
+    b"\xC0\x80"
+}
+
+/// Helper returning Dalvik MUTF-8 6-byte surrogate pair encoding (U+10400)
+pub fn mutf8_surrogate_pair() -> &'static [u8] {
+    b"\xED\xA0\x81\xED\xB0\x80"
+}
+
+/// Helper returning Dalvik MUTF-8 lone high surrogate (U+D800)
+pub fn mutf8_lone_high_surrogate() -> &'static [u8] {
+    b"\xED\xA0\x80"
+}
+
+/// Helper returning Dalvik MUTF-8 lone low surrogate (U+DC00)
+pub fn mutf8_lone_low_surrogate() -> &'static [u8] {
+    b"\xED\xB0\x80"
+}
+
+/// Helper returning UTF-16LE unpaired high surrogate (0xD800 followed by 'A')
+pub fn utf16le_unpaired_high_surrogate() -> &'static [u8] {
+    &[0x00, 0xD8, 0x41, 0x00]
+}
+
+/// Helper returning UTF-16LE unpaired low surrogate (0xDC00 followed by 'B')
+pub fn utf16le_unpaired_low_surrogate() -> &'static [u8] {
+    &[0x00, 0xDC, 0x42, 0x00]
+}
+
+/// Helper returning adversarial string with ANSI CSI color codes
+pub fn adversarial_ansi_string() -> &'static str {
+    "\x1b[31;1mcom.evil.malicious\x1b[0m"
+}
+
+/// Helper returning adversarial string with BiDi Right-to-Left Override (U+202E)
+pub fn adversarial_bidi_string() -> &'static str {
+    "app_\u{202E}cod.exe\u{202C}.apk"
+}
+
+/// Helper returning adversarial string with stacked Zalgo combining diacritics
+pub fn adversarial_zalgo_string() -> &'static str {
+    "Z\u{0300}\u{0301}\u{0302}\u{0303}\u{0304}\u{0305}\u{0306}\u{0307}\u{0308}\u{0309}algo"
+}
+
+/// Helper returning adversarial string with ANSI CSI cursor hiding/showing controls
+pub fn adversarial_cursor_hide_string() -> &'static str {
+    "\x1b[?25lHiddenPayload\x1b[?25h"
+}
+
+/// Helper returning adversarial string with ANSI OSC window title manipulation
+pub fn adversarial_osc_title_string() -> &'static str {
+    "\x1b]0;PwnedTitle\x07CleanTarget"
 }
 
 /// Helper to get the path to test fixtures

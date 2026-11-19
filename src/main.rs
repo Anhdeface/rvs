@@ -1262,9 +1262,16 @@ fn handle_apk_command(
 
             // Wire up --disasm and --smali flags: populate Dalvik bytecode disassembly
             if *disasm || *smali {
+                let is_filtered = class.is_some() || method.is_some();
+                let max_disasm_methods = if is_filtered { usize::MAX } else { 20 };
+                let mut methods_disassembled = 0;
                 let mut all_disasm = Vec::new();
-                for c in &mut analysis_result.classes {
+
+                'disasm_loop: for c in &mut analysis_result.classes {
                     for m in &mut c.methods {
+                        if methods_disassembled >= max_disasm_methods {
+                            break 'disasm_loop;
+                        }
                         if let Some(code_offset) = m.code_offset {
                             let instruction_addr = code_offset + 16;
                             let insts_res = if let Some(insns) = m.insns_size {
@@ -1276,6 +1283,7 @@ fn handle_apk_command(
                             if let Ok(insts) = insts_res {
                                 m.disassembly = Some(insts.clone());
                                 all_disasm.extend(insts);
+                                methods_disassembled += 1;
                             }
                         }
                     }

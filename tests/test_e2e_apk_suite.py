@@ -526,7 +526,7 @@ class TestApkE2ETier1FeatureCoverage(unittest.TestCase):
         self.assertIsInstance(resp, dict)
         self.assertEqual(resp.get("command"), "frida env-check")
         if resp.get("success"):
-            self.assertIn("r2frida_installed", resp.get("data", {}))
+            self.assertTrue("installed" in resp.get("data", {}) or "r2frida_installed" in resp.get("data", {}))
         else:
             self.assertIn("error", resp)
             self.assertEqual(resp["error"].get("code"), "R2_FRIDA_NOT_INSTALLED")

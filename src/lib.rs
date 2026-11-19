@@ -17,4 +17,7 @@ pub use r2::R2Driver;
 pub use analysis::xrefs::{XrefDirection, XrefKindFilter};
 pub use agent::*;
 pub use frida::*;
-pub use apk::{ApkPackage, ApkSource, ApkEntry, ManifestInfo, is_binary_axml, detect_elf_abi};
+pub use apk::{
+    detect_elf_abi, is_binary_axml, ApkEntry, ApkPackage, ApkSource, ManifestInfo,
+    decode_mutf8_lossy, decode_utf16le_lossy, sanitize_archive_entry_path, sanitize_identifier,
+};

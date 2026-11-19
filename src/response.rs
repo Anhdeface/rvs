@@ -1,9 +1,10 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::apk::sanitize::sanitize_identifier;
 pub use crate::error::AppError;
 
-pub const CURRENT_FORMAT_VERSION: &str = "0.4.0";
+pub const CURRENT_FORMAT_VERSION: &str = "0.4.1";
 
 /// Standard API response envelope wrapping all CLI outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,7 +105,7 @@ impl ApiError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
-            message: message.into(),
+            message: sanitize_identifier(&message.into()),
             category: None,
             exit_code: None,
             details: None,
@@ -115,7 +116,7 @@ impl ApiError {
     pub fn with_details(code: impl Into<String>, message: impl Into<String>, details: serde_json::Value) -> Self {
         Self {
             code: code.into(),
-            message: message.into(),
+            message: sanitize_identifier(&message.into()),
             category: None,
             exit_code: None,
             details: Some(details),
@@ -134,7 +135,7 @@ impl ApiError {
     }
 
     pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
-        self.suggestion = Some(suggestion.into());
+        self.suggestion = Some(sanitize_identifier(&suggestion.into()));
         self
     }
 }

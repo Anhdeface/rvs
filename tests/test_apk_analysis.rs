@@ -1656,3 +1656,1094 @@ fn test_tier2_cli_apk_resources_archive_path_traversal_rejected() {
     let err_rel = resp_rel.error.expect("error expected");
     assert_eq!(err_rel.code, "INVALID_BINARY");
 }
+
+
+// =============================================================================
+// Resilient Differential & Anti-Analysis Test Suites (R1 - R6)
+// =============================================================================
+
+// =============================================================================
+// Tier 1: Feature Coverage (Resilience Primitives & Happy Paths)
+// =============================================================================
+
+#[test]
+fn test_tier1_resilient_sanitized_identifier_standard_ascii() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_str]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    assert_eq!(data.package_name.as_deref(), Some("eu.jgamba.myapplication"));
+    let pkg = data.package_name.as_deref().unwrap_or("");
+    assert!(!pkg.contains('\x1b'));
+    assert!(!pkg.contains('\u{202E}'));
+}
+
+#[test]
+fn test_tier1_resilient_mutf8_ascii_strings() {
+    let raw_strings: [&[u8]; 3] = [b"com.example.test", b"MainActivity", b"onCreate"];
+    let dex_bytes = synthesize_mutf8_dex(&raw_strings);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("classes.dex");
+    std::fs::write(&dex_path, &dex_bytes).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert!(data.strings_count >= 3);
+    if let Some(ref strs) = data.strings {
+        assert!(strs.iter().any(|s| s == "com.example.test"));
+        assert!(strs.iter().any(|s| s == "MainActivity"));
+    }
+}
+
+#[test]
+fn test_tier1_resilient_utf16le_standard_strings() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, false, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("standard_arsc.apk")
+        .with_manifest("com.example.arsc")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(!data.arsc_packages.is_empty());
+    assert!(data.arsc_packages.iter().any(|p| p.name == "com.example.synthetic.target"));
+}
+
+#[test]
+fn test_tier1_resilient_andresguard_resource_structure() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("andresguard_tier1.apk")
+        .with_andresguard_structure(0x7f020000, "r/d/a.png", b"\x89PNG\r\n\x1a\nfake_png")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap(), "--list"]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    let entries = data.entries.expect("ResourcesData entries expected with --list");
+    assert!(entries.iter().any(|r| r.name.starts_with("r/")));
+}
+
+#[test]
+fn test_tier1_resilient_reschunk_standard_header() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, false, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("reschunk_standard_header.apk")
+        .with_manifest("com.example.synthetic.target")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Standard ARSC chunk header parsing must succeed");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(data.has_arsc);
+    assert!(!data.arsc_packages.is_empty(), "ARSC packages should be parsed from standard header");
+    assert!(data.arsc_packages.iter().any(|p| p.name == "com.example.synthetic.target"));
+}
+
+#[test]
+fn test_tier1_resilient_dalvik_standard_disassembly() {
+    let dex = classes_dex_fixture();
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex.to_str().unwrap(), "--class", "Lcom/devoteam/quickaction/QuickActionItem;", "--disasm",
+    ]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert!(!data.classes.is_empty());
+}
+
+// =============================================================================
+// Tier 2: Boundary & Corner Cases (R1 - R6)
+// =============================================================================
+
+// --- R1: Terminal and Unicode Sanitization ---
+
+#[test]
+fn test_tier2_apk_sanitize_ansi_csi_color_stripping() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("ansi_csi_target.apk")
+        .with_manifest(adversarial_ansi_string())
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    let raw_stdout = String::from_utf8_lossy(&out.stdout);
+    let raw_stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!raw_stdout.contains("\x1b["), "Stdout must not leak raw ANSI CSI escape sequences");
+    assert!(!raw_stderr.contains("\x1b["), "Stderr must not leak raw ANSI CSI escape sequences");
+    assert!(resp.success);
+    if let Some(data) = resp.data {
+        let pkg = data.package_name.as_deref().unwrap_or("");
+        assert!(!pkg.contains("\x1b[31;1m"));
+        assert!(!pkg.contains("\x1b[0m"));
+        assert!(pkg.contains("com.evil.malicious"));
+    }
+}
+
+#[test]
+fn test_tier2_apk_sanitize_ansi_osc_window_title_stripping() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("ansi_osc_target.apk")
+        .with_manifest(adversarial_osc_title_string())
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    let raw_stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(!raw_stdout.contains("\x1b]0;"), "Stdout must not contain OSC title hijack");
+    assert!(!raw_stdout.contains('\x07'), "Stdout must not contain BEL character");
+    assert!(resp.success);
+    if let Some(data) = resp.data {
+        let pkg = data.package_name.as_deref().unwrap_or("");
+        assert!(!pkg.contains("\x1b]0;"));
+        assert!(pkg.contains("CleanTarget"));
+    }
+}
+
+#[test]
+fn test_tier2_apk_sanitize_bidi_right_to_left_override_neutralized() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("bidi_target.apk")
+        .with_manifest(adversarial_bidi_string())
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    let raw_stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(!raw_stdout.contains('\u{202E}'), "Stdout must neutralize Right-to-Left Override (U+202E)");
+    assert!(resp.success);
+    if let Some(data) = resp.data {
+        let pkg = data.package_name.as_deref().unwrap_or("");
+        assert!(!pkg.contains('\u{202E}'));
+    }
+}
+
+#[test]
+fn test_tier2_apk_sanitize_zalgo_combining_characters_clamped() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("zalgo_target.apk")
+        .with_manifest(adversarial_zalgo_string())
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    if let Some(data) = resp.data {
+        let pkg = data.package_name.as_deref().unwrap_or("");
+        let mut combining_count = 0;
+        for c in pkg.chars() {
+            if ('\u{0300}'..='\u{036F}').contains(&c) {
+                combining_count += 1;
+            }
+        }
+        assert!(combining_count <= 2, "Zalgo diacritics must be clamped to threshold <= 2 per glyph; got {}", combining_count);
+    }
+}
+
+#[test]
+fn test_tier2_apk_sanitize_c0_controls_and_newlines_cleaned() {
+    let bad_pkg = "com.adversarial.app\nInjectedHeader: value\r\x08\x07";
+    let (_temp, apk_path) = SyntheticApkBuilder::new("c0_controls.apk")
+        .with_manifest(bad_pkg)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(resp.success);
+    let raw_stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw_stdout.contains('\x08'), "Backspace control must be sanitized");
+    assert!(!raw_stdout.contains('\x07'), "BEL control must be sanitized");
+}
+
+// --- R2: Resilient String Decoding (MUTF-8 and UTF-16LE) ---
+
+#[test]
+fn test_tier2_mutf8_two_byte_null_handling() {
+    let mut null_str = b"prefix_".to_vec();
+    null_str.extend_from_slice(mutf8_two_byte_null());
+    null_str.extend_from_slice(b"_suffix");
+
+    let dex_bytes = synthesize_mutf8_dex(&[&null_str]);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("mutf8_null.dex");
+    std::fs::write(&dex_path, &dex_bytes).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    if let Some(ref strs) = data.strings {
+        assert!(strs.iter().any(|s| s.contains("prefix_") && s.contains("_suffix")));
+    }
+}
+
+#[test]
+fn test_tier2_mutf8_six_byte_surrogate_pair_recombination() {
+    let mut surrogate_str = b"deseret_".to_vec();
+    surrogate_str.extend_from_slice(mutf8_surrogate_pair());
+    surrogate_str.extend_from_slice(b"_end");
+
+    let dex_bytes = synthesize_mutf8_dex(&[&surrogate_str]);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("mutf8_surrogate.dex");
+    std::fs::write(&dex_path, &dex_bytes).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let strs = data.strings.expect("DexAnalysisData strings expected");
+    assert!(strs.iter().any(|s| s.contains('𐐀')), "MUTF-8 surrogate pair must recombine to U+10400 ('𐐀')");
+}
+
+#[test]
+fn test_tier2_mutf8_unpaired_lone_surrogate_safe_replacement() {
+    let mut lone_str = b"lone_".to_vec();
+    lone_str.extend_from_slice(mutf8_lone_high_surrogate());
+    lone_str.extend_from_slice(b"_surrogate");
+
+    let dex_bytes = synthesize_mutf8_dex(&[&lone_str]);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("mutf8_lone.dex");
+    std::fs::write(&dex_path, &dex_bytes).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let strs = data.strings.expect("DexAnalysisData strings expected");
+    assert!(strs.iter().any(|s| s.contains('\u{FFFD}')), "MUTF-8 lone surrogate must be replaced with U+FFFD");
+}
+
+#[test]
+fn test_tier2_utf16le_unpaired_surrogates_in_arsc() {
+    let arsc_bytes = synthesize_utf16_surrogate_arsc_bytes();
+    let (_temp, apk_path) = SyntheticApkBuilder::new("arsc_unpaired.apk")
+        .with_manifest("com.example.unpaired")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(!data.arsc_packages.is_empty());
+}
+
+#[test]
+fn test_tier2_utf16le_mixed_surrogate_and_ascii_stream() {
+    let raw = utf16le_unpaired_low_surrogate();
+    let decoded = rvs::decode_utf16le_lossy(raw);
+    assert_eq!(decoded, "\u{FFFD}B");
+
+    let arsc_bytes = synthesize_utf16_surrogate_arsc_bytes();
+    let (_temp, apk_path) = SyntheticApkBuilder::new("utf16_mixed_surrogate.apk")
+        .with_manifest("com.example.surrogate")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap(), "--list"]);
+    assert!(out.status.success(), "Mixed surrogate stream in ARSC must not crash resources subcommand");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(data.has_arsc);
+}
+
+// --- R3: ZIP Fake Encryption & Path Traversal ---
+
+#[test]
+fn test_tier2_apk_fake_encryption_lfh_bit0() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("fake_enc_lfh.apk")
+        .with_manifest("com.example.fake.lfh")
+        .with_fake_encryption(true, false)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "APK inspect must tolerate fake encryption in LFH");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    assert_eq!(data.package_name.as_deref(), Some("com.example.fake.lfh"));
+}
+
+#[test]
+fn test_tier2_apk_fake_encryption_cd_bit0() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("fake_enc_cd.apk")
+        .with_manifest("com.example.fake.cd")
+        .with_fake_encryption(false, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "APK inspect must tolerate fake encryption in CD");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    assert_eq!(data.package_name.as_deref(), Some("com.example.fake.cd"));
+}
+
+#[test]
+fn test_tier2_apk_fake_encryption_both_lfh_and_cd_bit0() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("fake_enc_both.apk")
+        .with_manifest("com.example.fake.both")
+        .with_dex_markers("classes.dex", &["Lcom/example/fake/Main;"])
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "APK inspect must tolerate fake encryption in both LFH and CD");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    assert_eq!(data.package_name.as_deref(), Some("com.example.fake.both"));
+    assert!(!data.dex_files.is_empty());
+}
+
+#[test]
+fn test_tier2_zip_path_traversal_double_dot_blocked() {
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("dump_output");
+    let canary_leak = temp_workspace.path().join("canary_escaped.txt");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("path_traversal.apk")
+        .with_manifest("com.example.traversal")
+        .with_file("res/values/strings.xml", b"<resources/>")
+        .with_path_traversal_entry("../../canary_escaped.txt", b"evil_payload")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--dump", dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    assert!(!canary_leak.exists(), "Traversal entry must never escape to parent directory");
+}
+
+#[test]
+fn test_tier2_zip_os_reserved_characters_and_devices() {
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("reserved_dump");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("reserved_names.apk")
+        .with_manifest("com.example.reserved")
+        .with_file("assets/CON.txt", b"windows_reserved_con")
+        .with_file("assets/AUX.json", b"windows_reserved_aux")
+        .with_file("assets/NUL.bin", b"windows_reserved_nul")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--dump", dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    assert!(dump_dir.exists(), "Dump directory must be created");
+    // Windows reserved device names (CON, AUX, NUL) must be safely stored (e.g. sanitized as _CON.txt or safely created)
+    let con_safe = dump_dir.join("assets/_CON.txt").is_file() || dump_dir.join("assets/CON.txt").is_file();
+    assert!(con_safe, "Reserved device name 'CON.txt' must be safely dumped in output directory");
+}
+
+// --- R4: ResChunk Header and Table Resilience ---
+
+#[test]
+fn test_tier2_reschunk_padded_header_size_0x1c() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, false, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("padded_header.apk")
+        .with_manifest("com.example.padded")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Padded ResChunk headerSize must be parsed dynamically");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(!data.arsc_packages.is_empty());
+}
+
+#[test]
+fn test_tier2_reschunk_unknown_chunk_types_0x0000_skipped() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, true, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("unknown_chunks.apk")
+        .with_manifest("com.example.unknown")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Unknown chunk types (0x0000, 0xFFFF) must be skipped gracefully");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(!data.arsc_packages.is_empty());
+}
+
+#[test]
+fn test_tier2_reschunk_unknown_chunk_types_0xffff_skipped() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, true, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("unknown_chunks_ffff.apk")
+        .with_manifest("com.example.unknown.ffff")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Unknown chunk type 0xFFFF must be skipped gracefully");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(!data.arsc_packages.is_empty(), "Subsequent packages must be parsed after skipping 0xFFFF");
+}
+
+#[test]
+fn test_tier2_reschunk_arbitrary_unknown_chunks_skipped() {
+    let base_arsc = synthesize_resilient_arsc_bytes(false, false, false);
+    // Base ARSC layout: table header (12 bytes), global string pool, package chunk
+    // Global string pool chunk size at offset 16..20
+    let global_pool_size = u32::from_le_bytes([
+        base_arsc[16],
+        base_arsc[17],
+        base_arsc[18],
+        base_arsc[19],
+    ]) as usize;
+    let pkg_offset = 12 + global_pool_size;
+    assert!(pkg_offset <= base_arsc.len());
+    assert_eq!(&base_arsc[pkg_offset..pkg_offset + 2], &0x0200u16.to_le_bytes());
+
+    // Inject sequential arbitrary unknown chunks (10x 0x1234 and 10x 0xABCD)
+    let mut unknown_chunks = Vec::new();
+    for _ in 0..10 {
+        // chunk 0x1234: header_size 8, total size 16, payload 8 bytes
+        unknown_chunks.extend_from_slice(&0x1234u16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&8u16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&16u32.to_le_bytes());
+        unknown_chunks.extend_from_slice(&[0x42u8; 8]);
+    }
+    for _ in 0..10 {
+        // chunk 0xABCD: header_size 8, total size 16, payload 8 bytes
+        unknown_chunks.extend_from_slice(&0xABCDu16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&8u16.to_le_bytes());
+        unknown_chunks.extend_from_slice(&16u32.to_le_bytes());
+        unknown_chunks.extend_from_slice(&[0xDEu8; 8]);
+    }
+
+    let new_total = (base_arsc.len() + unknown_chunks.len()) as u32;
+    let mut arsc_bytes = Vec::with_capacity(new_total as usize);
+    // Table header with updated total size
+    arsc_bytes.extend_from_slice(&base_arsc[0..4]);
+    arsc_bytes.extend_from_slice(&new_total.to_le_bytes());
+    arsc_bytes.extend_from_slice(&base_arsc[8..12]);
+    // Global string pool
+    arsc_bytes.extend_from_slice(&base_arsc[12..pkg_offset]);
+    // Intervening sequential arbitrary unknown chunks
+    arsc_bytes.extend_from_slice(&unknown_chunks);
+    // Genuine package chunk
+    arsc_bytes.extend_from_slice(&base_arsc[pkg_offset..]);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("arbitrary_unknown_chunks.apk")
+        .with_manifest("com.example.arbitrary.unknown")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Arbitrary unknown chunks (0x1234, 0xABCD) must be skipped cleanly");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(!data.arsc_packages.is_empty(), "Subsequent packages must be parsed after skipping arbitrary unknown chunks");
+    assert_eq!(data.arsc_packages[0].name, "com.example.synthetic.target");
+    assert_eq!(data.arsc_packages[0].id, 0x7F);
+}
+
+#[test]
+fn test_tier2_reschunk_string_pool_anomalous_string_count_clamped() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, false, true);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("corrupt_pool.apk")
+        .with_manifest("com.example.corrupt.pool")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Anomalous string pool count must not crash parser");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(data.has_arsc);
+}
+
+#[test]
+fn test_tier2_reschunk_string_pool_oob_offset_clamped() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, false, true);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("oob_offset_pool.apk")
+        .with_manifest("com.example.oob.pool")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Out-of-bounds string offset (0x7FFFFFFF) must be clamped safely without panic");
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    assert!(data.has_arsc);
+}
+
+// --- R5: Dalvik / DEX Parser Dead-Code and Debug Info Resilience ---
+
+#[test]
+fn test_tier2_dalvik_dead_code_invalid_opcodes_after_return() {
+    let dead_dex = synthesize_dead_code_dex(&[0xff, 0xff, 0xef, 0x00], false);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("dead_code.dex");
+    std::fs::write(&dex_path, &dead_dex).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success(), "DEX parsing must succeed despite dead code invalid opcodes");
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert_eq!(data.classes_count, 323);
+}
+
+#[test]
+fn test_tier2_dalvik_dead_code_after_unconditional_goto() {
+    let dead_dex = synthesize_dead_code_dex(&[0x28, 0x00, 0x3e, 0x00], false);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("goto_dead.dex");
+    std::fs::write(&dex_path, &dead_dex).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier2_dalvik_corrupted_debug_info_stream_graceful() {
+    let corrupt_dex = synthesize_dead_code_dex(&[0x0e, 0x00], true);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("corrupt_debug.dex");
+    std::fs::write(&dex_path, &corrupt_dex).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Corrupted debug_info_item must not abort DEX class parsing");
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier2_dalvik_debug_info_missing_end_sequence() {
+    let dead_dex = synthesize_dead_code_dex(&[0x0e, 0x00, 0x01, 0x05], true);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("truncated_debug.dex");
+    std::fs::write(&dex_path, &dead_dex).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier2_dalvik_mixed_valid_and_dead_code_blocks() {
+    let dead_dex = synthesize_dead_code_dex(&[0xff, 0xfe, 0xfd, 0xfc], false);
+    let temp_dir = TempDir::new().unwrap();
+    let dex_path = temp_dir.path().join("mixed_blocks.dex");
+    std::fs::write(&dex_path, &dead_dex).unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", dex_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+// --- R6: Anti-AndResGuard Compatibility ---
+
+#[test]
+fn test_tier2_andresguard_r_directory_resource_discovery() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("andresguard_r.apk")
+        .with_manifest("com.example.andresguard.app")
+        .with_file("r/d/a.png", b"\x89PNG\r\n\x1a\n")
+        .with_file("r/l/b.xml", b"<layout/>")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap(), "--list"]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    let entries = data.entries.expect("ResourcesData entries expected with --list");
+    assert!(entries.iter().any(|r| r.name == "r/d/a.png"));
+    assert!(entries.iter().any(|r| r.name == "r/l/b.xml"));
+}
+
+#[test]
+fn test_tier2_andresguard_obfuscated_resource_extraction() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("andresguard_extract.apk")
+        .with_manifest("com.example.andresguard.extract")
+        .with_file("r/d/icon.png", b"fake_png_icon_data")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--extract", "r/d/icon.png",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier2_andresguard_dump_resources_includes_r_directory() {
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("andresguard_dump");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("andresguard_dump.apk")
+        .with_manifest("com.example.andresguard.dump")
+        .with_file("r/a/a.png", b"icon_a")
+        .with_file("r/a/b.png", b"icon_b")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--dump", dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    assert!(dump_dir.join("r/a/a.png").is_file());
+    assert!(dump_dir.join("r/a/b.png").is_file());
+}
+
+#[test]
+fn test_tier2_andresguard_short_single_letter_names_preserved() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, false, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("short_names.apk")
+        .with_manifest("com.example.short")
+        .with_file("r/d/a.png", b"\x89PNG\r\n\x1a\n")
+        .with_file("r/l/b.xml", b"<layout/>")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap(), "--list"]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ResourcesData expected");
+    let entries = data.entries.expect("ResourcesData entries expected with --list");
+    assert!(entries.iter().any(|r| r.name == "r/d/a.png"), "Short single-letter name 'r/d/a.png' must be preserved");
+    assert!(entries.iter().any(|r| r.name == "r/l/b.xml"), "Short single-letter name 'r/l/b.xml' must be preserved");
+}
+
+#[test]
+fn test_tier2_andresguard_7zip_stored_arsc_compatibility() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(false, false, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("sevenzip_stored.apk")
+        .with_manifest("com.example.sevenzip")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+// =============================================================================
+// Tier 3: Cross-Feature Combinations (Pairwise & Multi-Interaction)
+// =============================================================================
+
+#[test]
+fn test_tier3_combo_fake_encryption_and_andresguard_r_dirs() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_enc_andresguard.apk")
+        .with_manifest("com.example.combo.enc.andres")
+        .with_file("r/d/a.png", b"andres_image")
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_fake_encryption_and_dead_code_dex() {
+    let dead_dex = synthesize_dead_code_dex(&[0xff, 0xff, 0xef, 0x00], false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_enc_dead_dex.apk")
+        .with_manifest("com.example.combo.enc.dex")
+        .with_dex("classes.dex", &dead_dex)
+        .with_fake_encryption(true, false)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+
+    let (dex_resp, dex_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap(), "--disasm"]);
+    assert!(dex_out.status.success());
+    assert!(dex_resp.success);
+}
+
+#[test]
+fn test_tier3_combo_fake_encryption_and_padded_arsc_header() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, false, false);
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_enc_padded_arsc.apk")
+        .with_manifest("com.example.combo.enc.arsc")
+        .with_arsc(&arsc_bytes)
+        .with_fake_encryption(false, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_andresguard_and_mutf8_null_surrogates() {
+    let mut mutf8_str = b"class_".to_vec();
+    mutf8_str.extend_from_slice(mutf8_two_byte_null());
+    let dex_bytes = synthesize_mutf8_dex(&[&mutf8_str]);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_andres_mutf8.apk")
+        .with_manifest("com.example.combo.andres.mutf8")
+        .with_file("r/d/icon.png", b"icon_data")
+        .with_dex("classes.dex", &dex_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_padded_arsc_and_dead_code_dex_and_ansi_manifest() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, false, false);
+    let dead_dex = synthesize_dead_code_dex(&[0xff, 0xff], false);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_padded_dead_ansi.apk")
+        .with_manifest(adversarial_ansi_string())
+        .with_arsc(&arsc_bytes)
+        .with_dex("classes.dex", &dead_dex)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let raw_out = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw_out.contains("\x1b[31;1m"));
+
+    let (dex_resp, dex_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap(), "--disasm"]);
+    assert!(dex_out.status.success());
+    assert!(dex_resp.success);
+}
+
+#[test]
+fn test_tier3_combo_path_traversal_and_fake_encryption_and_zalgo() {
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("combo_dump");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_traversal_enc_zalgo.apk")
+        .with_manifest(adversarial_zalgo_string())
+        .with_path_traversal_entry("../../bad.txt", b"traversal")
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--dump", dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_utf16le_unpaired_surrogates_and_dead_code_dex() {
+    let dead_dex = synthesize_dead_code_dex(&[0xff, 0xef], false);
+    let arsc_bytes = synthesize_utf16_surrogate_arsc_bytes();
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_utf16_dead_dex.apk")
+        .with_manifest("com.example.combo.utf16.dex")
+        .with_arsc(&arsc_bytes)
+        .with_dex("classes.dex", &dead_dex)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+
+    let (dex_resp, dex_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap(), "--disasm"]);
+    assert!(dex_out.status.success());
+    assert!(dex_resp.success);
+}
+
+#[test]
+fn test_tier3_combo_andresguard_and_padded_arsc_and_bidi_manifest() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, false, false);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_andres_padded_bidi.apk")
+        .with_manifest(adversarial_bidi_string())
+        .with_file("r/d/a.png", b"png_data")
+        .with_arsc(&arsc_bytes)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw.contains('\u{202E}'));
+}
+
+#[test]
+fn test_tier3_combo_corrupted_debug_info_and_fake_encryption_and_ansi() {
+    let corrupt_dex = synthesize_dead_code_dex(&[0x0e, 0x00], true);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_debug_enc_ansi.apk")
+        .with_manifest(adversarial_ansi_string())
+        .with_dex("classes.dex", &corrupt_dex)
+        .with_fake_encryption(true, false)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw.contains("\x1b[31;1m"), "ANSI escape sequence must be sanitized");
+
+    let (dex_resp, dex_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap(), "--disasm"]);
+    assert!(dex_out.status.success());
+    assert!(dex_resp.success);
+}
+
+#[test]
+fn test_tier3_combo_7zip_deflate_and_fake_encryption_and_andresguard() {
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_7zip_enc_andres.apk")
+        .with_manifest("com.example.combo.sevenzip")
+        .with_file("r/a/a.xml", b"<view/>")
+        .with_fake_encryption(false, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_path_traversal_and_andresguard_r_paths() {
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("dump_andres_traversal");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_traversal_andres.apk")
+        .with_manifest("com.example.combo.trav.andres")
+        .with_file("r/d/icon.png", b"icon")
+        .with_path_traversal_entry("r/../../../tmp/bad_escape.txt", b"escape")
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--dump", dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    assert!(dump_dir.join("r/d/icon.png").is_file());
+}
+
+#[test]
+fn test_tier3_combo_mutf8_surrogates_and_utf16_surrogates_and_fake_enc() {
+    let surrogate_bytes = mutf8_surrogate_pair();
+    let dex_bytes = synthesize_mutf8_dex(&[surrogate_bytes]);
+    let arsc_bytes = synthesize_utf16_surrogate_arsc_bytes();
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_surrogates_enc.apk")
+        .with_manifest("com.example.combo.surrogates")
+        .with_dex("classes.dex", &dex_bytes)
+        .with_arsc(&arsc_bytes)
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+
+    let (res_resp, res_out) = run_rvs_json::<ResourcesData>(&["apk", "resources", apk_path.to_str().unwrap(), "--list"]);
+    assert!(res_out.status.success());
+    assert!(res_resp.success);
+}
+
+#[test]
+fn test_tier3_combo_padded_arsc_and_unknown_chunks_and_fake_encryption() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, true, false);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_padded_unknown_enc.apk")
+        .with_manifest("com.example.combo.pad.unk.enc")
+        .with_arsc(&arsc_bytes)
+        .with_fake_encryption(true, false)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_dead_code_after_goto_and_return_and_corrupt_debug() {
+    let dead_dex = synthesize_dead_code_dex(&[0x28, 0x00, 0xff, 0xff], true);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_goto_ret_debug.apk")
+        .with_manifest("com.example.combo.goto.ret")
+        .with_dex("classes.dex", &dead_dex)
+        .build();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap(), "--disasm"]);
+    assert!(out.status.success());
+    assert!(resp.success);
+}
+
+#[test]
+fn test_tier3_combo_bidi_manifest_and_zalgo_and_ansi_csi_osc() {
+    let complex_adversarial = format!(
+        "{}{}{}",
+        adversarial_ansi_string(),
+        adversarial_bidi_string(),
+        adversarial_zalgo_string()
+    );
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_super_adversarial.apk")
+        .with_manifest(&complex_adversarial)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw.contains("\x1b[31;1m"));
+    assert!(!raw.contains('\u{202E}'));
+}
+
+#[test]
+fn test_tier3_combo_multidex_dead_code_and_fake_encryption_and_andresguard() {
+    let dead_dex1 = synthesize_dead_code_dex(&[0xff, 0xff], false);
+    let dead_dex2 = synthesize_dead_code_dex(&[0xef, 0x00], false);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("combo_multidex_enc_andres.apk")
+        .with_manifest("com.example.combo.multidex")
+        .with_dex("classes.dex", &dead_dex1)
+        .with_dex("classes2.dex", &dead_dex2)
+        .with_file("r/d/icon.png", b"icon")
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("ApkInspectData expected");
+    assert_eq!(data.dex_files.len(), 2);
+
+    let (dex_resp, dex_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap(), "--disasm"]);
+    assert!(dex_out.status.success());
+    assert!(dex_resp.success);
+}
+
+// =============================================================================
+// Tier 4: Real-World Scenarios (5 Comprehensive Workflows)
+// =============================================================================
+
+#[test]
+fn test_tier4_e2e_anti_analysis_packer_composite() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, true, false);
+    let dead_dex = synthesize_dead_code_dex(&[0xff, 0xff, 0xef, 0x00], true);
+    let adversarial_pkg = format!("{}\x1b[31m\u{202E}app\x1b[0m", "com.packer.composite.");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("scenario1_packer_composite.apk")
+        .with_manifest(&adversarial_pkg)
+        .with_dex("classes.dex", &dead_dex)
+        .with_arsc(&arsc_bytes)
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Scenario 1 packer composite APK inspect must succeed");
+    assert!(resp.success);
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw.contains("\x1b[31m"));
+    assert!(!raw.contains('\u{202E}'));
+    let data = resp.data.expect("ApkInspectData expected");
+    assert!(!data.dex_files.is_empty());
+}
+
+#[test]
+fn test_tier4_e2e_andresguard_production_app() {
+    let arsc_bytes = synthesize_resilient_arsc_bytes(true, false, false);
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("andres_prod_dump");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("scenario2_andresguard_prod.apk")
+        .with_manifest("com.production.andresguard")
+        .with_arsc(&arsc_bytes)
+        .with_file("r/d/a.png", b"\x89PNG\r\n\x1a\nicon_data")
+        .with_file("r/l/b.xml", b"<LinearLayout/>")
+        .build();
+
+    let apk_str = apk_path.to_str().unwrap();
+
+    let (resp_dump, out_dump) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_str, "--dump", dump_dir.to_str().unwrap(),
+    ]);
+    assert!(out_dump.status.success());
+    assert!(resp_dump.success);
+    assert!(dump_dir.join("r/d/a.png").is_file());
+    assert!(dump_dir.join("r/l/b.xml").is_file());
+
+    let (resp_ext, out_ext) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_str, "--extract", "r/d/a.png",
+    ]);
+    assert!(out_ext.status.success());
+    assert!(resp_ext.success);
+}
+
+#[test]
+fn test_tier4_e2e_malicious_unicode_terminal_hijack() {
+    let attack_payload = format!(
+        "\x1b[?25l\x1b]0;HIJACK\x07\u{202E}com.attack.terminal.{}\x1b[?25h",
+        adversarial_zalgo_string()
+    );
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("scenario3_terminal_hijack.apk")
+        .with_manifest(&attack_payload)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ManifestInfoData>(&["apk", "manifest", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Scenario 3 terminal hijack attack must be safely neutralized");
+    assert!(resp.success);
+    let raw = String::from_utf8_lossy(&out.stdout);
+    assert!(!raw.contains("\x1b[?25l"));
+    assert!(!raw.contains("\x1b]0;HIJACK"));
+    assert!(!raw.contains('\u{202E}'));
+    assert!(!raw.contains('\x07'));
+}
+
+#[test]
+fn test_tier4_e2e_corrupted_dex_obfuscator() {
+    let mut null_and_surrogate = b"obf_".to_vec();
+    null_and_surrogate.extend_from_slice(mutf8_two_byte_null());
+    null_and_surrogate.extend_from_slice(mutf8_surrogate_pair());
+    null_and_surrogate.extend_from_slice(mutf8_lone_high_surrogate());
+
+    let dex1 = synthesize_mutf8_dex(&[&null_and_surrogate]);
+    let dex2 = synthesize_dead_code_dex(&[0xff, 0xff, 0xef, 0x00], true);
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("scenario4_corrupted_dex.apk")
+        .with_manifest("com.obfuscator.multidex")
+        .with_dex("classes.dex", &dex1)
+        .with_dex("classes2.dex", &dex2)
+        .build();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", apk_path.to_str().unwrap()]);
+    assert!(out.status.success(), "Scenario 4 corrupted multi-DEX must parse safely");
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert!(data.strings_count >= 1);
+}
+
+#[test]
+fn test_tier4_e2e_path_traversal_zip_slip_defensive_ejection() {
+    let temp_workspace = TempDir::new().unwrap();
+    let dump_dir = temp_workspace.path().join("scenario5_sandbox");
+    let escape_target = temp_workspace.path().join("etc/passwd");
+
+    let (_temp, apk_path) = SyntheticApkBuilder::new("scenario5_traversal_defense.apk")
+        .with_manifest("com.traversal.defense")
+        .with_file("res/values/strings.xml", b"<resources><string name=\"safe\">val</string></resources>")
+        .with_path_traversal_entry("../../etc/passwd", b"root:x:0:0::/root:/bin/bash")
+        .with_path_traversal_entry("res/../../../tmp/bad.xml", b"<bad/>")
+        .with_file("assets/CON.txt", b"con_device")
+        .with_fake_encryption(true, true)
+        .build();
+
+    let (resp, out) = run_rvs_json::<ResourcesData>(&[
+        "apk", "resources", apk_path.to_str().unwrap(), "--dump", dump_dir.to_str().unwrap(),
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    assert!(!escape_target.exists(), "Traversal entry must never escape to arbitrary paths");
+    assert!(dump_dir.join("res/values/strings.xml").is_file());
+}

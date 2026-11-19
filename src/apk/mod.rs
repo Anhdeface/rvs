@@ -9,6 +9,11 @@ pub mod dex;
 pub mod native_so;
 pub mod resources;
 pub mod signature;
+pub mod sanitize;
+
+pub use sanitize::{
+    decode_mutf8_lossy, decode_utf16le_lossy, sanitize_archive_entry_path, sanitize_identifier,
+};
 
 pub use container::{detect_elf_abi, ApkEntry, ApkPackage, ApkSource};
 pub use manifest::{decode_raw_manifest, is_binary_axml, ManifestInfo};

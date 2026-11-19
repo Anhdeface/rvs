@@ -76,7 +76,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.4.0"
+SERVER_VERSION: str = "0.4.1"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -6047,7 +6047,7 @@ class RvsHarness:
                 "command": "frida attach",
                 "target": str(f_tgt or attach_id),
                 "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "format_version": "0.4.0",
+                "format_version": "0.4.1",
                 "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                 "data": data,
                 "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6144,7 +6144,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": str(spawn_path or target_id),
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.4.0",
+                    "format_version": "0.4.1",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6173,7 +6173,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.4.0",
+                    "format_version": "0.4.1",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],

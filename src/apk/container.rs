@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use super::manifest::{is_binary_axml, ManifestInfo};
+use super::sanitize::sanitize_archive_entry_path;
 
 /// The input source representation for Android artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +50,8 @@ pub struct ApkPackage {
     pub asset_entries: Vec<ApkEntry>,
     #[serde(default)]
     pub resource_entries: Vec<ApkEntry>,
+    #[serde(skip)]
+    pub normalized_archive_data: Option<Vec<u8>>,
 }
 
 impl ApkPackage {
@@ -111,38 +114,65 @@ impl ApkPackage {
 
     /// Read raw bytes of an entry by name.
     pub fn read_entry(&self, entry_name: &str) -> Result<Vec<u8>, AppError> {
+        let rel = Path::new(entry_name);
+        if rel.is_absolute()
+            || entry_name.starts_with('/')
+            || entry_name.starts_with('\\')
+            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AppError::InvalidBinary(format!(
+                "Invalid entry path '{}'",
+                entry_name
+            )));
+        }
+
+        let sanitized_query = sanitize_archive_entry_path(entry_name);
+
         match &self.source {
             ApkSource::Archive(path) => {
-                let file = std::fs::File::open(path)?;
-                let mut archive = zip::ZipArchive::new(file).map_err(|e| {
-                    AppError::InvalidBinary(format!(
-                        "Failed to read APK archive '{}': {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
-
-                // 1. Exact match
-                if let Ok(mut zip_file) = archive.by_name(entry_name) {
-                    let mut buf = Vec::with_capacity(zip_file.size() as usize);
-                    zip_file.read_to_end(&mut buf)?;
-                    return Ok(buf);
-                }
-
-                // 2. Suffix / normalized match
-                let normalized = entry_name.replace('\\', "/");
-                let target_suffix = format!("/{}", normalized.trim_start_matches('/'));
-
-                for i in 0..archive.len() {
-                    if let Ok(mut zip_file) = archive.by_index(i) {
-                        let name = zip_file.name();
-                        if name == normalized
-                            || name.ends_with(&target_suffix)
-                            || name.ends_with(entry_name)
-                        {
-                            let mut buf = Vec::with_capacity(zip_file.size() as usize);
-                            zip_file.read_to_end(&mut buf)?;
-                            return Ok(buf);
+                if let Some(normalized) = &self.normalized_archive_data {
+                    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(normalized.as_slice())).map_err(|e| {
+                        AppError::InvalidBinary(format!("Failed to read APK archive '{}': {}", path.display(), e))
+                    })?;
+                    if let Some(buf) = Self::read_from_archive_inner(&mut archive, entry_name, &sanitized_query)? {
+                        return Ok(buf);
+                    }
+                } else {
+                    let file = std::fs::File::open(path)?;
+                    match zip::ZipArchive::new(file) {
+                        Ok(mut archive) => {
+                            match Self::read_from_archive_inner(&mut archive, entry_name, &sanitized_query) {
+                                Ok(Some(buf)) => return Ok(buf),
+                                Ok(None) => {}
+                                Err(AppError::InvalidBinary(ref msg)) if is_password_or_unsupported_error(msg) => {
+                                    let raw = std::fs::read(path)?;
+                                    let norm = normalize_zip_encryption_flags(&raw);
+                                    let mut norm_archive = zip::ZipArchive::new(std::io::Cursor::new(norm)).map_err(|err| {
+                                        AppError::InvalidBinary(format!("Failed to read normalized archive: {}", err))
+                                    })?;
+                                    if let Some(buf) = Self::read_from_archive_inner(&mut norm_archive, entry_name, &sanitized_query)? {
+                                        return Ok(buf);
+                                    }
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Err(zip::result::ZipError::UnsupportedArchive(_)) => {
+                            let raw = std::fs::read(path)?;
+                            let norm = normalize_zip_encryption_flags(&raw);
+                            let mut norm_archive = zip::ZipArchive::new(std::io::Cursor::new(norm)).map_err(|err| {
+                                AppError::InvalidBinary(format!("Failed to read normalized archive: {}", err))
+                            })?;
+                            if let Some(buf) = Self::read_from_archive_inner(&mut norm_archive, entry_name, &sanitized_query)? {
+                                return Ok(buf);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(AppError::InvalidBinary(format!(
+                                "Failed to read APK archive '{}': {}",
+                                path.display(),
+                                e
+                            )));
                         }
                     }
                 }
@@ -154,18 +184,6 @@ impl ApkPackage {
                 )))
             }
             ApkSource::Directory(base_dir) => {
-                let rel = Path::new(entry_name);
-                if rel.is_absolute()
-                    || entry_name.starts_with('/')
-                    || entry_name.starts_with('\\')
-                    || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return Err(AppError::InvalidBinary(format!(
-                        "Invalid entry path '{}'",
-                        entry_name
-                    )));
-                }
-
                 // 1. Direct path join
                 let direct_path = base_dir.join(rel);
                 let canonical_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
@@ -187,9 +205,24 @@ impl ApkPackage {
                     return Ok(std::fs::read(&direct_path)?);
                 }
 
+                if !sanitized_query.is_empty() && sanitized_query != entry_name {
+                    let sanitized_path = base_dir.join(&sanitized_query);
+                    if let Ok(canon_sanitized) = sanitized_path.canonicalize() {
+                        if canon_sanitized.starts_with(&canonical_base) && sanitized_path.is_file() {
+                            return Ok(std::fs::read(&sanitized_path)?);
+                        }
+                    } else if sanitized_path.starts_with(base_dir) && sanitized_path.is_file() {
+                        return Ok(std::fs::read(&sanitized_path)?);
+                    }
+                }
+
                 // 2. Search in dex_entries
                 for entry in &self.dex_entries {
-                    if entry.name == entry_name || entry.name.ends_with(entry_name) {
+                    if entry.name == entry_name
+                        || entry.name == sanitized_query
+                        || entry.name.ends_with(entry_name)
+                        || (!sanitized_query.is_empty() && entry.name.ends_with(&sanitized_query))
+                    {
                         if let Some(p) = &entry.path {
                             if p.is_file() {
                                 return Ok(std::fs::read(p)?);
@@ -201,7 +234,11 @@ impl ApkPackage {
                 // 3. Search in native_libraries
                 for entries in self.native_libraries.values() {
                     for entry in entries {
-                        if entry.name == entry_name || entry.name.ends_with(entry_name) {
+                        if entry.name == entry_name
+                            || entry.name == sanitized_query
+                            || entry.name.ends_with(entry_name)
+                            || (!sanitized_query.is_empty() && entry.name.ends_with(&sanitized_query))
+                        {
                             if let Some(p) = &entry.path {
                                 if p.is_file() {
                                     return Ok(std::fs::read(p)?);
@@ -213,7 +250,11 @@ impl ApkPackage {
 
                 // 4. Search in asset_entries
                 for entry in &self.asset_entries {
-                    if entry.name == entry_name || entry.name.ends_with(entry_name) {
+                    if entry.name == entry_name
+                        || entry.name == sanitized_query
+                        || entry.name.ends_with(entry_name)
+                        || (!sanitized_query.is_empty() && entry.name.ends_with(&sanitized_query))
+                    {
                         if let Some(p) = &entry.path {
                             if p.is_file() {
                                 return Ok(std::fs::read(p)?);
@@ -224,7 +265,11 @@ impl ApkPackage {
 
                 // 5. Search in resource_entries
                 for entry in &self.resource_entries {
-                    if entry.name == entry_name || entry.name.ends_with(entry_name) {
+                    if entry.name == entry_name
+                        || entry.name == sanitized_query
+                        || entry.name.ends_with(entry_name)
+                        || (!sanitized_query.is_empty() && entry.name.ends_with(&sanitized_query))
+                    {
                         if let Some(p) = &entry.path {
                             if p.is_file() {
                                 return Ok(std::fs::read(p)?);
@@ -233,8 +278,8 @@ impl ApkPackage {
                     }
                 }
 
-                // 5. Manifest special case
-                if entry_name == "AndroidManifest.xml" {
+                // Manifest special case
+                if entry_name == "AndroidManifest.xml" || sanitized_query == "AndroidManifest.xml" {
                     if let Some(data) = &self.manifest_data {
                         return Ok(data.clone());
                     }
@@ -254,14 +299,15 @@ impl ApkPackage {
 
                 if entry_name.is_empty()
                     || entry_name == fname
+                    || (!sanitized_query.is_empty() && sanitized_query == fname)
                     || entry_name == path.to_string_lossy()
-                    || self.dex_entries.iter().any(|e| e.name == entry_name)
+                    || self.dex_entries.iter().any(|e| e.name == entry_name || (!sanitized_query.is_empty() && e.name == sanitized_query))
                     || self
                         .native_libraries
                         .values()
                         .flatten()
-                        .any(|e| e.name == entry_name)
-                    || self.asset_entries.iter().any(|e| e.name == entry_name)
+                        .any(|e| e.name == entry_name || (!sanitized_query.is_empty() && e.name == sanitized_query))
+                    || self.asset_entries.iter().any(|e| e.name == entry_name || (!sanitized_query.is_empty() && e.name == sanitized_query))
                 {
                     if path.is_file() {
                         Ok(std::fs::read(path)?)
@@ -557,18 +603,167 @@ impl ApkPackage {
         detections
     }
 
+    /// Return slice of all discovered resource entries (including `res/` and AndResGuard `r/`).
+    pub fn resource_entries(&self) -> &[ApkEntry] {
+        &self.resource_entries
+    }
+
+    /// Safely extracts all package contents to a destination directory,
+    /// protecting against Zip Slip path traversal and Windows reserved device names.
+    pub fn extract_to<P: AsRef<Path>>(&self, destination: P) -> Result<(), AppError> {
+        let dest = destination.as_ref();
+        std::fs::create_dir_all(dest)?;
+        let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+
+        match &self.source {
+            ApkSource::Archive(path) => {
+                if let Some(normalized) = &self.normalized_archive_data {
+                    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(normalized.as_slice())).map_err(|e| {
+                        AppError::InvalidBinary(format!("Failed to read APK archive '{}': {}", path.display(), e))
+                    })?;
+                    Self::extract_from_archive_inner(&mut archive, dest, &canonical_dest)?;
+                } else {
+                    let file = std::fs::File::open(path)?;
+                    match zip::ZipArchive::new(file) {
+                        Ok(mut archive) => {
+                            match Self::extract_from_archive_inner(&mut archive, dest, &canonical_dest) {
+                                Ok(()) => return Ok(()),
+                                Err(AppError::InvalidBinary(ref msg)) if is_password_or_unsupported_error(msg) => {
+                                    let raw = std::fs::read(path)?;
+                                    let norm = normalize_zip_encryption_flags(&raw);
+                                    let mut norm_archive = zip::ZipArchive::new(std::io::Cursor::new(norm)).map_err(|err| {
+                                        AppError::InvalidBinary(format!("Failed to read normalized archive: {}", err))
+                                    })?;
+                                    Self::extract_from_archive_inner(&mut norm_archive, dest, &canonical_dest)?;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Err(zip::result::ZipError::UnsupportedArchive(_)) => {
+                            let raw = std::fs::read(path)?;
+                            let norm = normalize_zip_encryption_flags(&raw);
+                            let mut norm_archive = zip::ZipArchive::new(std::io::Cursor::new(norm)).map_err(|err| {
+                                AppError::InvalidBinary(format!("Failed to read normalized archive: {}", err))
+                            })?;
+                            Self::extract_from_archive_inner(&mut norm_archive, dest, &canonical_dest)?;
+                        }
+                        Err(e) => {
+                            return Err(AppError::InvalidBinary(format!(
+                                "Failed to open APK archive '{}': {}",
+                                path.display(),
+                                e
+                            )));
+                        }
+                    }
+                }
+            }
+            ApkSource::Directory(base_dir) => {
+                let mut all_files = Vec::new();
+                collect_files_recursive(base_dir, &mut all_files)?;
+
+                for file_path in all_files {
+                    let rel = file_path
+                        .strip_prefix(base_dir)
+                        .unwrap_or(&file_path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let sanitized = sanitize_archive_entry_path(&rel);
+                    if sanitized.is_empty() {
+                        continue;
+                    }
+
+                    let target_path = dest.join(&sanitized);
+                    if !is_path_safe_descendant(&target_path, dest, &canonical_dest) {
+                        continue;
+                    }
+
+                    if let Some(parent) = target_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        if let Ok(canon_parent) = parent.canonicalize() {
+                            if !canon_parent.starts_with(&canonical_dest) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Ok(meta) = std::fs::symlink_metadata(&target_path) {
+                        if meta.file_type().is_symlink() {
+                            continue;
+                        }
+                    }
+
+                    std::fs::copy(&file_path, &target_path)?;
+                }
+            }
+            ApkSource::Standalone(path) => {
+                let fname = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let sanitized = sanitize_archive_entry_path(&fname);
+                if !sanitized.is_empty() {
+                    let target_path = dest.join(&sanitized);
+                    if is_path_safe_descendant(&target_path, dest, &canonical_dest) {
+                        if let Some(parent) = target_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if let Ok(meta) = std::fs::symlink_metadata(&target_path) {
+                            if meta.file_type().is_symlink() {
+                                return Ok(());
+                            }
+                        }
+                        std::fs::copy(path, &target_path)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     // --- Internal Ingestion Methods ---
 
     fn open_archive(path: &Path) -> Result<Self, AppError> {
         let file = std::fs::File::open(path)?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
-            AppError::InvalidBinary(format!(
+        match zip::ZipArchive::new(file) {
+            Ok(archive) => {
+                match Self::open_archive_from_reader(archive, path, None) {
+                    Ok(pkg) => Ok(pkg),
+                    Err(AppError::InvalidBinary(ref msg)) if is_password_or_unsupported_error(msg) => {
+                        Self::open_archive_normalized(path)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(zip::result::ZipError::UnsupportedArchive(_)) => {
+                Self::open_archive_normalized(path)
+            }
+            Err(e) => Err(AppError::InvalidBinary(format!(
                 "Failed to open APK archive '{}': {}",
+                path.display(),
+                e
+            ))),
+        }
+    }
+
+    fn open_archive_normalized(path: &Path) -> Result<Self, AppError> {
+        let raw = std::fs::read(path)?;
+        let normalized = normalize_zip_encryption_flags(&raw);
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(normalized.clone())).map_err(|e| {
+            AppError::InvalidBinary(format!(
+                "Failed to open normalized APK archive '{}': {}",
                 path.display(),
                 e
             ))
         })?;
+        Self::open_archive_from_reader(archive, path, Some(normalized))
+    }
 
+    fn open_archive_from_reader<R: Read + Seek>(
+        mut archive: zip::ZipArchive<R>,
+        path: &Path,
+        normalized_data: Option<Vec<u8>>,
+    ) -> Result<Self, AppError> {
         let mut manifest_data = None;
         let mut is_manifest_binary = false;
         let mut dex_entries = Vec::new();
@@ -585,21 +780,30 @@ impl ApkPackage {
             })?;
 
             let name = entry.name().to_string();
+            let sanitized_name = sanitize_archive_entry_path(&name);
+            if sanitized_name.is_empty() {
+                continue;
+            }
             let size = entry.size();
 
-            if name == "AndroidManifest.xml" {
+            if sanitized_name == "AndroidManifest.xml" {
                 let mut data = Vec::with_capacity(size as usize);
-                entry.read_to_end(&mut data)?;
+                entry.read_to_end(&mut data).map_err(|e| {
+                    AppError::InvalidBinary(format!(
+                        "Failed to read AndroidManifest.xml: {}",
+                        e
+                    ))
+                })?;
                 is_manifest_binary = is_binary_axml(&data);
                 manifest_data = Some(data);
-            } else if name.ends_with(".dex") {
+            } else if sanitized_name.ends_with(".dex") {
                 dex_entries.push(ApkEntry {
-                    name,
+                    name: sanitized_name,
                     size,
                     path: None,
                 });
-            } else if name.ends_with(".so") {
-                let mut abi = extract_abi_from_path(&name);
+            } else if sanitized_name.starts_with("lib/") {
+                let mut abi = extract_abi_from_path(&sanitized_name);
                 if abi == "unknown" {
                     let mut data = Vec::with_capacity(size.min(1024) as usize);
                     if std::io::Read::by_ref(&mut entry).take(1024).read_to_end(&mut data).is_ok() {
@@ -614,19 +818,22 @@ impl ApkPackage {
                     .entry(abi)
                     .or_default()
                     .push(ApkEntry {
-                        name,
+                        name: sanitized_name,
                         size,
                         path: None,
                     });
-            } else if name.starts_with("assets/") || name.starts_with("assets\\") {
+            } else if sanitized_name.starts_with("assets/") {
                 asset_entries.push(ApkEntry {
-                    name: name.replace('\\', "/"),
+                    name: sanitized_name,
                     size,
                     path: None,
                 });
-            } else if name == "resources.arsc" || name.starts_with("res/") || name.starts_with("res\\") {
+            } else if sanitized_name == "resources.arsc"
+                || sanitized_name.starts_with("res/")
+                || sanitized_name.starts_with("r/")
+            {
                 resource_entries.push(ApkEntry {
-                    name: name.replace('\\', "/"),
+                    name: sanitized_name,
                     size,
                     path: None,
                 });
@@ -648,6 +855,7 @@ impl ApkPackage {
             native_libraries,
             asset_entries,
             resource_entries,
+            normalized_archive_data: normalized_data,
         })
     }
 
@@ -687,6 +895,10 @@ impl ApkPackage {
                 .unwrap_or(file_path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            let sanitized_rel = sanitize_archive_entry_path(&rel);
+            if sanitized_rel.is_empty() {
+                continue;
+            }
 
             let ext = file_path
                 .extension()
@@ -694,14 +906,14 @@ impl ApkPackage {
                 .unwrap_or("")
                 .to_ascii_lowercase();
 
-            if ext == "dex" {
+            if sanitized_rel.ends_with(".dex") || ext == "dex" {
                 dex_entries.push(ApkEntry {
-                    name: rel,
+                    name: sanitized_rel,
                     size,
                     path: Some(file_path.clone()),
                 });
-            } else if ext == "so" {
-                let mut abi = extract_abi_from_path(&rel);
+            } else if sanitized_rel.starts_with("lib/") {
+                let mut abi = extract_abi_from_path(&sanitized_rel);
                 if abi == "unknown" {
                     if let Some(detected) = detect_elf_abi_from_file(file_path) {
                         abi = detected;
@@ -711,19 +923,22 @@ impl ApkPackage {
                     .entry(abi)
                     .or_default()
                     .push(ApkEntry {
-                        name: rel,
+                        name: sanitized_rel,
                         size,
                         path: Some(file_path.clone()),
                     });
-            } else if rel.starts_with("assets/") {
+            } else if sanitized_rel.starts_with("assets/") {
                 asset_entries.push(ApkEntry {
-                    name: rel,
+                    name: sanitized_rel,
                     size,
                     path: Some(file_path.clone()),
                 });
-            } else if rel == "resources.arsc" || rel.starts_with("res/") {
+            } else if sanitized_rel == "resources.arsc"
+                || sanitized_rel.starts_with("res/")
+                || sanitized_rel.starts_with("r/")
+            {
                 resource_entries.push(ApkEntry {
-                    name: rel,
+                    name: sanitized_rel,
                     size,
                     path: Some(file_path.clone()),
                 });
@@ -745,6 +960,7 @@ impl ApkPackage {
             native_libraries,
             asset_entries,
             resource_entries,
+            normalized_archive_data: None,
         })
     }
 
@@ -762,6 +978,7 @@ impl ApkPackage {
             native_libraries: HashMap::new(),
             asset_entries: Vec::new(),
             resource_entries: Vec::new(),
+            normalized_archive_data: None,
         })
     }
 
@@ -783,7 +1000,249 @@ impl ApkPackage {
             native_libraries,
             asset_entries: Vec::new(),
             resource_entries: Vec::new(),
+            normalized_archive_data: None,
         })
+    }
+
+    fn read_from_archive_inner<R: Read + Seek>(
+        archive: &mut zip::ZipArchive<R>,
+        entry_name: &str,
+        sanitized_query: &str,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        // 1. Exact match
+        if let Ok(mut zip_file) = archive.by_name(entry_name) {
+            let mut buf = Vec::with_capacity(zip_file.size() as usize);
+            zip_file.read_to_end(&mut buf)?;
+            return Ok(Some(buf));
+        }
+
+        // 2. Sanitized query match
+        if !sanitized_query.is_empty() && sanitized_query != entry_name {
+            if let Ok(mut zip_file) = archive.by_name(sanitized_query) {
+                let mut buf = Vec::with_capacity(zip_file.size() as usize);
+                zip_file.read_to_end(&mut buf)?;
+                return Ok(Some(buf));
+            }
+        }
+
+        // 3. Suffix / normalized match
+        let normalized = entry_name.replace('\\', "/");
+        let target_suffix = format!("/{}", normalized.trim_start_matches('/'));
+        let query_suffix = if !sanitized_query.is_empty() {
+            format!("/{}", sanitized_query.trim_start_matches('/'))
+        } else {
+            String::new()
+        };
+
+        for i in 0..archive.len() {
+            match archive.by_index(i) {
+                Ok(mut zip_file) => {
+                    let name = zip_file.name();
+                    let has_traversal = name.split(['/', '\\']).any(|s| s.trim() == "..");
+                    if has_traversal {
+                        continue;
+                    }
+                    let sanitized_entry = sanitize_archive_entry_path(name);
+                    if sanitized_entry.is_empty() {
+                        continue;
+                    }
+                    if name == normalized
+                        || name == entry_name
+                        || (!sanitized_query.is_empty() && (name == sanitized_query || sanitized_entry == sanitized_query))
+                        || (sanitized_entry == entry_name || sanitized_entry == normalized)
+                        || (!target_suffix.is_empty() && sanitized_entry.ends_with(&target_suffix))
+                        || (!query_suffix.is_empty() && sanitized_entry.ends_with(&query_suffix))
+                    {
+                        let mut buf = Vec::with_capacity(zip_file.size() as usize);
+                        zip_file.read_to_end(&mut buf)?;
+                        return Ok(Some(buf));
+                    }
+                }
+                Err(zip::result::ZipError::UnsupportedArchive(msg)) => {
+                    return Err(AppError::InvalidBinary(format!("Unsupported archive entry: {}", msg)));
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn extract_from_archive_inner<R: Read + Seek>(
+        archive: &mut zip::ZipArchive<R>,
+        dest: &Path,
+        canonical_dest: &Path,
+    ) -> Result<(), AppError> {
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| {
+                AppError::InvalidBinary(format!("Failed to read archive entry at index {}: {}", i, e))
+            })?;
+
+            let raw_name = entry.name().to_string();
+            let sanitized = sanitize_archive_entry_path(&raw_name);
+            if sanitized.is_empty() {
+                continue;
+            }
+
+            let target_path = dest.join(&sanitized);
+            if !is_path_safe_descendant(&target_path, dest, canonical_dest) {
+                continue;
+            }
+
+            if entry.is_dir() || sanitized.ends_with('/') {
+                std::fs::create_dir_all(&target_path)?;
+            } else {
+                if let Some(parent) = target_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                    if let Ok(canon_parent) = parent.canonicalize() {
+                        if !canon_parent.starts_with(canonical_dest) {
+                            continue;
+                        }
+                    }
+                }
+
+                // Refuse to write through symlinks
+                if let Ok(meta) = std::fs::symlink_metadata(&target_path) {
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                }
+
+                let mut outfile = std::fs::File::create(&target_path)?;
+                std::io::copy(&mut entry, &mut outfile)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Neutralizes fake encryption flags in a raw ZIP archive buffer.
+///
+/// Clears bit 0 (`0x0001`, encrypted flag) at offset +6 in Local File Headers (`PK\x03\x04`)
+/// and at offset +8 in Central Directory Headers (`PK\x01\x02`).
+/// Traverses via End of Central Directory (EOCD) to follow authoritative pointers to avoid
+/// corrupting uncompressed STORED payloads that might contain `PK\x03\x04` magic bytes.
+/// Falls back to signature scanning if EOCD is damaged or absent.
+pub fn normalize_zip_encryption_flags(data: &[u8]) -> Vec<u8> {
+    if data.len() < 22 {
+        return data.to_vec();
+    }
+
+    let mut normalized = data.to_vec();
+
+    // 1. Primary Structural Pass: EOCD-Directed Traversal
+    // EOCD record is at least 22 bytes. Max comment length is 65535, so search window is up to 65557 bytes from EOF.
+    let min_pos = data.len().saturating_sub(65557);
+    let mut eocd_found = false;
+
+    for i in (min_pos..=data.len().saturating_sub(22)).rev() {
+        if &data[i..i + 4] == b"PK\x05\x06" {
+            let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+            if i + 22 + comment_len <= data.len() {
+                let cd_count = u16::from_le_bytes([data[i + 10], data[i + 11]]) as usize;
+                let cd_size = u32::from_le_bytes([
+                    data[i + 12],
+                    data[i + 13],
+                    data[i + 14],
+                    data[i + 15],
+                ]) as usize;
+                let cd_offset = u32::from_le_bytes([
+                    data[i + 16],
+                    data[i + 17],
+                    data[i + 18],
+                    data[i + 19],
+                ]) as usize;
+
+                // Validate CD location
+                if cd_offset + cd_size <= data.len() {
+                    // Check if either cd_size == 0 or signature at cd_offset matches PK\x01\x02
+                    if cd_size == 0 || (cd_offset + 4 <= data.len() && &data[cd_offset..cd_offset + 4] == b"PK\x01\x02") {
+                        let mut cur = cd_offset;
+                        let cd_end = cd_offset + cd_size;
+                        let mut walked = 0;
+
+                        while cur + 46 <= cd_end && (cd_count == 0 || walked < cd_count || cd_count == 0xFFFF) {
+                            if &data[cur..cur + 4] != b"PK\x01\x02" {
+                                break;
+                            }
+
+                            // Clear bit 0 in Central Directory header flags (at +8)
+                            normalized[cur + 8] &= 0xFE;
+
+                            let name_len = u16::from_le_bytes([data[cur + 28], data[cur + 29]]) as usize;
+                            let extra_len = u16::from_le_bytes([data[cur + 30], data[cur + 31]]) as usize;
+                            let comment_len = u16::from_le_bytes([data[cur + 32], data[cur + 33]]) as usize;
+                            let lfh_offset = u32::from_le_bytes([
+                                data[cur + 42],
+                                data[cur + 43],
+                                data[cur + 44],
+                                data[cur + 45],
+                            ]) as usize;
+
+                            // Follow relative offset pointer directly to the authentic Local File Header (at +6)
+                            if lfh_offset + 30 <= data.len() && &data[lfh_offset..lfh_offset + 4] == b"PK\x03\x04" {
+                                normalized[lfh_offset + 6] &= 0xFE;
+                            }
+
+                            cur += 46 + name_len + extra_len + comment_len;
+                            walked += 1;
+                        }
+
+                        eocd_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Secondary Pass: Fallback Signature Scan if EOCD was not found or damaged
+    if !eocd_found {
+        let mut i = 0;
+        while i + 4 <= normalized.len() {
+            if &normalized[i..i + 4] == b"PK\x03\x04" && i + 30 <= normalized.len() {
+                normalized[i + 6] &= 0xFE;
+                i += 4;
+            } else if &normalized[i..i + 4] == b"PK\x01\x02" && i + 46 <= normalized.len() {
+                normalized[i + 8] &= 0xFE;
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    normalized
+}
+
+fn is_password_or_unsupported_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("password")
+        || lower.contains("encrypt")
+        || lower.contains("unsupported zip archive")
+        || lower.contains("unsupported archive")
+}
+
+fn is_path_safe_descendant(target: &Path, dest: &Path, canonical_dest: &Path) -> bool {
+    if let Ok(rel) = target.strip_prefix(dest) {
+        for c in rel.components() {
+            if matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            ) {
+                return false;
+            }
+        }
+        if let Ok(canon) = target.canonicalize() {
+            if !canon.starts_with(canonical_dest) {
+                return false;
+            }
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -1559,5 +2018,325 @@ mod tests {
         assert!(names.contains(&"Java"));
         assert!(!names.contains(&"React Native"), "Undelimited package name must not trigger React Native");
         assert!(!names.contains(&"Flutter / Dart"), "Undelimited package name must not trigger Flutter / Dart");
+    }
+
+    // =========================================================================
+    // Milestone 2 Container & ZIP Differential Resilience Unit Tests
+    // =========================================================================
+
+    #[test]
+    fn test_normalize_fake_encryption_lfh_bit0() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("fake_lfh.apk");
+        let content = b"uncompressed_content_inside_lfh_encrypted";
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("classes.dex", opt).unwrap();
+            zip.write_all(content).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut raw = std::fs::read(&apk_path).unwrap();
+        // Set bit 0 in LFH only
+        let mut i = 0;
+        while i + 30 <= raw.len() {
+            if &raw[i..i + 4] == b"PK\x03\x04" {
+                raw[i + 6] |= 0x01;
+                break;
+            }
+            i += 1;
+        }
+        std::fs::write(&apk_path, &raw).unwrap();
+
+        let normalized = normalize_zip_encryption_flags(&raw);
+        // Verify bit 0 is cleared
+        let mut i = 0;
+        while i + 30 <= normalized.len() {
+            if &normalized[i..i + 4] == b"PK\x03\x04" {
+                assert_eq!(normalized[i + 6] & 0x01, 0, "LFH bit 0 must be cleared");
+                break;
+            }
+            i += 1;
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open fake lfh apk");
+        let read = pkg.read_entry("classes.dex").expect("read classes.dex");
+        assert_eq!(read, content);
+    }
+
+    #[test]
+    fn test_normalize_fake_encryption_cd_bit0() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("fake_cd.apk");
+        let content = b"uncompressed_content_inside_cd_encrypted";
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("classes.dex", opt).unwrap();
+            zip.write_all(content).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut raw = std::fs::read(&apk_path).unwrap();
+        // Set bit 0 in CD only
+        let mut i = 0;
+        while i + 46 <= raw.len() {
+            if &raw[i..i + 4] == b"PK\x01\x02" {
+                raw[i + 8] |= 0x01;
+                break;
+            }
+            i += 1;
+        }
+        std::fs::write(&apk_path, &raw).unwrap();
+
+        let normalized = normalize_zip_encryption_flags(&raw);
+        // Verify bit 0 is cleared
+        let mut i = 0;
+        while i + 46 <= normalized.len() {
+            if &normalized[i..i + 4] == b"PK\x01\x02" {
+                assert_eq!(normalized[i + 8] & 0x01, 0, "CD bit 0 must be cleared");
+                break;
+            }
+            i += 1;
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open fake cd apk");
+        assert!(pkg.normalized_archive_data.is_some());
+        let read = pkg.read_entry("classes.dex").expect("read classes.dex");
+        assert_eq!(read, content);
+    }
+
+    #[test]
+    fn test_normalize_fake_encryption_both_lfh_and_cd() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("fake_both.apk");
+        let content = b"payload_both_encrypted";
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("AndroidManifest.xml", opt).unwrap();
+            zip.write_all(b"<manifest package=\"com.fake.both\" />").unwrap();
+            zip.start_file("classes.dex", opt).unwrap();
+            zip.write_all(content).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut raw = std::fs::read(&apk_path).unwrap();
+        let mut i = 0;
+        while i + 30 <= raw.len() {
+            if &raw[i..i + 4] == b"PK\x03\x04" {
+                raw[i + 6] |= 0x01;
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j + 46 <= raw.len() {
+            if &raw[j..j + 4] == b"PK\x01\x02" {
+                raw[j + 8] |= 0x01;
+            }
+            j += 1;
+        }
+        std::fs::write(&apk_path, &raw).unwrap();
+
+        let pkg = ApkPackage::open(&apk_path).expect("open fake both apk");
+        assert!(pkg.normalized_archive_data.is_some());
+        assert_eq!(pkg.dex_entries.len(), 1);
+        let read = pkg.read_entry("classes.dex").expect("read classes.dex");
+        assert_eq!(read, content);
+    }
+
+    #[test]
+    fn test_normalizer_preserves_uncompressed_stored_entries_with_magic_bytes() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("magic_payload.apk");
+        // Payload contains raw bytes of PK\x03\x04 with fake flags
+        let payload = b"HEADER_DATA_PK\x03\x04\x01\x00_TRAILER_DATA";
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("assets/magic.bin", opt).unwrap();
+            zip.write_all(payload).unwrap();
+            zip.finish().unwrap();
+        }
+        let raw = std::fs::read(&apk_path).unwrap();
+        let normalized = normalize_zip_encryption_flags(&raw);
+
+        // Decompress normalized archive and assert payload CRC and content are 100% intact
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(normalized)).expect("open normalized archive");
+        let mut entry = archive.by_name("assets/magic.bin").expect("find entry");
+        let mut decompressed = Vec::new();
+        entry.read_to_end(&mut decompressed).expect("decompress entry");
+        assert_eq!(decompressed, payload, "Payload containing PK0304 must not be corrupted");
+    }
+
+    #[test]
+    fn test_path_traversal_zip_slip_prevention() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("slip.apk");
+        let extract_dir = dir.path().join("extracted");
+        let outside_canary = dir.path().join("canary_slip.txt");
+
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("valid.txt", opt).unwrap();
+            zip.write_all(b"valid").unwrap();
+            zip.start_file("../../canary_slip.txt", opt).unwrap();
+            zip.write_all(b"escaped_payload").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open slip apk");
+        // read_entry with .. should be rejected
+        assert!(pkg.read_entry("../../canary_slip.txt").is_err());
+        assert!(pkg.read_entry("/etc/passwd").is_err());
+
+        // extract_to should safely extract without writing outside destination
+        pkg.extract_to(&extract_dir).expect("extract_to must succeed");
+        assert!(extract_dir.join("valid.txt").is_file());
+        assert!(!outside_canary.exists(), "Zip slip entry must never escape extract directory");
+    }
+
+    #[test]
+    fn test_windows_reserved_device_names_neutralization() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("reserved.apk");
+        let extract_dir = dir.path().join("extracted_res");
+
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("assets/CON.txt", opt).unwrap();
+            zip.write_all(b"con_data").unwrap();
+            zip.start_file("assets/PRN.xml", opt).unwrap();
+            zip.write_all(b"prn_data").unwrap();
+            zip.start_file("assets/AUX.json", opt).unwrap();
+            zip.write_all(b"aux_data").unwrap();
+            zip.start_file("assets/NUL.bin", opt).unwrap();
+            zip.write_all(b"nul_data").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open reserved apk");
+        assert!(pkg.asset_entries.iter().any(|e| e.name == "assets/_CON.txt" || e.name == "assets/CON.txt"));
+        assert_eq!(pkg.read_entry("assets/CON.txt").unwrap(), b"con_data");
+        assert_eq!(pkg.read_entry("assets/_CON.txt").unwrap(), b"con_data");
+
+        pkg.extract_to(&extract_dir).expect("extract_to reserved");
+        let con_exists = extract_dir.join("assets/_CON.txt").is_file() || extract_dir.join("assets/CON.txt").is_file();
+        assert!(con_exists, "Reserved device name CON must be safely extracted");
+    }
+
+    #[test]
+    fn test_andresguard_r_directory_resource_discovery_and_extraction() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("andres.apk");
+        let extract_dir = dir.path().join("extracted_andres");
+
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("r/d/a.png", opt).unwrap();
+            zip.write_all(b"png_icon_data").unwrap();
+            zip.start_file("r/l/b.xml", opt).unwrap();
+            zip.write_all(b"<layout/>").unwrap();
+            zip.start_file("res/values/strings.xml", opt).unwrap();
+            zip.write_all(b"<resources/>").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open andres apk");
+        let res_entries = pkg.resource_entries();
+        assert!(res_entries.iter().any(|e| e.name == "r/d/a.png"), "r/d/a.png must be discovered");
+        assert!(res_entries.iter().any(|e| e.name == "r/l/b.xml"), "r/l/b.xml must be discovered");
+        assert!(res_entries.iter().any(|e| e.name == "res/values/strings.xml"), "whitelisted res/ entry must be discovered");
+
+        let png = pkg.read_entry("r/d/a.png").expect("read r/d/a.png");
+        assert_eq!(png, b"png_icon_data");
+
+        pkg.extract_to(&extract_dir).expect("extract_to");
+        assert!(extract_dir.join("r/d/a.png").is_file());
+        assert!(extract_dir.join("r/l/b.xml").is_file());
+        assert!(extract_dir.join("res/values/strings.xml").is_file());
+    }
+
+    #[test]
+    fn test_seven_zip_max_deflate_compatibility() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("sevenzip.apk");
+        let payload = vec![0x42u8; 10000]; // repetitive data compresses well with max deflate
+
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("assets/large.bin", opt).unwrap();
+            zip.write_all(&payload).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open sevenzip apk");
+        let read = pkg.read_entry("assets/large.bin").expect("read large.bin");
+        assert_eq!(read, payload);
+    }
+
+    #[test]
+    fn test_path_traversal_categorization_and_suffix_matching() {
+        let dir = tempdir().unwrap();
+        let apk_path = dir.path().join("traversal_categorization.apk");
+
+        {
+            let file = std::fs::File::create(&apk_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+            zip.start_file("AndroidManifest.xml", opt).unwrap();
+            zip.write_all(b"<manifest package=\"com.test.traversal\" />").unwrap();
+
+            zip.start_file("classes.dex", opt).unwrap();
+            zip.write_all(b"dex\n035\0valid_dex").unwrap();
+
+            zip.start_file("res/values/strings.xml", opt).unwrap();
+            zip.write_all(b"<resources><string name=\"app\">Safe</string></resources>").unwrap();
+
+            // Adversarial traversal entries that attempt to mimic category prefixes
+            zip.start_file("res/../../../tmp/canary_res.txt", opt).unwrap();
+            zip.write_all(b"evil_res").unwrap();
+
+            zip.start_file("assets/../../../tmp/canary_asset.txt", opt).unwrap();
+            zip.write_all(b"evil_asset").unwrap();
+
+            zip.start_file("lib/../../../tmp/canary_lib.so", opt).unwrap();
+            zip.write_all(b"evil_lib").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let pkg = ApkPackage::open(&apk_path).expect("open synthetic traversal apk");
+
+        // 1. Resource entries must only contain the legitimate resource, not the escaped traversal entry
+        let res_entries = pkg.resource_entries();
+        assert_eq!(res_entries.len(), 1, "Only legitimate res/values/strings.xml should be in resource_entries");
+        assert_eq!(res_entries[0].name, "res/values/strings.xml");
+
+        // 2. Asset entries must be empty because assets/../../../tmp/... sanitized path is outside assets/
+        assert!(pkg.asset_entries.is_empty(), "Escaped asset traversal must not be in asset_entries");
+
+        // 3. Native libraries must be empty because lib/../../../tmp/... sanitized path is outside lib/
+        assert!(pkg.native_libraries.is_empty(), "Escaped lib traversal must not be in native_libraries");
+
+        // 4. Dex entries must contain only classes.dex
+        assert_eq!(pkg.dex_entries.len(), 1);
+        assert_eq!(pkg.dex_entries[0].name, "classes.dex");
+
+        // 5. Suffix matching in read_entry must not match traversal paths
+        assert!(matches!(pkg.read_entry("canary_res.txt"), Err(AppError::FileNotFound(_))));
+        assert!(matches!(pkg.read_entry("canary_asset.txt"), Err(AppError::FileNotFound(_))));
+        assert!(matches!(pkg.read_entry("canary_lib.so"), Err(AppError::FileNotFound(_))));
     }
 }
