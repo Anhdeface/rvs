@@ -2747,3 +2747,435 @@ fn test_tier4_e2e_path_traversal_zip_slip_defensive_ejection() {
     assert!(!escape_target.exists(), "Traversal entry must never escape to arbitrary paths");
     assert!(dump_dir.join("res/values/strings.xml").is_file());
 }
+
+// =============================================================================
+// Feature: Java & Apktool Discovery, Autonomous Unpack, and Smali Ingestion
+// =============================================================================
+
+#[test]
+fn test_tier1_java_environment_detection() {
+    // Java detection
+    if let Some(java_bin) = rvs::apk::java::JavaEnvironment::find_java() {
+        assert!(java_bin.exists(), "Java binary must exist if found");
+        let version_opt = rvs::apk::java::JavaEnvironment::get_java_version(Some(&java_bin));
+        assert!(version_opt.is_some(), "Should be able to parse java -version output");
+        let version = version_opt.unwrap();
+        assert!(
+            rvs::apk::java::JavaEnvironment::check_java_version_supported(&version),
+            "Host Java version '{}' should be supported (>= 8)",
+            version
+        );
+    }
+
+    // Apktool detection
+    if let Some(runner) = rvs::apk::java::JavaEnvironment::find_apktool() {
+        assert!(
+            runner.executable_path().exists(),
+            "Apktool runner executable must exist"
+        );
+    }
+}
+
+#[test]
+fn test_tier1_cli_apk_unpack_pure_rust_fallback() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let dest_dir = temp_dir.path().join("out_rust_unpack");
+    let dest_str = dest_dir.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<ApkUnpackData>(&[
+        "apk", "unpack", apk_str, "-o", dest_str, "--no-java", "--force",
+    ]);
+
+    assert!(out.status.success(), "rvs apk unpack --no-java should succeed");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkUnpackData expected");
+    assert_eq!(data.engine, "rust-native");
+    assert!(data.manifest_extracted, "Manifest must be extracted in pure-Rust mode");
+    assert!(data.resources_extracted, "Resources must be extracted in pure-Rust mode");
+    assert!(data.smali_generated, "Smali must be generated in pure-Rust mode");
+    assert!(data.file_count > 0);
+
+    // Verify disk contents
+    let manifest_file = dest_dir.join("AndroidManifest.xml");
+    assert!(manifest_file.is_file(), "AndroidManifest.xml must exist on disk");
+    let manifest_content = std::fs::read_to_string(&manifest_file).unwrap();
+    assert!(manifest_content.contains("<manifest"), "Manifest should be valid decoded XML text");
+
+    let strings_file = dest_dir.join("res/values/strings.xml");
+    assert!(strings_file.is_file(), "res/values/strings.xml must exist on disk");
+    let strings_content = std::fs::read_to_string(&strings_file).unwrap();
+    assert!(strings_content.contains("<resources>"), "strings.xml should have <resources> root");
+    assert!(strings_content.contains("</resources>"));
+
+    let smali_dir = dest_dir.join("smali");
+    assert!(smali_dir.is_dir(), "smali directory must exist on disk");
+    let mut smali_files = Vec::new();
+    fn collect_smali(p: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_smali(&path, out);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("smali") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    collect_smali(&smali_dir, &mut smali_files);
+    assert!(!smali_files.is_empty(), "Smali files should have been generated");
+
+    // Verify native library
+    let so_file = dest_dir.join("lib/arm64-v8a/libnative.so");
+    assert!(so_file.is_file(), "Native library libnative.so must be extracted");
+
+    // Verify asset
+    let asset_file = dest_dir.join("assets/app_config.json");
+    assert!(asset_file.is_file(), "Asset app_config.json must be extracted");
+}
+
+#[test]
+fn test_tier1_cli_apk_unpack_java_accelerated() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let dest_dir = temp_dir.path().join("out_java_unpack");
+    let dest_str = dest_dir.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<ApkUnpackData>(&[
+        "apk", "unpack", apk_str, "-o", dest_str, "--force",
+    ]);
+
+    assert!(out.status.success(), "rvs apk unpack should succeed");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkUnpackData expected");
+
+    // If host has Java + apktool, engine should be java-apktool; otherwise fallback to rust-native
+    if rvs::apk::java::JavaEnvironment::find_apktool().is_some() {
+        assert_eq!(data.engine, "java-apktool");
+    }
+    assert!(data.manifest_extracted);
+    assert!(data.resources_extracted);
+    assert!(data.smali_generated);
+    assert!(dest_dir.join("AndroidManifest.xml").is_file());
+    assert!(dest_dir.join("smali").is_dir());
+}
+
+#[test]
+fn test_tier1_cli_apk_inspect_and_dex_on_smali_only_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    let smali_sub = root.join("smali").join("com").join("example").join("testapp");
+    std::fs::create_dir_all(&smali_sub).unwrap();
+
+    let smali_src = r#".class public Lcom/example/testapp/MyActivity;
+.super Landroid/app/Activity;
+
+# fields
+.field public static final TAG:Ljava/lang/String; = "MyActivity"
+
+# methods
+.method public onCreate(Landroid/os/Bundle;)V
+    .registers 2
+    return-void
+.end method
+
+.method public customHandler(Ljava/lang/String;)I
+    .registers 3
+    const/4 v0, 0x1
+    return v0
+.end method
+"#;
+    std::fs::write(smali_sub.join("MyActivity.smali"), smali_src).unwrap();
+
+    // AndroidManifest.xml
+    let manifest_src = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.testapp"
+    android:versionCode="10"
+    android:versionName="1.0.0">
+    <application android:debuggable="true">
+        <activity android:name=".MyActivity" />
+    </application>
+</manifest>"#;
+    std::fs::write(root.join("AndroidManifest.xml"), manifest_src).unwrap();
+
+    let root_str = root.to_str().unwrap();
+
+    // 1. Test rvs apk inspect on the smali-only unpacked directory
+    let (insp_resp, insp_out) = run_rvs_json::<ApkInspectData>(&["apk", "inspect", root_str]);
+    assert!(insp_out.status.success(), "Inspect should succeed on smali-only directory");
+    assert!(insp_resp.success);
+    let insp_data = insp_resp.data.expect("ApkInspectData expected");
+    assert_eq!(insp_data.source_type, "directory");
+    assert_eq!(insp_data.package_name.as_deref(), Some("com.example.testapp"));
+    assert_eq!(insp_data.dex_files, vec!["smali"]);
+
+    let java_detection = insp_data.languages.iter().find(|l| l.language == "Java");
+    assert!(java_detection.is_some(), "Java must be detected when smali/ is present");
+    let java_detection = java_detection.unwrap();
+    assert_eq!(java_detection.confidence, "High");
+    assert!(
+        java_detection.evidence.iter().any(|e| e.contains("Smali")),
+        "Java evidence should cite Smali assembly"
+    );
+
+    // 2. Test rvs apk dex on the smali-only unpacked directory
+    let (dex_resp, dex_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", root_str]);
+    assert!(dex_out.status.success(), "Dex command should succeed on smali-only directory");
+    assert!(dex_resp.success);
+    let dex_data = dex_resp.data.expect("DexAnalysisData expected");
+    assert_eq!(dex_data.classes_count, 1);
+    assert_eq!(dex_data.methods_count, 2);
+    assert_eq!(dex_data.classes[0].name, "Lcom/example/testapp/MyActivity;");
+    assert_eq!(dex_data.classes[0].super_class.as_deref(), Some("Landroid/app/Activity;"));
+
+    // 3. Test filtering with --class and --method
+    let (f_resp, f_out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", root_str, "--class", "MyActivity", "--method", "customHandler",
+    ]);
+    assert!(f_out.status.success());
+    let f_data = f_resp.data.expect("Filtered DexAnalysisData expected");
+    assert_eq!(f_data.classes_count, 1);
+    assert_eq!(f_data.classes[0].methods.len(), 1);
+    assert_eq!(f_data.classes[0].methods[0].name, "customHandler");
+
+    // 4. Test --smali output on smali-only directory
+    let (s_resp, s_out) = run_rvs_json::<DexAnalysisData>(&["apk", "dex", root_str, "--smali"]);
+    assert!(s_out.status.success());
+    let s_data = s_resp.data.expect("Smali output expected");
+    assert!(s_data.smali.is_some());
+    assert!(s_data.smali.unwrap().contains(".class public Lcom/example/testapp/MyActivity;"));
+}
+
+#[test]
+fn test_tier2_apk_unpack_existing_dir_without_force_fails() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let dest_dir = temp_dir.path().join("non_empty_dir");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    std::fs::write(dest_dir.join("existing_file.txt"), b"already exists").unwrap();
+
+    let dest_str = dest_dir.to_str().unwrap();
+
+    // Without --force, unpacking to a non-empty directory must fail cleanly with structured error
+    let (resp, out) = run_rvs_json::<serde_json::Value>(&[
+        "apk", "unpack", apk_str, "-o", dest_str, "--no-java",
+    ]);
+    assert!(!out.status.success(), "Unpack without --force to non-empty dir must fail");
+    assert!(!resp.success);
+    let err = resp.error.expect("Error expected");
+    assert!(err.message.contains("--force"));
+
+    // With --force, unpacking must succeed
+    let (f_resp, f_out) = run_rvs_json::<ApkUnpackData>(&[
+        "apk", "unpack", apk_str, "-o", dest_str, "--no-java", "--force",
+    ]);
+    assert!(f_out.status.success(), "Unpack with --force must succeed");
+    assert!(f_resp.success);
+    assert!(dest_dir.join("AndroidManifest.xml").is_file());
+}
+
+#[test]
+fn test_tier2_java_version_parsing_adversarial_matrix() {
+    use rvs::apk::JavaEnvironment;
+
+    // Modern GA releases with '+' build indicator
+    assert!(JavaEnvironment::check_java_version_supported("21+35"));
+    assert!(JavaEnvironment::check_java_version_supported("17+35-2724"));
+    assert!(JavaEnvironment::check_java_version_supported("11+28"));
+
+    // Legacy update indicator notation 'u' / 'U'
+    assert!(JavaEnvironment::check_java_version_supported("8u382-b05"));
+    assert!(JavaEnvironment::check_java_version_supported("8U123"));
+    assert!(JavaEnvironment::check_java_version_supported("8u401"));
+
+    // 'v' prefix variants
+    assert!(JavaEnvironment::check_java_version_supported("v21+35"));
+    assert!(JavaEnvironment::check_java_version_supported("v17.0.2"));
+    assert!(JavaEnvironment::check_java_version_supported("v8u382-b05"));
+
+    // Standard semver & legacy formats
+    assert!(JavaEnvironment::check_java_version_supported("21.0.13"));
+    assert!(JavaEnvironment::check_java_version_supported("17.0.2"));
+    assert!(JavaEnvironment::check_java_version_supported("11.0.11"));
+    assert!(JavaEnvironment::check_java_version_supported("1.8.0_312"));
+    assert!(JavaEnvironment::check_java_version_supported("1.8"));
+
+    // Unsupported versions (< 8) and malformed inputs
+    assert!(!JavaEnvironment::check_java_version_supported("1.7.0_80"));
+    assert!(!JavaEnvironment::check_java_version_supported("1.6.0_45"));
+    assert!(!JavaEnvironment::check_java_version_supported("7u80"));
+    assert!(!JavaEnvironment::check_java_version_supported("invalid"));
+    assert!(!JavaEnvironment::check_java_version_supported(""));
+}
+
+#[test]
+fn test_tier2_apktool_pipe_drain_large_output_and_reap_zombie() {
+    use rvs::apk::run_apktool_decode;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    let apk = raw_apk_fixture();
+    let temp_dir = TempDir::new().unwrap();
+    let mock_bin_dir = temp_dir.path().join("bin");
+    std::fs::create_dir_all(&mock_bin_dir).unwrap();
+
+    let dest_dir = temp_dir.path().join("out_decode");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+
+    // 1. Test Large Output Draining (>64KB pipe buffer without deadlock)
+    let mock_apktool = mock_bin_dir.join("apktool");
+    let script_content = r#"#!/bin/sh
+# Generate 128KB of output to stdout and stderr
+head -c 65536 /dev/zero | tr '\0' 'A'
+echo ""
+head -c 65536 /dev/zero | tr '\0' 'B' >&2
+echo "" >&2
+exit 0
+"#;
+    std::fs::write(&mock_apktool, script_content).unwrap();
+    std::fs::set_permissions(&mock_apktool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let test_path = format!("{}:{}", mock_bin_dir.display(), orig_path);
+    std::env::set_var("PATH", &test_path);
+
+    let start_time = std::time::Instant::now();
+    let decode_result = run_apktool_decode(&apk, &dest_dir, true, Some(Duration::from_secs(5)));
+    let elapsed = start_time.elapsed();
+
+    assert!(decode_result.is_ok(), "run_apktool_decode must not deadlock on >64KB output");
+    assert!(elapsed < Duration::from_secs(4), "Should complete rapidly without waiting for timeout");
+
+    // 2. Test Timeout and Child Process Reaping (No Zombie Leak)
+    let pid_file = temp_dir.path().join("mock_apktool.pid");
+    let timeout_script = format!(
+        r#"#!/bin/sh
+echo $$ > "{}"
+sleep 10
+exit 0
+"#,
+        pid_file.display()
+    );
+    std::fs::write(&mock_apktool, timeout_script).unwrap();
+
+    let timeout_result = run_apktool_decode(&apk, &dest_dir, true, Some(Duration::from_millis(250)));
+    assert!(timeout_result.is_err(), "Must return Err on timeout");
+    match timeout_result.err().unwrap() {
+        rvs::error::AppError::Timeout(msg) => {
+            assert!(msg.contains("timed out"), "Expected timeout message, got: {}", msg);
+        }
+        other => panic!("Expected AppError::Timeout, got: {:?}", other),
+    }
+
+    // Verify child process was reaped and is NOT a zombie (<defunct>)
+    if pid_file.is_file() {
+        let pid_str = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid_str.trim();
+        if !pid.is_empty() {
+            // Give kernel a tiny slice to process wait
+            std::thread::sleep(Duration::from_millis(50));
+            let proc_status_path = format!("/proc/{}/status", pid);
+            if let Ok(status) = std::fs::read_to_string(&proc_status_path) {
+                assert!(
+                    !status.contains("State:\tZ"),
+                    "Child process {} must be reaped by wait(), not left as a zombie!\nStatus:\n{}",
+                    pid, status
+                );
+            }
+        }
+    }
+
+    // Restore original PATH
+    std::env::set_var("PATH", orig_path);
+}
+
+#[test]
+fn test_tier1_unpack_agent_summary_json_and_md_generated() {
+    let apk = raw_apk_fixture();
+    let apk_str = apk.to_str().unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let dest_dir = temp_dir.path().join("out_agent_summary");
+    let dest_str = dest_dir.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<ApkUnpackData>(&[
+        "apk", "unpack", apk_str, "-o", dest_str, "--force", "--no-java",
+    ]);
+
+    assert!(out.status.success(), "rvs apk unpack should succeed");
+    assert!(resp.success);
+    let data = resp.data.expect("ApkUnpackData expected");
+
+    // Check artifacts on disk
+    let summary_json_file = dest_dir.join("rvs_agent_summary.json");
+    assert!(summary_json_file.is_file(), "rvs_agent_summary.json must exist");
+    let json_content = std::fs::read_to_string(&summary_json_file).unwrap();
+    assert!(json_content.contains("package_name"), "json must have package_name");
+    assert!(json_content.contains("eu.jgamba.myapplication"), "json must have myapplication package");
+
+    let summary_md_file = dest_dir.join("rvs_agent_summary.md");
+    assert!(summary_md_file.is_file(), "rvs_agent_summary.md must exist");
+    let md_content = std::fs::read_to_string(&summary_md_file).unwrap();
+    assert!(md_content.contains("# RVS APK Agent Reconnaissance Summary"), "md header missing");
+    assert!(md_content.contains("Attack Surface"), "Attack Surface section missing");
+    assert!(md_content.contains("JNI Native Method Cross-References"), "JNI section missing");
+
+    // Check structured data in memory
+    let agent_summary = data.agent_summary.expect("agent_summary should be attached");
+    assert_eq!(agent_summary.package_name.as_deref(), Some("eu.jgamba.myapplication"));
+    assert!(agent_summary.total_classes > 0, "total_classes must be > 0");
+    assert!(agent_summary.total_methods > 0, "total_methods must be > 0");
+    assert!(agent_summary.native_methods_count > 0, "native_methods_count must be > 0");
+    assert!(
+        agent_summary.exported_activities.iter().any(|a| a.contains("MainActivity")),
+        "MainActivity should be detected as exported"
+    );
+    assert!(
+        agent_summary.jni_cross_references.iter().any(|j| j.dalvik_method.contains("stringFromJNI")),
+        "stringFromJNI should be cross-referenced"
+    );
+}
+
+#[test]
+fn test_tier1_jni_cross_referencing_dalvik_to_so() {
+    let apk = raw_apk_fixture();
+    let pkg = rvs::apk::ApkPackage::open(&apk).expect("open raw apk");
+    let dex_results = pkg.analyze_dex(None).expect("analyze dex");
+    let native_libs = pkg.analyze_native_libraries().expect("analyze native libs");
+
+    let mut all_classes = Vec::new();
+    for d in &dex_results {
+        all_classes.extend(d.classes.clone());
+    }
+
+    let xrefs = rvs::apk::native_so::cross_reference_classes(&all_classes, &native_libs);
+    assert!(!xrefs.is_empty(), "JNI cross references must be found in raw APK");
+
+    let string_from_jni = xrefs.iter().find(|x| x.dalvik_method == "stringFromJNI");
+    assert!(string_from_jni.is_some(), "stringFromJNI must be cross-referenced");
+    let entry = string_from_jni.unwrap();
+    assert_eq!(entry.registration_type, "static_export");
+    assert!(entry.native_symbol.as_ref().unwrap().contains("stringFromJNI"));
+    assert_eq!(entry.abi.as_deref(), Some("arm64-v8a"));
+    assert!(entry.library_path.as_ref().unwrap().contains("libnative.so"));
+}
+
+#[test]
+fn test_tier2_hybrid_cooperative_post_unpack_manifest_repair() {
+    let apk = raw_apk_fixture();
+    let pkg = rvs::apk::ApkPackage::open(&apk).expect("open raw apk");
+    let temp_dir = TempDir::new().unwrap();
+    let dest = temp_dir.path().join("coop_repair");
+
+    // Pure-rust unpack
+    let summary = pkg.unpack(&dest, false).expect("unpack pure rust");
+    assert_eq!(summary.engine, "rust-native");
+    assert!(summary.manifest_extracted);
+    assert!(dest.join("AndroidManifest.xml").is_file());
+    assert!(dest.join("rvs_agent_summary.json").is_file());
+    assert!(dest.join("rvs_agent_summary.md").is_file());
+}

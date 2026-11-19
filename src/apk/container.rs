@@ -37,6 +37,56 @@ pub struct LanguageDetection {
     pub evidence: Vec<String>,
 }
 
+/// Comprehensive reconnaissance summary generated for downstream AI agents during unpacking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_code: Option<u32>,
+    pub debuggable: bool,
+    pub total_classes: usize,
+    pub total_methods: usize,
+    pub native_methods_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dangerous_permissions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exported_activities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exported_services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exported_receivers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exported_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deep_link_schemes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jni_cross_references: Vec<super::native_so::JniMethodCrossReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<LanguageDetection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attack_surface_components: Vec<super::manifest::ManifestComponent>,
+}
+
+pub type AgentAugmentationSummary = AgentSummary;
+
+/// Structured summary of an APK unpack operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApkUnpackSummary {
+    pub destination: PathBuf,
+    pub engine: String,
+    pub file_count: usize,
+    pub manifest_extracted: bool,
+    pub resources_extracted: bool,
+    pub smali_generated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_summary: Option<AgentSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repairs: Vec<String>,
+}
+
 /// Unified representation of an ingested Android APK package or standalone component.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApkPackage {
@@ -355,15 +405,42 @@ impl ApkPackage {
     pub fn detect_languages(&self) -> Vec<LanguageDetection> {
         let mut detections = Vec::new();
 
-        // 1. Java Detection: requires Dalvik DEX bytecode (.dex files)
-        if !self.dex_entries.is_empty() {
+        // 1. Java Detection: requires Dalvik DEX bytecode (.dex files) or Smali directory structure
+        let has_real_dex = self
+            .dex_entries
+            .iter()
+            .any(|e| e.name.ends_with(".dex") || e.name.contains(".dex"));
+        let has_smali = self
+            .dex_entries
+            .iter()
+            .any(|e| e.name == "smali" || e.name.starts_with("smali_") || e.name.starts_with("smali/"));
+
+        if has_real_dex || has_smali {
             let mut java_evidence = Vec::new();
-            let names = self.dex_names();
-            java_evidence.push(format!(
-                "Dalvik DEX bytecode present ({} file(s): {})",
-                names.len(),
-                names.join(", ")
-            ));
+            if has_real_dex {
+                let names: Vec<String> = self
+                    .dex_entries
+                    .iter()
+                    .filter(|e| e.name.ends_with(".dex") || e.name.contains(".dex"))
+                    .map(|e| e.name.clone())
+                    .collect();
+                java_evidence.push(format!(
+                    "Dalvik DEX bytecode present ({} file(s): {})",
+                    names.len(),
+                    names.join(", ")
+                ));
+            }
+            if has_smali {
+                let smali_count = self
+                    .dex_entries
+                    .iter()
+                    .filter(|e| e.name == "smali" || e.name.starts_with("smali_") || e.name.starts_with("smali/"))
+                    .count();
+                java_evidence.push(format!(
+                    "Smali assembly structure present ({} directory/directories)",
+                    smali_count
+                ));
+            }
             if self.manifest_data.is_some() {
                 if self.is_manifest_binary {
                     java_evidence.push("AndroidManifest.xml present (binary AXML format)".to_string());
@@ -371,7 +448,7 @@ impl ApkPackage {
                     java_evidence.push("AndroidManifest.xml present (XML text format)".to_string());
                 }
             }
-            let conf = if self.manifest_data.is_some() {
+            let conf = if self.manifest_data.is_some() || has_smali {
                 "High"
             } else {
                 "Medium"
@@ -721,6 +798,552 @@ impl ApkPackage {
         Ok(())
     }
 
+    /// Unpack and decode the APK package into a fully structured directory containing:
+    /// - Human-readable `AndroidManifest.xml` (decoded from binary AXML if needed)
+    /// - `res/` directory with decoded XML layouts/drawables and values
+    /// - `res/values/strings.xml` reconstructed from `resources.arsc`
+    /// - Disassembled Dalvik `.smali` files in `smali/` and `smali_classes2/`
+    /// - Native shared libraries in `lib/<abi>/`
+    /// - Raw assets in `assets/`
+    ///
+    /// Implements Unified Cohesive Hybrid Pipeline:
+    /// - RVS Master Engine supervision:
+    ///   - If `prefer_java` is true and apktool is present: attempt apktool decode.
+    ///   - If apktool succeeds, inspect outputs; verify and repair missing/corrupt pieces (manifest, resources, strings, lib, assets).
+    ///   - If apktool fails on resources/AXML: cooperatively retry apktool with `-r` (`--no-res`) to salvage smali code, while RVS Rust decodes resources and manifest.
+    ///   - If apktool completely fails, smoothly fallback to autonomous pure-Rust extraction.
+    ///   - In all modes, RVS automatically performs Agent Augmentation, generating attack surface profile, class indexing, JNI cross-references, and summary artifacts.
+    pub fn unpack(&self, destination: &Path, prefer_java: bool) -> Result<ApkUnpackSummary, AppError> {
+        if destination.exists() && destination.is_file() {
+            return Err(AppError::InvalidBinary(format!(
+                "Destination path '{}' is an existing file, not a directory",
+                destination.display()
+            )));
+        }
+
+        let mut repairs = Vec::new();
+        let mut engine_used = "rust-native".to_string();
+        let mut manifest_extracted = false;
+        let mut resources_extracted = false;
+        let mut smali_generated = false;
+        let mut java_succeeded = false;
+
+        // Tier 1 / Hybrid: Java-accelerated extraction via apktool with cooperative fallback
+        if prefer_java {
+            if let ApkSource::Archive(apk_path) = &self.source {
+                if apk_path.is_file() && super::java::JavaEnvironment::find_apktool().is_some() {
+                    // Attempt 1: Standard apktool decode
+                    if let Ok(()) = super::java::run_apktool_decode(apk_path, destination, true, None) {
+                        java_succeeded = true;
+                        engine_used = "java-apktool".to_string();
+
+                        // Master Engine Post-Unpack Verification & Repair:
+                        // 1. Verify AndroidManifest.xml
+                        let manifest_p = destination.join("AndroidManifest.xml");
+                        if !manifest_p.is_file() || std::fs::metadata(&manifest_p).map(|m| m.len() == 0).unwrap_or(true) {
+                            if let Some(m_bytes) = &self.manifest_data {
+                                if let Ok(xml_str) = super::manifest::decode_raw_manifest(m_bytes) {
+                                    let _ = std::fs::write(&manifest_p, xml_str.as_bytes());
+                                    repairs.push("manifest_repaired".to_string());
+                                }
+                            }
+                        }
+
+                        // 2. Verify res/ and strings.xml
+                        let strings_p = destination.join("res").join("values").join("strings.xml");
+                        if !strings_p.is_file() {
+                            if let Ok(arsc_bytes) = self.read_entry("resources.arsc") {
+                                let strings = super::resources::extract_arsc_strings(&arsc_bytes);
+                                if !strings.is_empty() {
+                                    let xml = super::resources::generate_strings_xml(&strings);
+                                    if let Some(p) = strings_p.parent() {
+                                        let _ = std::fs::create_dir_all(p);
+                                    }
+                                    let _ = std::fs::write(&strings_p, xml.as_bytes());
+                                    repairs.push("strings_xml_repaired".to_string());
+                                }
+                            }
+                        }
+
+                        // 3. Ensure assets/ and lib/ are preserved
+                        self.repair_missing_assets_and_libs(destination, &mut repairs);
+                    } else {
+                        // Attempt 2: Cooperative decoding with `-r` (no-res) to salvage smali
+                        let _ = std::fs::remove_dir_all(destination);
+                        if let Ok(()) = super::java::run_apktool_decode_options(
+                            apk_path, destination, true, true, false, None,
+                        ) {
+                            java_succeeded = true;
+                            engine_used = "hybrid-cooperative".to_string();
+                            repairs.push("cooperative_no_res_smali_salvaged".to_string());
+
+                            // Rust engine steps in cooperatively to decode manifest, resources, and strings
+                            let _ = self.extract_manifest_pure_rust(destination, &mut manifest_extracted);
+                            let _ = self.extract_resources_pure_rust(destination, &mut resources_extracted);
+                            self.repair_missing_assets_and_libs(destination, &mut repairs);
+                        } else {
+                            // Clean up destination for pure-Rust extraction
+                            let _ = std::fs::remove_dir_all(destination);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tier 2: Pure-Rust autonomous fallback extraction (if Java not preferred, missing, or failed)
+        if !java_succeeded {
+            std::fs::create_dir_all(destination)?;
+            self.extract_manifest_pure_rust(destination, &mut manifest_extracted)?;
+            self.extract_resources_pure_rust(destination, &mut resources_extracted)?;
+            self.extract_assets_and_libs_pure_rust(destination)?;
+            self.extract_smali_pure_rust(destination, &mut smali_generated)?;
+            engine_used = "rust-native".to_string();
+        } else {
+            manifest_extracted = destination.join("AndroidManifest.xml").exists();
+            resources_extracted = destination.join("res").exists();
+            smali_generated = destination.join("smali").exists() || destination.join("smali_classes2").exists();
+        }
+
+        // Automatic Agent Augmentation: attack surface, class index, JNI cross-references, artifacts
+        let agent_summary = self.generate_and_write_agent_summary(destination);
+
+        let mut final_files = Vec::new();
+        let _ = collect_files_recursive(destination, &mut final_files);
+
+        Ok(ApkUnpackSummary {
+            destination: destination.to_path_buf(),
+            engine: engine_used,
+            file_count: final_files.len(),
+            manifest_extracted,
+            resources_extracted,
+            smali_generated,
+            agent_summary: Some(agent_summary),
+            repairs,
+        })
+    }
+
+    fn repair_missing_assets_and_libs(&self, destination: &Path, repairs: &mut Vec<String>) {
+        let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+        for entry in &self.asset_entries {
+            let sanitized = sanitize_archive_entry_path(&entry.name);
+            if sanitized.is_empty() {
+                continue;
+            }
+            let target = destination.join(&sanitized);
+            if !target.exists() && is_path_safe_descendant(&target, destination, &canonical_dest) {
+                if let Some(p) = target.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                if let Ok(bytes) = self.read_entry(&entry.name) {
+                    let _ = std::fs::write(&target, &bytes);
+                    if !repairs.contains(&"assets_repaired".to_string()) {
+                        repairs.push("assets_repaired".to_string());
+                    }
+                }
+            }
+        }
+
+        for entries in self.native_libraries.values() {
+            for entry in entries {
+                let sanitized = sanitize_archive_entry_path(&entry.name);
+                if sanitized.is_empty() {
+                    continue;
+                }
+                let target = destination.join(&sanitized);
+                if !target.exists() && is_path_safe_descendant(&target, destination, &canonical_dest) {
+                    if let Some(p) = target.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
+                    if let Ok(bytes) = self.read_entry(&entry.name) {
+                        let _ = std::fs::write(&target, &bytes);
+                        if !repairs.contains(&"native_libs_repaired".to_string()) {
+                            repairs.push("native_libs_repaired".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_manifest_pure_rust(&self, destination: &Path, manifest_extracted: &mut bool) -> Result<(), AppError> {
+        let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+        if let Some(manifest_bytes) = &self.manifest_data {
+            let out_manifest = destination.join("AndroidManifest.xml");
+            if is_path_safe_descendant(&out_manifest, destination, &canonical_dest) {
+                if self.is_manifest_binary || super::manifest::is_binary_axml(manifest_bytes) {
+                    if let Ok(xml_str) = super::manifest::decode_raw_manifest(manifest_bytes) {
+                        if std::fs::write(&out_manifest, xml_str.as_bytes()).is_ok() {
+                            *manifest_extracted = true;
+                        }
+                    } else if std::fs::write(&out_manifest, manifest_bytes).is_ok() {
+                        *manifest_extracted = true;
+                    }
+                } else if std::fs::write(&out_manifest, manifest_bytes).is_ok() {
+                    *manifest_extracted = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_resources_pure_rust(&self, destination: &Path, resources_extracted: &mut bool) -> Result<(), AppError> {
+        let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+        for entry in &self.resource_entries {
+            if entry.name == "resources.arsc" {
+                continue;
+            }
+            let sanitized = sanitize_archive_entry_path(&entry.name);
+            if sanitized.is_empty() {
+                continue;
+            }
+            let target_path = destination.join(&sanitized);
+            if !is_path_safe_descendant(&target_path, destination, &canonical_dest) {
+                continue;
+            }
+            if let Some(parent) = target_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(bytes) = self.read_entry(&entry.name) {
+                if (entry.name.ends_with(".xml") || super::manifest::is_binary_axml(&bytes)) && !bytes.is_empty() {
+                    if let Ok(decoded) = super::manifest::decode_raw_manifest(&bytes) {
+                        if std::fs::write(&target_path, decoded.as_bytes()).is_ok() {
+                            *resources_extracted = true;
+                            continue;
+                        }
+                    }
+                }
+                if std::fs::write(&target_path, &bytes).is_ok() {
+                    *resources_extracted = true;
+                }
+            }
+        }
+
+        if let Ok(arsc_bytes) = self.read_entry("resources.arsc") {
+            let strings = super::resources::extract_arsc_strings(&arsc_bytes);
+            if !strings.is_empty() {
+                let xml = super::resources::generate_strings_xml(&strings);
+                let strings_path = destination.join("res").join("values").join("strings.xml");
+                if is_path_safe_descendant(&strings_path, destination, &canonical_dest) {
+                    if let Some(p) = strings_path.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
+                    if std::fs::write(&strings_path, xml.as_bytes()).is_ok() {
+                        *resources_extracted = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_assets_and_libs_pure_rust(&self, destination: &Path) -> Result<(), AppError> {
+        let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+        for entry in &self.asset_entries {
+            let sanitized = sanitize_archive_entry_path(&entry.name);
+            if sanitized.is_empty() {
+                continue;
+            }
+            let target_path = destination.join(&sanitized);
+            if !is_path_safe_descendant(&target_path, destination, &canonical_dest) {
+                continue;
+            }
+            if let Some(parent) = target_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(bytes) = self.read_entry(&entry.name) {
+                let _ = std::fs::write(&target_path, &bytes);
+            }
+        }
+
+        for entries in self.native_libraries.values() {
+            for entry in entries {
+                let sanitized = sanitize_archive_entry_path(&entry.name);
+                if sanitized.is_empty() {
+                    continue;
+                }
+                let target_path = destination.join(&sanitized);
+                if !is_path_safe_descendant(&target_path, destination, &canonical_dest) {
+                    continue;
+                }
+                if let Some(parent) = target_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(bytes) = self.read_entry(&entry.name) {
+                    let _ = std::fs::write(&target_path, &bytes);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_smali_pure_rust(&self, destination: &Path, smali_generated: &mut bool) -> Result<(), AppError> {
+        let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+        for (idx, dex_entry) in self.dex_entries.iter().enumerate() {
+            let smali_dirname = if idx == 0 {
+                "smali".to_string()
+            } else {
+                format!("smali_classes{}", idx + 1)
+            };
+            let smali_root = destination.join(&smali_dirname);
+            if let Ok(bytes) = self.read_entry(&dex_entry.name) {
+                if let Ok(dex_res) = super::dex::parse_dex_bytes(&bytes, &dex_entry.name) {
+                    for c in &dex_res.classes {
+                        let raw_name = c.name.trim_matches(|ch| ch == 'L' || ch == ';');
+                        let rel_path = format!("{}.smali", raw_name);
+                        let target = smali_root.join(&rel_path);
+                        if target.starts_with(&smali_root) && is_path_safe_descendant(&target, destination, &canonical_dest) {
+                            if let Some(p) = target.parent() {
+                                let _ = std::fs::create_dir_all(p);
+                            }
+                            let smali_text = super::dex::format_class_smali(c);
+                            if std::fs::write(&target, smali_text.as_bytes()).is_ok() {
+                                *smali_generated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn generate_and_write_agent_summary(&self, destination: &Path) -> AgentSummary {
+        // 1. Manifest attack surface analysis
+        let manifest_info = {
+            let manifest_path = destination.join("AndroidManifest.xml");
+            if manifest_path.is_file() {
+                if let Ok(bytes) = std::fs::read(&manifest_path) {
+                    ManifestInfo::parse(&bytes, super::manifest::is_binary_axml(&bytes)).unwrap_or_default()
+                } else {
+                    ManifestInfo::default()
+                }
+            } else if let Some(bytes) = &self.manifest_data {
+                ManifestInfo::parse(bytes, self.is_manifest_binary || super::manifest::is_binary_axml(bytes)).unwrap_or_default()
+            } else {
+                ManifestInfo::default()
+            }
+        };
+
+        let package_name = if manifest_info.package_name.is_empty() {
+            None
+        } else {
+            Some(manifest_info.package_name.clone())
+        };
+        let version_name = manifest_info.version_name.clone();
+        let version_code = manifest_info.version_code;
+        let debuggable = manifest_info.debuggable;
+        let dangerous_permissions = manifest_info.dangerous_permissions.clone();
+
+        let mut exported_activities = Vec::new();
+        let mut exported_services = Vec::new();
+        let mut exported_receivers = Vec::new();
+        let mut exported_providers = Vec::new();
+        let mut deep_link_schemes = Vec::new();
+
+        for comp in &manifest_info.components {
+            if comp.exported {
+                match comp.component_type.as_str() {
+                    "activity" => {
+                        if !exported_activities.contains(&comp.name) {
+                            exported_activities.push(comp.name.clone());
+                        }
+                    }
+                    "service" => {
+                        if !exported_services.contains(&comp.name) {
+                            exported_services.push(comp.name.clone());
+                        }
+                    }
+                    "receiver" => {
+                        if !exported_receivers.contains(&comp.name) {
+                            exported_receivers.push(comp.name.clone());
+                        }
+                    }
+                    "provider" => {
+                        if !exported_providers.contains(&comp.name) {
+                            exported_providers.push(comp.name.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for f in &comp.intent_filters {
+                for sch in &f.data_schemes {
+                    if !deep_link_schemes.contains(sch) {
+                        deep_link_schemes.push(sch.clone());
+                    }
+                }
+            }
+        }
+
+        // If components were empty (e.g. basic manifest), fallback to plain activity list
+        if exported_activities.is_empty() && manifest_info.components.is_empty() {
+            exported_activities = manifest_info.activities.clone();
+            exported_services = manifest_info.services.clone();
+            exported_receivers = manifest_info.receivers.clone();
+            exported_providers = manifest_info.providers.clone();
+        }
+
+        // 2. Class & method indexing
+        let mut all_classes = Vec::new();
+        if let Ok(dex_results) = self.analyze_dex(None) {
+            for d in dex_results {
+                all_classes.extend(d.classes);
+            }
+        }
+
+        if all_classes.is_empty() {
+            // Try scanning smali directories from destination
+            let smali_dir = destination.join("smali");
+            if smali_dir.is_dir() {
+                if let Ok(smali_res) = parse_smali_directory(&smali_dir) {
+                    all_classes.extend(smali_res.classes);
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(destination) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with("smali_classes") {
+                            if let Ok(smali_res) = parse_smali_directory(&path) {
+                                all_classes.extend(smali_res.classes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_classes = all_classes.len();
+        let mut total_methods = 0;
+        let mut native_methods_count = 0;
+        for c in &all_classes {
+            total_methods += c.methods.len();
+            for m in &c.methods {
+                if (m.access_flags & 0x0100) != 0 {
+                    native_methods_count += 1;
+                }
+            }
+        }
+
+        // 3. Native libraries and JNI cross-referencing
+        let mut native_libs = self.analyze_native_libraries().unwrap_or_default();
+        if native_libs.is_empty() {
+            let lib_dir = destination.join("lib");
+            if lib_dir.is_dir() {
+                let mut lib_files = Vec::new();
+                let _ = collect_files_recursive(&lib_dir, &mut lib_files);
+                for lf in lib_files {
+                    if lf.extension().and_then(|s| s.to_str()) == Some("so") {
+                        if let Ok(bytes) = std::fs::read(&lf) {
+                            let fname = lf.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            if let Ok(anal) = super::native_so::parse_native_so_bytes(&bytes, &fname) {
+                                native_libs.push(anal);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let jni_cross_references = super::native_so::cross_reference_classes(&all_classes, &native_libs);
+        let native_methods_count = native_methods_count.max(jni_cross_references.len());
+
+        // 4. Multi-language detection
+        let languages = self.detect_languages();
+
+        let summary = AgentSummary {
+            package_name,
+            version_name,
+            version_code,
+            debuggable,
+            total_classes,
+            total_methods,
+            native_methods_count,
+            dangerous_permissions,
+            exported_activities,
+            exported_services,
+            exported_receivers,
+            exported_providers,
+            deep_link_schemes,
+            jni_cross_references,
+            languages,
+            attack_surface_components: manifest_info.components,
+        };
+
+        // 5. Generate rvs_agent_summary.json
+        if let Ok(json_str) = serde_json::to_string_pretty(&summary) {
+            let _ = std::fs::write(destination.join("rvs_agent_summary.json"), json_str.as_bytes());
+        }
+
+        // 6. Generate rvs_agent_summary.md
+        let mut md = String::new();
+        md.push_str("# RVS APK Agent Reconnaissance Summary\n\n");
+        md.push_str(&format!("- **Package**: `{}`\n", summary.package_name.as_deref().unwrap_or("unknown")));
+        md.push_str(&format!("- **Version**: `{}` (code: {:?})\n", summary.version_name.as_deref().unwrap_or("unknown"), summary.version_code));
+        md.push_str(&format!("- **Debuggable**: `{}`\n", summary.debuggable));
+        md.push_str(&format!("- **Classes Index**: {} total classes, {} methods ({} native ACC_NATIVE)\n\n", summary.total_classes, summary.total_methods, summary.native_methods_count));
+
+        md.push_str("## Attack Surface\n\n");
+        md.push_str(&format!("- **Exported Activities ({})**:\n", summary.exported_activities.len()));
+        for a in &summary.exported_activities {
+            md.push_str(&format!("  - `{}`\n", a));
+        }
+        md.push_str(&format!("- **Exported Services ({})**:\n", summary.exported_services.len()));
+        for s in &summary.exported_services {
+            md.push_str(&format!("  - `{}`\n", s));
+        }
+        md.push_str(&format!("- **Exported Receivers ({})**:\n", summary.exported_receivers.len()));
+        for r in &summary.exported_receivers {
+            md.push_str(&format!("  - `{}`\n", r));
+        }
+        md.push_str(&format!("- **Exported Providers ({})**:\n", summary.exported_providers.len()));
+        for p in &summary.exported_providers {
+            md.push_str(&format!("  - `{}`\n", p));
+        }
+        if !summary.deep_link_schemes.is_empty() {
+            md.push_str(&format!("- **Deep Link Schemes**: {}\n", summary.deep_link_schemes.join(", ")));
+        }
+        md.push('\n');
+
+        md.push_str(&format!("## Dangerous Permissions ({})\n\n", summary.dangerous_permissions.len()));
+        for perm in &summary.dangerous_permissions {
+            md.push_str(&format!("- `{}`\n", perm));
+        }
+        md.push('\n');
+
+        md.push_str(&format!("## JNI Native Method Cross-References ({})\n\n", summary.jni_cross_references.len()));
+        if summary.jni_cross_references.is_empty() {
+            md.push_str("_No native methods detected._\n\n");
+        } else {
+            md.push_str("| Dalvik Class | Dalvik Method | Native Symbol | Library | ABI | Address | Registration |\n");
+            md.push_str("|---|---|---|---|---|---|---|\n");
+            for jni in &summary.jni_cross_references {
+                md.push_str(&format!(
+                    "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+                    jni.dalvik_class,
+                    jni.dalvik_method,
+                    jni.native_symbol.as_deref().unwrap_or("-"),
+                    jni.library_path.as_deref().unwrap_or("-"),
+                    jni.abi.as_deref().unwrap_or("-"),
+                    jni.address.map(|a| format!("0x{:x}", a)).unwrap_or_else(|| "-".to_string()),
+                    jni.registration_type,
+                ));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Languages & Frameworks\n\n");
+        for lang in &summary.languages {
+            md.push_str(&format!("- **{}** (confidence: {}): {}\n", lang.language, lang.confidence, lang.evidence.join(", ")));
+        }
+        md.push('\n');
+
+        let _ = std::fs::write(destination.join("rvs_agent_summary.md"), md.as_bytes());
+
+        summary
+    }
+
     // --- Internal Ingestion Methods ---
 
     fn open_archive(path: &Path) -> Result<Self, AppError> {
@@ -941,6 +1564,39 @@ impl ApkPackage {
                     name: sanitized_rel,
                     size,
                     path: Some(file_path.clone()),
+                });
+            }
+        }
+
+        // If no DEX entries were found, discover smali/ and smali_classes*/ directories
+        if dex_entries.is_empty() {
+            let mut smali_dirs: HashMap<String, (u64, PathBuf)> = HashMap::new();
+            for file_path in &all_files {
+                let rel = file_path
+                    .strip_prefix(path)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let sanitized_rel = sanitize_archive_entry_path(&rel);
+                if sanitized_rel.ends_with(".smali") {
+                    let root_smali = sanitized_rel.split('/').next().unwrap_or("smali");
+                    if root_smali == "smali" || root_smali.starts_with("smali_classes") {
+                        let size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+                        let entry = smali_dirs.entry(root_smali.to_string()).or_insert_with(|| {
+                            (0, path.join(root_smali))
+                        });
+                        entry.0 += size;
+                    }
+                }
+            }
+
+            let mut sorted_smali: Vec<_> = smali_dirs.into_iter().collect();
+            sorted_smali.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, (size, dir_path)) in sorted_smali {
+                dex_entries.push(ApkEntry {
+                    name,
+                    size,
+                    path: Some(dir_path),
                 });
             }
         }
@@ -1383,6 +2039,183 @@ pub fn detect_elf_abi(bytes: &[u8]) -> Option<String> {
         });
     }
     None
+}
+
+/// Parse Dalvik class definition from a single `.smali` file.
+pub fn parse_smali_file(path: &Path) -> Result<super::dex::DexClassSummary, AppError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut class_name = String::new();
+    let mut super_class = None;
+    let mut access_flags = 0u32;
+    let mut fields = Vec::new();
+    let mut methods = Vec::new();
+
+    let mut current_method_name = String::new();
+    let mut current_method_sig = String::new();
+    let mut current_method_flags = 0u32;
+    let mut current_registers: Option<u16> = None;
+    let mut in_method = false;
+    let mut current_method_lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if in_method {
+            current_method_lines.push(line.to_string());
+            if trimmed.starts_with(".registers") || trimmed.starts_with(".locals") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(r) = parts[1].parse::<u16>() {
+                        current_registers = Some(r);
+                    }
+                }
+            } else if trimmed == ".end method" {
+                in_method = false;
+                methods.push(super::dex::DexMethodSummary {
+                    name: current_method_name.clone(),
+                    signature: current_method_sig.clone(),
+                    access_flags: current_method_flags,
+                    code_offset: None,
+                    registers_size: current_registers,
+                    insns_size: None,
+                    debug_info: None,
+                    disassembly: None,
+                    smali: Some(current_method_lines.join("\n")),
+                    decompiled: None,
+                });
+                current_method_lines.clear();
+            }
+            continue;
+        }
+
+        if trimmed.starts_with(".class") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                class_name = parts.last().unwrap_or(&"").to_string();
+                access_flags = parse_smali_access_flags(&parts[1..parts.len() - 1]);
+            }
+        } else if trimmed.starts_with(".super") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                super_class = Some(parts[1].to_string());
+            }
+        } else if trimmed.starts_with(".field") {
+            let rest = trimmed.strip_prefix(".field").unwrap_or("").trim();
+            fields.push(rest.to_string());
+        } else if trimmed.starts_with(".method") {
+            in_method = true;
+            current_method_lines.clear();
+            current_method_lines.push(line.to_string());
+            current_registers = None;
+
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let name_and_sig = parts.last().unwrap_or(&"");
+                let flags_slice = &parts[1..parts.len() - 1];
+                current_method_flags = parse_smali_access_flags(flags_slice);
+
+                if let Some(paren_idx) = name_and_sig.find('(') {
+                    current_method_name = name_and_sig[..paren_idx].to_string();
+                    current_method_sig = name_and_sig[paren_idx..].to_string();
+                } else {
+                    current_method_name = name_and_sig.to_string();
+                    current_method_sig = "()V".to_string();
+                }
+            }
+        }
+    }
+
+    if class_name.is_empty() {
+        let file_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown");
+        class_name = format!("L{};", file_stem);
+    }
+
+    Ok(super::dex::DexClassSummary {
+        name: class_name,
+        super_class,
+        access_flags,
+        methods,
+        fields,
+        smali: Some(content),
+    })
+}
+
+fn parse_smali_access_flags(tokens: &[&str]) -> u32 {
+    let mut flags = 0u32;
+    for tok in tokens {
+        match *tok {
+            "public" => flags |= 0x0001,
+            "private" => flags |= 0x0002,
+            "protected" => flags |= 0x0004,
+            "static" => flags |= 0x0008,
+            "final" => flags |= 0x0010,
+            "synchronized" => flags |= 0x0020,
+            "volatile" => flags |= 0x0040,
+            "transient" => flags |= 0x0080,
+            "native" => flags |= 0x0100,
+            "interface" => flags |= 0x0200,
+            "abstract" => flags |= 0x0400,
+            "synthetic" => flags |= 0x1000,
+            "constructor" => flags |= 0x10000,
+            "declared-synchronized" => flags |= 0x20000,
+            _ => {}
+        }
+    }
+    flags
+}
+
+/// Recursively collect and parse all `.smali` files in a directory into a DexAnalysisResult.
+pub fn parse_smali_directory(dir: &Path) -> Result<super::dex::DexAnalysisResult, AppError> {
+    if !dir.exists() {
+        return Err(AppError::FileNotFound(dir.display().to_string()));
+    }
+
+    let mut smali_files = Vec::new();
+    collect_files_recursive(dir, &mut smali_files)?;
+
+    let mut classes = Vec::new();
+    let mut strings = Vec::new();
+
+    for file_path in &smali_files {
+        if file_path.extension().and_then(|s| s.to_str()) == Some("smali") {
+            if let Ok(class_summary) = parse_smali_file(file_path) {
+                strings.push(class_summary.name.clone());
+                for m in &class_summary.methods {
+                    strings.push(m.name.clone());
+                }
+                for f in &class_summary.fields {
+                    strings.push(f.clone());
+                }
+                classes.push(class_summary);
+            }
+        }
+    }
+
+    classes.sort_by(|a, b| a.name.cmp(&b.name));
+    let classes_count = classes.len();
+    let methods_count = classes.iter().map(|c| c.methods.len()).sum();
+    let strings_count = strings.len();
+
+    let file_name = dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    Ok(super::dex::DexAnalysisResult {
+        file_name,
+        classes_count,
+        methods_count,
+        strings_count,
+        classes,
+        strings: Some(strings),
+        disassembly: None,
+        smali: None,
+        decompiled: None,
+    })
 }
 
 #[cfg(test)]
@@ -2338,5 +3171,64 @@ mod tests {
         assert!(matches!(pkg.read_entry("canary_res.txt"), Err(AppError::FileNotFound(_))));
         assert!(matches!(pkg.read_entry("canary_asset.txt"), Err(AppError::FileNotFound(_))));
         assert!(matches!(pkg.read_entry("canary_lib.so"), Err(AppError::FileNotFound(_))));
+    }
+
+    #[test]
+    fn test_pure_rust_unpack_on_raw_apk() {
+        let apk_path = Path::new("tests/fixtures/sample_raw.apk");
+        if apk_path.is_file() {
+            let pkg = ApkPackage::open(apk_path).expect("open sample_raw.apk");
+            let dir = tempdir().unwrap();
+            let unpack_dir = dir.path().join("unpacked_rust");
+            let summary = pkg.unpack(&unpack_dir, false).expect("unpack must succeed");
+
+            assert_eq!(summary.engine, "rust-native");
+            assert!(summary.manifest_extracted);
+            assert!(summary.resources_extracted);
+            assert!(summary.smali_generated);
+            assert!(summary.file_count > 0);
+
+            assert!(unpack_dir.join("AndroidManifest.xml").is_file());
+            assert!(unpack_dir.join("res/values/strings.xml").is_file());
+            assert!(unpack_dir.join("smali").is_dir());
+        }
+    }
+
+    #[test]
+    fn test_smali_directory_ingestion_and_parsing() {
+        let dir = tempdir().unwrap();
+        let smali_dir = dir.path().join("smali").join("com").join("example");
+        std::fs::create_dir_all(&smali_dir).unwrap();
+
+        let smali_content = r#".class public Lcom/example/MyTest;
+.super Ljava/lang/Object;
+
+# fields
+.field private id:I
+
+# methods
+.method public testMethod()V
+    .registers 2
+    return-void
+.end method
+"#;
+        std::fs::write(smali_dir.join("MyTest.smali"), smali_content).unwrap();
+
+        // Also add a manifest
+        std::fs::write(dir.path().join("AndroidManifest.xml"), b"<manifest package=\"com.example\" />").unwrap();
+
+        let pkg = ApkPackage::open(dir.path()).expect("open smali directory");
+        assert_eq!(pkg.dex_entries.len(), 1);
+        assert_eq!(pkg.dex_entries[0].name, "smali");
+
+        let langs = pkg.detect_languages();
+        assert!(langs.iter().any(|l| l.language == "Java" && l.confidence == "High"));
+
+        let dex_res = parse_smali_directory(&dir.path().join("smali")).expect("parse smali directory");
+        assert_eq!(dex_res.classes_count, 1);
+        assert_eq!(dex_res.classes[0].name, "Lcom/example/MyTest;");
+        assert_eq!(dex_res.classes[0].super_class.as_deref(), Some("Ljava/lang/Object;"));
+        assert_eq!(dex_res.classes[0].methods.len(), 1);
+        assert_eq!(dex_res.classes[0].methods[0].name, "testMethod");
     }
 }

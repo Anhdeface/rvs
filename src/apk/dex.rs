@@ -1303,6 +1303,27 @@ impl ApkPackage {
     /// If `dex_name` is Some, analyzes only the matching DEX entry;
     /// otherwise analyzes all DEX entries present in the package.
     pub fn analyze_dex(&self, dex_name: Option<&str>) -> Result<Vec<DexAnalysisResult>, AppError> {
+        let analyze_single_entry = |entry: &crate::apk::container::ApkEntry| -> Result<DexAnalysisResult, AppError> {
+            if entry.name == "smali"
+                || entry.name.starts_with("smali_classes")
+                || entry.path.as_ref().map(|p| p.is_dir()).unwrap_or(false)
+            {
+                if let Some(p) = &entry.path {
+                    if p.is_dir() {
+                        return crate::apk::container::parse_smali_directory(p);
+                    }
+                }
+                if let ApkSource::Directory(base) = &self.source {
+                    let dir_path = base.join(&entry.name);
+                    if dir_path.is_dir() {
+                        return crate::apk::container::parse_smali_directory(&dir_path);
+                    }
+                }
+            }
+            let bytes = self.read_entry(&entry.name)?;
+            parse_dex_bytes(&bytes, &entry.name)
+        };
+
         if let Some(target) = dex_name {
             let entry = self
                 .dex_entries
@@ -1314,8 +1335,7 @@ impl ApkPackage {
                         target
                     ))
                 })?;
-            let bytes = self.read_entry(&entry.name)?;
-            let analysis = parse_dex_bytes(&bytes, &entry.name)?;
+            let analysis = analyze_single_entry(entry)?;
             Ok(vec![analysis])
         } else {
             if self.dex_entries.is_empty() {
@@ -1332,8 +1352,7 @@ impl ApkPackage {
 
             let mut results = Vec::with_capacity(self.dex_entries.len());
             for entry in &self.dex_entries {
-                let bytes = self.read_entry(&entry.name)?;
-                let analysis = parse_dex_bytes(&bytes, &entry.name)?;
+                let analysis = analyze_single_entry(entry)?;
                 results.push(analysis);
             }
             Ok(results)

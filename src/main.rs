@@ -93,7 +93,8 @@ fn main() -> ExitCode {
             | ApkCommands::Dex { path, .. }
             | ApkCommands::So { path, .. }
             | ApkCommands::Resources { path, .. }
-            | ApkCommands::Signature { path, .. } => path.display().to_string(),
+            | ApkCommands::Signature { path, .. }
+            | ApkCommands::Unpack { path, .. } => path.display().to_string(),
         },
         _ => cli.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default(),
     };
@@ -156,6 +157,7 @@ fn main() -> ExitCode {
         Commands::Apk(ApkCommands::So { .. }) => "apk so",
         Commands::Apk(ApkCommands::Resources { .. }) => "apk resources",
         Commands::Apk(ApkCommands::Signature { .. }) => "apk signature",
+        Commands::Apk(ApkCommands::Unpack { .. }) => "apk unpack",
     };
 
     match execute_cli(&cli, command_name, &target_str) {
@@ -1161,7 +1163,56 @@ fn handle_apk_command(
                     )));
                 }
 
-                if let Some(target_dex) = &dex_file {
+                let is_smali = pkg.dex_entries.iter().all(|e| e.name == "smali" || e.name.starts_with("smali"));
+
+                if is_smali {
+                    if let Some(target_dex) = &dex_file {
+                        let entry = pkg.dex_entries.iter().find(|e| {
+                            e.name == *target_dex || e.name.ends_with(target_dex)
+                        }).ok_or_else(|| {
+                            AppError::FileNotFound(format!(
+                                "Smali directory '{}' not found in package",
+                                target_dex
+                            ))
+                        })?;
+                        let smali_dir = entry.path.as_deref().unwrap_or(path);
+                        apk::parse_smali_directory(smali_dir)?
+                    } else if pkg.dex_entries.len() == 1 {
+                        let entry = &pkg.dex_entries[0];
+                        let smali_dir = entry.path.as_deref().unwrap_or(path);
+                        apk::parse_smali_directory(smali_dir)?
+                    } else {
+                        // Multi-smali merge
+                        let mut combined_classes = Vec::new();
+                        let mut total_methods = 0;
+                        let mut total_strings = 0;
+                        let mut all_strings = Vec::new();
+
+                        for entry in &pkg.dex_entries {
+                            if let Some(smali_dir) = &entry.path {
+                                let r = apk::parse_smali_directory(smali_dir)?;
+                                total_methods += r.methods_count;
+                                total_strings += r.strings_count;
+                                if let Some(strs) = r.strings {
+                                    all_strings.extend(strs);
+                                }
+                                combined_classes.extend(r.classes);
+                            }
+                        }
+
+                        apk::DexAnalysisResult {
+                            file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                            classes_count: combined_classes.len(),
+                            methods_count: total_methods,
+                            strings_count: total_strings,
+                            classes: combined_classes,
+                            strings: Some(all_strings),
+                            disassembly: None,
+                            smali: None,
+                            decompiled: None,
+                        }
+                    }
+                } else if let Some(target_dex) = &dex_file {
                     let entry = pkg.dex_entries.iter().find(|e| {
                         e.name == *target_dex || e.name.ends_with(target_dex)
                     }).ok_or_else(|| {
@@ -1298,9 +1349,15 @@ fn handle_apk_command(
                 let mut class_smalis = Vec::new();
                 for c in &mut analysis_result.classes {
                     for m in &mut c.methods {
-                        m.smali = Some(apk::format_method_smali(m));
+                        if m.smali.is_none() {
+                            m.smali = Some(apk::format_method_smali(m));
+                        }
                     }
-                    let c_smali = apk::format_class_smali(c);
+                    let c_smali = if let Some(existing) = &c.smali {
+                        existing.clone()
+                    } else {
+                        apk::format_class_smali(c)
+                    };
                     c.smali = Some(c_smali.clone());
                     class_smalis.push(c_smali);
                 }
@@ -1616,6 +1673,61 @@ fn handle_apk_command(
                 resp.to_json(pretty).map_err(Into::into)
             } else {
                 let resp = ApiResponse::success(command_name, target_str, sig_info);
+                resp.to_json(pretty).map_err(Into::into)
+            }
+        }
+
+        ApkCommands::Unpack {
+            path,
+            output,
+            force,
+            no_java,
+        } => {
+            if !path.exists() {
+                return Err(AppError::FileNotFound(path.display().to_string()));
+            }
+            if path.is_file() {
+                let meta = std::fs::metadata(path)?;
+                if meta.len() == 0 {
+                    return Err(AppError::ZeroByteFile(path.display().to_string()));
+                }
+            }
+
+            let destination = match output {
+                Some(p) => p.clone(),
+                None => {
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("apk");
+                    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    parent.join(format!("{}_unpacked", stem))
+                }
+            };
+
+            if destination.exists() {
+                if *force {
+                    let _ = std::fs::remove_dir_all(&destination);
+                } else {
+                    let is_empty = destination
+                        .read_dir()
+                        .is_ok_and(|mut i| i.next().is_none());
+                    if !is_empty {
+                        return Err(AppError::InvalidArgument(format!(
+                            "Destination directory '{}' already exists and is not empty. Use --force to overwrite.",
+                            destination.display()
+                        )));
+                    }
+                }
+            }
+
+            let pkg = ApkPackage::open(path)?;
+            let prefer_java = !*no_java;
+            let summary = pkg.unpack(&destination, prefer_java)?;
+
+            if compact_flag {
+                let comp = compact::CompactApkUnpackData::from(&summary);
+                let resp = make_compact_response(command_name, target_str, comp);
+                resp.to_json(pretty).map_err(Into::into)
+            } else {
+                let resp = ApiResponse::success(command_name, target_str, summary);
                 resp.to_json(pretty).map_err(Into::into)
             }
         }

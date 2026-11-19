@@ -39,6 +39,23 @@ pub struct NativeSymbol {
     pub is_import: bool,
 }
 
+/// Cross-reference linking a Dalvik native method (`ACC_NATIVE = 0x0100`) to an ELF `.so` export or registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JniMethodCrossReference {
+    pub dalvik_class: String,
+    pub dalvik_method: String,
+    pub dalvik_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<u64>,
+    pub registration_type: String, // "static_export", "dynamic_registernatives", "unresolved"
+}
+
 /// Analysis result for an Android native `.so` shared library.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLibraryAnalysis {
@@ -411,6 +428,260 @@ pub fn analyze_jni_xrefs(
         crate::analysis::xrefs::XrefDirection::All,
         None,
     )
+}
+
+/// Correlate Dalvik methods with ELF `.so` native libraries.
+///
+/// Filters methods for native declarations (`access_flags & 0x0100 != 0`) and resolves
+/// static JNI exports (`Java_<class>_<method>`) or dynamic `RegisterNatives` registrations.
+pub fn correlate_jni_methods(
+    dalvik_methods: &[crate::apk::dex::DexMethodSummary],
+    native_libs: &[NativeLibraryAnalysis],
+) -> Vec<JniMethodCrossReference> {
+    let mut results = Vec::new();
+
+    for m in dalvik_methods {
+        if (m.access_flags & 0x0100) == 0 {
+            continue;
+        }
+
+        let mut matched = false;
+        // Search in native libraries
+        for lib in native_libs {
+            for jni in &lib.jni_functions {
+                let method_match = jni
+                    .demangled_method
+                    .as_deref()
+                    .map(|dm| dm == m.name)
+                    .unwrap_or(false)
+                    || jni.name.ends_with(&format!("_{}", m.name))
+                    || jni.name.contains(&m.name);
+
+                if method_match {
+                    let dalvik_class = jni
+                        .demangled_class
+                        .clone()
+                        .unwrap_or_default();
+
+                    results.push(JniMethodCrossReference {
+                        dalvik_class,
+                        dalvik_method: m.name.clone(),
+                        dalvik_signature: m.signature.clone(),
+                        native_symbol: Some(jni.name.clone()),
+                        library_path: Some(lib.file_name.clone()),
+                        abi: Some(lib.abi.clone()),
+                        address: Some(jni.address),
+                        registration_type: "static_export".to_string(),
+                    });
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                break;
+            }
+        }
+
+        if !matched {
+            let any_dynamic = native_libs.iter().any(|l| l.register_natives_detected);
+            let registration_type = if any_dynamic {
+                "dynamic_registernatives".to_string()
+            } else {
+                "unresolved".to_string()
+            };
+
+            results.push(JniMethodCrossReference {
+                dalvik_class: String::new(),
+                dalvik_method: m.name.clone(),
+                dalvik_signature: m.signature.clone(),
+                native_symbol: None,
+                library_path: None,
+                abi: None,
+                address: None,
+                registration_type,
+            });
+        }
+    }
+
+    // Also include any static JNI functions from native_libs not already present
+    for lib in native_libs {
+        for jni in &lib.jni_functions {
+            let already_present = results.iter().any(|r| {
+                r.native_symbol.as_deref() == Some(&jni.name)
+                    || (jni.demangled_method.is_some() && r.dalvik_method == *jni.demangled_method.as_ref().unwrap())
+            });
+            if !already_present {
+                results.push(JniMethodCrossReference {
+                    dalvik_class: jni.demangled_class.clone().unwrap_or_default(),
+                    dalvik_method: jni.demangled_method.clone().unwrap_or_else(|| jni.name.clone()),
+                    dalvik_signature: String::new(),
+                    native_symbol: Some(jni.name.clone()),
+                    library_path: Some(lib.file_name.clone()),
+                    abi: Some(lib.abi.clone()),
+                    address: Some(jni.address),
+                    registration_type: "static_export".to_string(),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Cross-reference Dalvik class summaries with native `.so` libraries.
+pub fn cross_reference_classes(
+    classes: &[crate::apk::dex::DexClassSummary],
+    native_libs: &[NativeLibraryAnalysis],
+) -> Vec<JniMethodCrossReference> {
+    let mut results = Vec::new();
+
+    for class in classes {
+        let clean_class_name = class
+            .name
+            .trim_matches(|c| c == 'L' || c == ';')
+            .replace('/', ".");
+
+        for m in &class.methods {
+            if (m.access_flags & 0x0100) == 0 {
+                continue;
+            }
+
+            let mut matched = false;
+            for lib in native_libs {
+                for jni in &lib.jni_functions {
+                    let class_match = jni
+                        .demangled_class
+                        .as_deref()
+                        .map(|dc| dc == clean_class_name || clean_class_name.ends_with(dc) || dc.ends_with(&clean_class_name))
+                        .unwrap_or(false);
+
+                    let method_match = jni
+                        .demangled_method
+                        .as_deref()
+                        .map(|dm| dm == m.name)
+                        .unwrap_or(false);
+
+                    if (class_match && method_match)
+                        || jni.name.contains(&format!("{}_{}", clean_class_name.replace('.', "_"), m.name))
+                    {
+                        results.push(JniMethodCrossReference {
+                            dalvik_class: clean_class_name.clone(),
+                            dalvik_method: m.name.clone(),
+                            dalvik_signature: m.signature.clone(),
+                            native_symbol: Some(jni.name.clone()),
+                            library_path: Some(lib.file_name.clone()),
+                            abi: Some(lib.abi.clone()),
+                            address: Some(jni.address),
+                            registration_type: "static_export".to_string(),
+                        });
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    break;
+                }
+            }
+
+            if !matched {
+                // Secondary check: match on method name if static JNI symbol contains it
+                for lib in native_libs {
+                    for jni in &lib.jni_functions {
+                        if jni
+                            .demangled_method
+                            .as_deref()
+                            .map(|dm| dm == m.name)
+                            .unwrap_or(false)
+                        {
+                            results.push(JniMethodCrossReference {
+                                dalvik_class: clean_class_name.clone(),
+                                dalvik_method: m.name.clone(),
+                                dalvik_signature: m.signature.clone(),
+                                native_symbol: Some(jni.name.clone()),
+                                library_path: Some(lib.file_name.clone()),
+                                abi: Some(lib.abi.clone()),
+                                address: Some(jni.address),
+                                registration_type: "static_export".to_string(),
+                            });
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if matched {
+                        break;
+                    }
+                }
+            }
+
+            if !matched {
+                let any_dynamic = native_libs.iter().any(|l| l.register_natives_detected);
+                let registration_type = if any_dynamic {
+                    "dynamic_registernatives".to_string()
+                } else {
+                    "unresolved".to_string()
+                };
+
+                results.push(JniMethodCrossReference {
+                    dalvik_class: clean_class_name.clone(),
+                    dalvik_method: m.name.clone(),
+                    dalvik_signature: m.signature.clone(),
+                    native_symbol: None,
+                    library_path: None,
+                    abi: None,
+                    address: None,
+                    registration_type,
+                });
+            }
+        }
+    }
+
+    // Also include any static JNI exports from native_libs not already matched from Dalvik classes
+    for lib in native_libs {
+        for jni in &lib.jni_functions {
+            let already_present = results.iter().any(|r| {
+                r.native_symbol.as_deref() == Some(&jni.name)
+                    || (jni.demangled_method.is_some() && r.dalvik_method == *jni.demangled_method.as_ref().unwrap() && !r.dalvik_class.is_empty())
+            });
+            if !already_present {
+                let dalvik_class = jni.demangled_class.clone().unwrap_or_default();
+                let dalvik_method = jni.demangled_method.clone().unwrap_or_else(|| jni.name.clone());
+                let dalvik_signature = classes
+                    .iter()
+                    .find(|c| {
+                        let clean = c.name.trim_matches(|ch| ch == 'L' || ch == ';').replace('/', ".");
+                        clean == dalvik_class || dalvik_class.ends_with(&clean)
+                    })
+                    .and_then(|c| c.methods.iter().find(|m| m.name == dalvik_method))
+                    .map(|m| m.signature.clone())
+                    .unwrap_or_default();
+
+                results.push(JniMethodCrossReference {
+                    dalvik_class,
+                    dalvik_method,
+                    dalvik_signature,
+                    native_symbol: Some(jni.name.clone()),
+                    library_path: Some(lib.file_name.clone()),
+                    abi: Some(lib.abi.clone()),
+                    address: Some(jni.address),
+                    registration_type: "static_export".to_string(),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Cross-reference parsed DEX analysis results with native `.so` libraries.
+pub fn cross_reference_jni_methods(
+    dex_results: &[crate::apk::dex::DexAnalysisResult],
+    native_libs: &[NativeLibraryAnalysis],
+) -> Vec<JniMethodCrossReference> {
+    let mut all_classes = Vec::new();
+    for d in dex_results {
+        all_classes.extend(d.classes.clone());
+    }
+    cross_reference_classes(&all_classes, native_libs)
 }
 
 // -----------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 //! - Redundant instruction pointer register diffs suppressed in dynamic trace
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::dynamic::AgentEmulateData;
@@ -1868,6 +1869,39 @@ impl From<crate::apk::signature::ApkSignatureInfo> for CompactApkSignatureData {
     }
 }
 
+/// Compact representation of APK unpack summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactApkUnpackData {
+    pub destination: PathBuf,
+    pub engine: String,
+    pub file_count: usize,
+    pub manifest_extracted: bool,
+    pub resources_extracted: bool,
+    pub smali_generated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_summary: Option<crate::apk::container::AgentSummary>,
+}
+
+impl From<&crate::apk::container::ApkUnpackSummary> for CompactApkUnpackData {
+    fn from(s: &crate::apk::container::ApkUnpackSummary) -> Self {
+        Self {
+            destination: s.destination.clone(),
+            engine: s.engine.clone(),
+            file_count: s.file_count,
+            manifest_extracted: s.manifest_extracted,
+            resources_extracted: s.resources_extracted,
+            smali_generated: s.smali_generated,
+            agent_summary: s.agent_summary.clone(),
+        }
+    }
+}
+
+impl From<crate::apk::container::ApkUnpackSummary> for CompactApkUnpackData {
+    fn from(s: crate::apk::container::ApkUnpackSummary) -> Self {
+        Self::from(&s)
+    }
+}
+
 // ── Tests ──────────────────────────────────────────
 
 #[cfg(test)]
@@ -2239,6 +2273,7 @@ mod tests {
             receivers: Vec::new(),
             providers: Vec::new(),
             raw_xml: None,
+            ..Default::default()
         };
         let compact = CompactManifestInfo::from(&full);
         assert_eq!(compact.pkg, "com.example.app");

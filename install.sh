@@ -2,6 +2,16 @@
 # =============================================================================
 # rvs — AI Agent Setup & Synchronization Tool
 # =============================================================================
+# POSIX re-exec header: ensure execution under bash if invoked via sh/dash
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "Error: rvs installer requires GNU Bash, but bash was not found in PATH." >&2
+        exit 1
+    fi
+fi
+
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
@@ -193,7 +203,124 @@ run_preflight_diagnostics() {
         has_errors=true
     fi
 
-    # 2. radare2 (r2) Check
+    # 2. Java Runtime Environment / JDK Check (Version >= 8 for APK analysis)
+    local java_status="${C_YELLOW}missing${C_RESET}"
+    local java_cmd=""
+    if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]]; then
+        java_cmd="${JAVA_HOME}/bin/java"
+    elif command -v java &>/dev/null; then
+        java_cmd="java"
+    fi
+
+    if [[ -n "$java_cmd" ]]; then
+        local raw_ver=""
+        if raw_ver=$(run_with_timeout 3 "$java_cmd" -version 2>&1) && [[ -n "$raw_ver" ]]; then
+            local java_ver=""
+            if [[ "$raw_ver" =~ version[[:space:]]+\"([^\"]+)\" ]]; then
+                java_ver="${BASH_REMATCH[1]}"
+            elif [[ "$raw_ver" =~ build[[:space:]]+([0-9]+(\.[0-9]+)*) ]]; then
+                java_ver="${BASH_REMATCH[1]}"
+            fi
+
+            local java_type="JRE"
+            local javac_cmd=""
+            if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/javac" ]]; then
+                javac_cmd="${JAVA_HOME}/bin/javac"
+            elif command -v javac &>/dev/null; then
+                javac_cmd="javac"
+            fi
+            if [[ -n "$javac_cmd" ]] && run_with_timeout 2 "$javac_cmd" -version &>/dev/null; then
+                java_type="JDK"
+            fi
+
+            local major_ver=0
+            if [[ "$java_ver" =~ ^1\.([0-9]+) ]]; then
+                major_ver="${BASH_REMATCH[1]}"
+            elif [[ "$java_ver" =~ ^([0-9]+) ]]; then
+                major_ver="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ $major_ver -gt 0 && $major_ver -lt 8 ]]; then
+                java_status="${C_YELLOW}outdated${C_RESET} (v${java_ver:-unknown}, need >= 8)"
+                missing_warnings+=("Java is outdated (v${java_ver:-unknown}); version >= 8 is recommended for APK analysis.")
+            elif [[ -n "$java_ver" ]]; then
+                java_status="${C_GREEN}OK${C_RESET} (v${java_ver}, ${java_type})"
+            else
+                java_status="${C_GREEN}OK${C_RESET} (${java_type})"
+            fi
+        else
+            missing_warnings+=("Java is missing; APK deep analysis will be limited.")
+        fi
+    else
+        missing_warnings+=("Java is missing; APK deep analysis will be limited.")
+    fi
+
+    # 2b. Apktool Check (Binary in PATH or standalone JAR via Java; Non-Fatal & Optional)
+    local apktool_status="${C_DIM}not found (optional)${C_RESET}"
+    local apktool_cmd=""
+    local apktool_jar=""
+
+    # Check 1: Binary executable in PATH or explicit APKTOOL_PATH
+    if [[ -n "${APKTOOL_PATH:-}" ]]; then
+        if [[ -x "$APKTOOL_PATH" ]]; then
+            apktool_cmd="$APKTOOL_PATH"
+        fi
+    elif command -v apktool &>/dev/null; then
+        apktool_cmd="apktool"
+    elif [[ -x "$HOME/.local/bin/apktool" ]]; then
+        apktool_cmd="$HOME/.local/bin/apktool"
+    elif [[ -x "/usr/local/bin/apktool" ]]; then
+        apktool_cmd="/usr/local/bin/apktool"
+    elif [[ -x "/usr/bin/apktool" ]]; then
+        apktool_cmd="/usr/bin/apktool"
+    fi
+
+    # Check 2: Standalone JAR file in standard locations
+    if [[ -z "$apktool_cmd" ]]; then
+        if [[ -n "${APKTOOL_JAR:-}" ]]; then
+            if [[ -f "$APKTOOL_JAR" ]]; then
+                apktool_jar="$APKTOOL_JAR"
+            fi
+        else
+            local jar_candidates=(
+                "$HOME/.local/opt/apktool/apktool.jar"
+                "$HOME/.local/share/apktool/apktool.jar"
+                "/usr/local/bin/apktool.jar"
+                "/usr/local/share/apktool/apktool.jar"
+                "/usr/share/java/apktool.jar"
+                "/usr/share/java/apktool/apktool.jar"
+                "/opt/apktool/apktool.jar"
+                "/usr/local/lib/apktool.jar"
+            )
+            for cand in "${jar_candidates[@]}"; do
+                if [[ -f "$cand" ]]; then
+                    apktool_jar="$cand"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    # Check 3: Extract version string if runner or jar+java exists
+    local apktool_raw=""
+    if [[ -n "$apktool_cmd" ]]; then
+        apktool_raw=$(run_with_timeout 3 "$apktool_cmd" --version 2>&1 || run_with_timeout 3 "$apktool_cmd" -version 2>&1 || true)
+    elif [[ -n "$apktool_jar" && -n "$java_cmd" ]]; then
+        apktool_raw=$(run_with_timeout 3 "$java_cmd" -jar "$apktool_jar" --version 2>&1 || run_with_timeout 3 "$java_cmd" -jar "$apktool_jar" -version 2>&1 || true)
+    fi
+
+    if [[ -n "$apktool_cmd" || ( -n "$apktool_jar" && -n "$java_cmd" ) ]]; then
+        local apktool_ver=""
+        if [[ "$apktool_raw" =~ ([0-9]+(\.[0-9]+)+(-[a-zA-Z0-9._]+)?) ]]; then
+            apktool_ver="${BASH_REMATCH[1]}"
+            apktool_ver="${apktool_ver#v}"
+            apktool_status="${C_GREEN}OK${C_RESET} (v${apktool_ver})"
+        else
+            apktool_status="${C_GREEN}OK${C_RESET}"
+        fi
+    fi
+
+    # 3. radare2 (r2) Check
     local r2_status="${C_YELLOW}not found${C_RESET}"
     if command -v radare2 &>/dev/null; then
         local r2_ver
@@ -203,7 +330,7 @@ run_preflight_diagnostics() {
         missing_warnings+=("radare2 is missing; static/ESIL analysis will be limited.")
     fi
 
-    # 3. Core CLI tools (git, jq)
+    # 4. Core CLI tools (git, jq)
     local git_status="${C_RED}missing${C_RESET}"
     if command -v git &>/dev/null; then
         git_status="${C_GREEN}OK${C_RESET}"
@@ -220,7 +347,7 @@ run_preflight_diagnostics() {
         has_errors=true
     fi
 
-    # 4. Cargo (Optional, for building from source)
+    # 5. Cargo (Optional, for building from source)
     local cargo_status="${C_DIM}not found${C_RESET}"
     if command -v cargo &>/dev/null; then
         local cargo_ver
@@ -228,7 +355,7 @@ run_preflight_diagnostics() {
         cargo_status="${C_GREEN}OK${C_RESET} ($cargo_ver)"
     fi
 
-    # 5. rvs CLI Shortcut & Symlink Diagnostic
+    # 6. rvs CLI Shortcut & Symlink Diagnostic
     local rvs_cli_status="${C_DIM}not installed${C_RESET}"
     if [[ -L "$HOME/.local/bin/rvs" ]]; then
         local link_dest
@@ -239,7 +366,7 @@ run_preflight_diagnostics() {
         missing_warnings+=("$HOME/.local/bin/rvs is not a symlink; re-link it to $RVS_BIN.")
     fi
 
-    # 6. Agent Detection
+    # 7. Agent Detection
     detect_agents
 
     # Display Diagnostic Table
@@ -249,6 +376,8 @@ run_preflight_diagnostics() {
         echo -e "  Repo      : ${C_CYAN}$REPO_DIR${C_RESET}"
         echo -e "  rvs CLI   : $rvs_cli_status"
         echo -e "  Python 3  : $py_status"
+        echo -e "  Java      : $java_status"
+        echo -e "  Apktool   : $apktool_status"
         echo -e "  radare2   : $r2_status"
         echo -e "  Git       : $git_status"
         echo -e "  jq        : $jq_status"
@@ -264,16 +393,14 @@ run_preflight_diagnostics() {
         if [[ ${#missing_required[@]} -gt 0 ]]; then
             echo ""
             error "Missing required dependencies: ${missing_required[*]}"
-            echo "Install them with your package manager:"
-            echo "  Debian/Ubuntu : sudo apt install ${missing_required[*]}"
-            echo "  macOS         : brew install ${missing_required[*]}"
-            echo "  Arch Linux    : sudo pacman -S ${missing_required[*]}"
             echo ""
             return 1
         fi
 
         if [[ ${#missing_warnings[@]} -gt 0 ]]; then
-            warn "${missing_warnings[*]}"
+            for w in "${missing_warnings[@]}"; do
+                warn "$w"
+            done
             echo ""
         fi
     fi
@@ -1109,6 +1236,12 @@ main() {
     if [[ "${1:-}" == "--check-update-silent" || "${1:-}" == "--update-silent" ]]; then
         check_update_silent
         exit 0
+    fi
+
+    if [[ "${1:-}" == "--diagnostics" || "${1:-}" == "--check" ]]; then
+        print_banner
+        run_preflight_diagnostics true
+        exit $?
     fi
 
     print_banner

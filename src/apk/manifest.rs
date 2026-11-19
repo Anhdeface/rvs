@@ -2,6 +2,74 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::apk::sanitize::sanitize_identifier;
 
+/// Detailed information about an Android intent-filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentFilterInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_schemes: Vec<String>,
+}
+
+/// Structured representation of an Android component (activity, service, receiver, provider).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestComponent {
+    pub name: String,
+    pub component_type: String, // "activity", "service", "receiver", "provider"
+    pub exported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_filters: Vec<IntentFilterInfo>,
+}
+
+/// Helper to determine if an Android permission is categorized as dangerous / runtime-prompted.
+pub fn is_dangerous_permission(permission: &str) -> bool {
+    let perm = permission.trim();
+    const DANGEROUS: &[&str] = &[
+        "READ_CALENDAR",
+        "WRITE_CALENDAR",
+        "CAMERA",
+        "READ_CONTACTS",
+        "WRITE_CONTACTS",
+        "GET_ACCOUNTS",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "RECORD_AUDIO",
+        "READ_PHONE_STATE",
+        "READ_PHONE_NUMBERS",
+        "CALL_PHONE",
+        "ANSWER_PHONE_CALLS",
+        "READ_CALL_LOG",
+        "WRITE_CALL_LOG",
+        "ADD_VOICEMAIL",
+        "USE_SIP",
+        "PROCESS_OUTGOING_CALLS",
+        "BODY_SENSORS",
+        "BODY_SENSORS_BACKGROUND",
+        "SEND_SMS",
+        "RECEIVE_SMS",
+        "READ_SMS",
+        "RECEIVE_WAP_PUSH",
+        "RECEIVE_MMS",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "ACCESS_MEDIA_LOCATION",
+        "POST_NOTIFICATIONS",
+        "NEARBY_WIFI_DEVICES",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "BLUETOOTH_ADVERTISE",
+        "UWB_RANGING",
+        "ACTIVITY_RECOGNITION",
+    ];
+    let short_name = perm.rsplit('.').next().unwrap_or(perm);
+    DANGEROUS.contains(&short_name) || DANGEROUS.iter().any(|d| perm.ends_with(d))
+}
+
 /// Structured summary of an AndroidManifest.xml file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestInfo {
@@ -18,6 +86,10 @@ pub struct ManifestInfo {
     pub providers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_xml: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ManifestComponent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dangerous_permissions: Vec<String>,
 }
 
 /// Decode AndroidManifest raw bytes (binary AXML or plain text XML) into readable XML text.
@@ -285,15 +357,28 @@ impl ManifestInfo {
         let mut target_sdk_version = None;
         let mut debuggable = false;
         let mut permissions = Vec::new();
+        let mut dangerous_permissions = Vec::new();
         let mut activities = Vec::new();
         let mut services = Vec::new();
         let mut receivers = Vec::new();
         let mut providers = Vec::new();
+        let mut components = Vec::new();
+
+        struct CurComp {
+            name: String,
+            component_type: String,
+            explicit_exported: Option<bool>,
+            permission: Option<String>,
+            intent_filters: Vec<IntentFilterInfo>,
+        }
+
+        let mut cur_component: Option<CurComp> = None;
+        let mut cur_filter: Option<IntentFilterInfo> = None;
 
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                Ok(quick_xml::events::Event::Start(e)) => {
                     let local_tag = e.name().local_name();
                     let tag_bytes = local_tag.as_ref();
 
@@ -333,6 +418,9 @@ impl ManifestInfo {
                             if let Some(name) = get_attr("name") {
                                 let clean = sanitize_identifier(&name);
                                 if !clean.is_empty() && !permissions.contains(&clean) {
+                                    if is_dangerous_permission(&clean) && !dangerous_permissions.contains(&clean) {
+                                        dangerous_permissions.push(clean.clone());
+                                    }
                                     permissions.push(clean);
                                 }
                             }
@@ -342,39 +430,200 @@ impl ManifestInfo {
                                 debuggable = dbg.eq_ignore_ascii_case("true") || dbg == "1";
                             }
                         }
-                        b"activity" | b"activity-alias" => {
-                            if let Some(name) = get_attr("name") {
-                                let clean = sanitize_identifier(&name);
-                                if !clean.is_empty() && !activities.contains(&clean) {
-                                    activities.push(clean);
+                        b"activity" | b"activity-alias" | b"service" | b"receiver" | b"provider" => {
+                            let comp_type = match tag_bytes {
+                                b"service" => "service",
+                                b"receiver" => "receiver",
+                                b"provider" => "provider",
+                                _ => "activity",
+                            };
+                            let name = get_attr("name").map(|n| sanitize_identifier(&n)).unwrap_or_default();
+                            let permission = get_attr("permission").map(|p| sanitize_identifier(&p));
+                            let explicit_exported = get_attr("exported").map(|v| v.eq_ignore_ascii_case("true") || v == "1");
+
+                            if !name.is_empty() {
+                                match comp_type {
+                                    "activity" if !activities.contains(&name) => activities.push(name.clone()),
+                                    "service" if !services.contains(&name) => services.push(name.clone()),
+                                    "receiver" if !receivers.contains(&name) => receivers.push(name.clone()),
+                                    "provider" if !providers.contains(&name) => providers.push(name.clone()),
+                                    _ => {}
+                                }
+                            }
+
+                            cur_component = Some(CurComp {
+                                name,
+                                component_type: comp_type.to_string(),
+                                explicit_exported,
+                                permission,
+                                intent_filters: Vec::new(),
+                            });
+                        }
+                        b"intent-filter" => {
+                            if cur_component.is_some() {
+                                cur_filter = Some(IntentFilterInfo::default());
+                            }
+                        }
+                        b"action" => {
+                            if let Some(ref mut f) = cur_filter {
+                                if let Some(act) = get_attr("name").map(|a| sanitize_identifier(&a)) {
+                                    if !act.is_empty() && !f.actions.contains(&act) {
+                                        f.actions.push(act);
+                                    }
                                 }
                             }
                         }
-                        b"service" => {
-                            if let Some(name) = get_attr("name") {
-                                let clean = sanitize_identifier(&name);
-                                if !clean.is_empty() && !services.contains(&clean) {
-                                    services.push(clean);
+                        b"category" => {
+                            if let Some(ref mut f) = cur_filter {
+                                if let Some(cat) = get_attr("name").map(|c| sanitize_identifier(&c)) {
+                                    if !cat.is_empty() && !f.categories.contains(&cat) {
+                                        f.categories.push(cat);
+                                    }
                                 }
                             }
                         }
-                        b"receiver" => {
-                            if let Some(name) = get_attr("name") {
-                                let clean = sanitize_identifier(&name);
-                                if !clean.is_empty() && !receivers.contains(&clean) {
-                                    receivers.push(clean);
-                                }
-                            }
-                        }
-                        b"provider" => {
-                            if let Some(name) = get_attr("name") {
-                                let clean = sanitize_identifier(&name);
-                                if !clean.is_empty() && !providers.contains(&clean) {
-                                    providers.push(clean);
+                        b"data" => {
+                            if let Some(ref mut f) = cur_filter {
+                                if let Some(sch) = get_attr("scheme").map(|s| sanitize_identifier(&s)) {
+                                    if !sch.is_empty() && !f.data_schemes.contains(&sch) {
+                                        f.data_schemes.push(sch);
+                                    }
                                 }
                             }
                         }
                         _ => {}
+                    }
+                }
+                Ok(quick_xml::events::Event::Empty(e)) => {
+                    let local_tag = e.name().local_name();
+                    let tag_bytes = local_tag.as_ref();
+
+                    let get_attr = |target: &str| -> Option<String> {
+                        for attr in e.attributes().flatten() {
+                            let key_local = attr.key.local_name();
+                            if key_local.as_ref().eq_ignore_ascii_case(target.as_bytes()) {
+                                if let Ok(val) = attr.unescape_value() {
+                                    return Some(val.trim().to_string());
+                                }
+                            }
+                        }
+                        None
+                    };
+
+                    match tag_bytes {
+                        b"manifest" => {
+                            if let Some(pkg) = get_attr("package") {
+                                package_name = sanitize_identifier(&pkg);
+                            }
+                            if let Some(vc) = get_attr("versionCode").and_then(|s| parse_int(&s)) {
+                                version_code = Some(vc);
+                            }
+                            if let Some(vn) = get_attr("versionName") {
+                                version_name = Some(sanitize_identifier(&vn));
+                            }
+                        }
+                        b"uses-sdk" => {
+                            if let Some(min) = get_attr("minSdkVersion").and_then(|s| parse_int(&s)) {
+                                min_sdk_version = Some(min);
+                            }
+                            if let Some(target) = get_attr("targetSdkVersion").and_then(|s| parse_int(&s)) {
+                                target_sdk_version = Some(target);
+                            }
+                        }
+                        b"uses-permission" | b"permission" => {
+                            if let Some(name) = get_attr("name") {
+                                let clean = sanitize_identifier(&name);
+                                if !clean.is_empty() && !permissions.contains(&clean) {
+                                    if is_dangerous_permission(&clean) && !dangerous_permissions.contains(&clean) {
+                                        dangerous_permissions.push(clean.clone());
+                                    }
+                                    permissions.push(clean);
+                                }
+                            }
+                        }
+                        b"application" => {
+                            if let Some(dbg) = get_attr("debuggable") {
+                                debuggable = dbg.eq_ignore_ascii_case("true") || dbg == "1";
+                            }
+                        }
+                        b"activity" | b"activity-alias" | b"service" | b"receiver" | b"provider" => {
+                            let comp_type = match tag_bytes {
+                                b"service" => "service",
+                                b"receiver" => "receiver",
+                                b"provider" => "provider",
+                                _ => "activity",
+                            };
+                            let name = get_attr("name").map(|n| sanitize_identifier(&n)).unwrap_or_default();
+                            let permission = get_attr("permission").map(|p| sanitize_identifier(&p));
+                            let explicit_exported = get_attr("exported").map(|v| v.eq_ignore_ascii_case("true") || v == "1");
+
+                            if !name.is_empty() {
+                                match comp_type {
+                                    "activity" if !activities.contains(&name) => activities.push(name.clone()),
+                                    "service" if !services.contains(&name) => services.push(name.clone()),
+                                    "receiver" if !receivers.contains(&name) => receivers.push(name.clone()),
+                                    "provider" if !providers.contains(&name) => providers.push(name.clone()),
+                                    _ => {}
+                                }
+                                components.push(ManifestComponent {
+                                    name,
+                                    component_type: comp_type.to_string(),
+                                    exported: explicit_exported.unwrap_or(false),
+                                    permission,
+                                    intent_filters: Vec::new(),
+                                });
+                            }
+                        }
+                        b"action" => {
+                            if let Some(ref mut f) = cur_filter {
+                                if let Some(act) = get_attr("name").map(|a| sanitize_identifier(&a)) {
+                                    if !act.is_empty() && !f.actions.contains(&act) {
+                                        f.actions.push(act);
+                                    }
+                                }
+                            }
+                        }
+                        b"category" => {
+                            if let Some(ref mut f) = cur_filter {
+                                if let Some(cat) = get_attr("name").map(|c| sanitize_identifier(&c)) {
+                                    if !cat.is_empty() && !f.categories.contains(&cat) {
+                                        f.categories.push(cat);
+                                    }
+                                }
+                            }
+                        }
+                        b"data" => {
+                            if let Some(ref mut f) = cur_filter {
+                                if let Some(sch) = get_attr("scheme").map(|s| sanitize_identifier(&s)) {
+                                    if !sch.is_empty() && !f.data_schemes.contains(&sch) {
+                                        f.data_schemes.push(sch);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(quick_xml::events::Event::End(e)) => {
+                    let local_tag = e.name().local_name();
+                    let tag_bytes = local_tag.as_ref();
+                    if tag_bytes == b"intent-filter" {
+                        if let (Some(ref mut comp), Some(f)) = (&mut cur_component, cur_filter.take()) {
+                            comp.intent_filters.push(f);
+                        }
+                    } else if matches!(tag_bytes, b"activity" | b"activity-alias" | b"service" | b"receiver" | b"provider") {
+                        if let Some(c) = cur_component.take() {
+                            if !c.name.is_empty() {
+                                let exported = c.explicit_exported.unwrap_or(!c.intent_filters.is_empty());
+                                components.push(ManifestComponent {
+                                    name: c.name,
+                                    component_type: c.component_type,
+                                    exported,
+                                    permission: c.permission,
+                                    intent_filters: c.intent_filters,
+                                });
+                            }
+                        }
                     }
                 }
                 Ok(quick_xml::events::Event::Eof) => break,
@@ -399,6 +648,8 @@ impl ManifestInfo {
             receivers,
             providers,
             raw_xml: None,
+            components,
+            dangerous_permissions,
         })
     }
 
@@ -418,10 +669,12 @@ impl ManifestInfo {
         let mut target_sdk_version = None;
         let mut debuggable = false;
         let mut permissions = Vec::new();
+        let mut dangerous_permissions = Vec::new();
         let mut activities = Vec::new();
         let mut services = Vec::new();
         let mut receivers = Vec::new();
         let mut providers = Vec::new();
+        let mut components = Vec::new();
 
         // Traverse elements
         for child in &root.children {
@@ -441,6 +694,9 @@ impl ManifestInfo {
                 "uses-permission" | "permission" => {
                     if let Some(name) = find_attr(child, "name").map(|a| sanitize_identifier(a.value.trim())) {
                         if !name.is_empty() && !permissions.contains(&name) {
+                            if is_dangerous_permission(&name) && !dangerous_permissions.contains(&name) {
+                                dangerous_permissions.push(name.clone());
+                            }
                             permissions.push(name);
                         }
                     }
@@ -453,36 +709,87 @@ impl ManifestInfo {
                     }
 
                     for app_child in &child.children {
-                        match app_child.name.as_str() {
-                            "activity" | "activity-alias" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
-                                    if !name.is_empty() && !activities.contains(&name) {
-                                        activities.push(name);
+                        let comp_type = match app_child.name.as_str() {
+                            "activity" | "activity-alias" => "activity",
+                            "service" => "service",
+                            "receiver" => "receiver",
+                            "provider" => "provider",
+                            _ => continue,
+                        };
+
+                        if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
+                            if !name.is_empty() {
+                                match comp_type {
+                                    "activity" if !activities.contains(&name) => activities.push(name.clone()),
+                                    "service" if !services.contains(&name) => services.push(name.clone()),
+                                    "receiver" if !receivers.contains(&name) => receivers.push(name.clone()),
+                                    "provider" if !providers.contains(&name) => providers.push(name.clone()),
+                                    _ => {}
+                                }
+
+                                let permission = find_attr(app_child, "permission").map(|a| sanitize_identifier(a.value.trim()));
+                                let explicit_exported = find_attr(app_child, "exported").and_then(|a| {
+                                    a.as_bool().or_else(|| a.value.trim().parse::<bool>().ok()).or_else(|| {
+                                        if a.value.trim() == "1" {
+                                            Some(true)
+                                        } else if a.value.trim() == "0" {
+                                            Some(false)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                });
+
+                                let mut intent_filters = Vec::new();
+                                for filter_child in &app_child.children {
+                                    if filter_child.name == "intent-filter" {
+                                        let mut actions = Vec::new();
+                                        let mut categories = Vec::new();
+                                        let mut data_schemes = Vec::new();
+
+                                        for sub in &filter_child.children {
+                                            match sub.name.as_str() {
+                                                "action" => {
+                                                    if let Some(act) = find_attr(sub, "name").map(|a| sanitize_identifier(a.value.trim())) {
+                                                        if !act.is_empty() && !actions.contains(&act) {
+                                                            actions.push(act);
+                                                        }
+                                                    }
+                                                }
+                                                "category" => {
+                                                    if let Some(cat) = find_attr(sub, "name").map(|a| sanitize_identifier(a.value.trim())) {
+                                                        if !cat.is_empty() && !categories.contains(&cat) {
+                                                            categories.push(cat);
+                                                        }
+                                                    }
+                                                }
+                                                "data" => {
+                                                    if let Some(sch) = find_attr(sub, "scheme").map(|a| sanitize_identifier(a.value.trim())) {
+                                                        if !sch.is_empty() && !data_schemes.contains(&sch) {
+                                                            data_schemes.push(sch);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        intent_filters.push(IntentFilterInfo {
+                                            actions,
+                                            categories,
+                                            data_schemes,
+                                        });
                                     }
                                 }
+
+                                let exported = explicit_exported.unwrap_or(!intent_filters.is_empty());
+                                components.push(ManifestComponent {
+                                    name,
+                                    component_type: comp_type.to_string(),
+                                    exported,
+                                    permission,
+                                    intent_filters,
+                                });
                             }
-                            "service" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
-                                    if !name.is_empty() && !services.contains(&name) {
-                                        services.push(name);
-                                    }
-                                }
-                            }
-                            "receiver" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
-                                    if !name.is_empty() && !receivers.contains(&name) {
-                                        receivers.push(name);
-                                    }
-                                }
-                            }
-                            "provider" => {
-                                if let Some(name) = find_attr(app_child, "name").map(|a| sanitize_identifier(a.value.trim())) {
-                                    if !name.is_empty() && !providers.contains(&name) {
-                                        providers.push(name);
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -503,6 +810,8 @@ impl ManifestInfo {
             receivers,
             providers,
             raw_xml: None,
+            components,
+            dangerous_permissions,
         })
     }
 }

@@ -604,6 +604,122 @@ pub fn extract_resource_or_asset(pkg: &ApkPackage, entry_name: &str) -> Result<E
     })
 }
 
+/// Helper to escape XML special characters in string values
+fn escape_xml_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Generate a valid, indented `res/values/strings.xml` XML document from key-value pairs.
+pub fn generate_strings_xml(strings: &[(String, String)]) -> String {
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n");
+    for (key, val) in strings {
+        let escaped_key = escape_xml_text(key);
+        let escaped_val = escape_xml_text(val);
+        out.push_str(&format!(
+            "    <string name=\"{}\">{}</string>\n",
+            escaped_key, escaped_val
+        ));
+    }
+    out.push_str("</resources>\n");
+    out
+}
+
+/// Extract string resource key-value pairs from `resources.arsc` binary data.
+///
+/// Supports multi-layer extraction:
+/// 1. `apk_info::ARSC` resolution for typed string table entries and resource name lookups.
+/// 2. Package key string pool and global string pool correlation fallback.
+pub fn extract_arsc_strings(bytes: &[u8]) -> Vec<(String, String)> {
+    if bytes.len() < 12 {
+        return Vec::new();
+    }
+
+    let mut results: Vec<(String, String)> = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
+
+    // Layer 1: apk_info::ARSC
+    let normalized = normalize_arsc_table(bytes);
+    let mut input = normalized.as_slice();
+    if let Ok(arsc) = apk_info::ARSC::new(&mut input) {
+        for pkg in arsc.packages() {
+            for k in 0..pkg.key_strings.len() {
+                if let Some(key) = pkg.key_strings.get(k as u32) {
+                    let sanitized_key = sanitize_identifier(&key);
+                    if sanitized_key.is_empty() || seen_keys.contains(&sanitized_key) {
+                        continue;
+                    }
+                    if let Some(val) = arsc.get_resource_value_by_name(&key) {
+                        if !val.is_empty() {
+                            seen_keys.insert(sanitized_key.clone());
+                            results.push((sanitized_key, val));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Layer 2: Direct chunk analysis fallback if Layer 1 found nothing or incomplete
+    if results.is_empty() {
+        let mut offset = 12;
+        let mut global_strings = Vec::new();
+        let total_size = bytes.len();
+        while offset + 8 <= total_size {
+            let c_type = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+            let c_size = u32::from_le_bytes([
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
+            ]) as usize;
+            if c_size < 8 || offset + c_size > bytes.len() {
+                break;
+            }
+            if c_type == 0x0001 && global_strings.is_empty() {
+                global_strings = parse_string_pool(&bytes[offset..offset + c_size]);
+            } else if c_type == 0x0200 && c_size >= 284 {
+                // Package chunk: key strings offset is at chunk offset 276
+                let key_off = u32::from_le_bytes([
+                    bytes[offset + 276],
+                    bytes[offset + 277],
+                    bytes[offset + 278],
+                    bytes[offset + 279],
+                ]) as usize;
+                if key_off > 0 && offset + key_off < offset + c_size {
+                    let key_strings = parse_string_pool(&bytes[offset + key_off..offset + c_size]);
+                    for (i, key) in key_strings.iter().enumerate() {
+                        let sanitized_key = sanitize_identifier(key);
+                        if sanitized_key.is_empty() || seen_keys.contains(&sanitized_key) {
+                            continue;
+                        }
+                        let val = if i < global_strings.len() && !global_strings[i].is_empty() {
+                            global_strings[i].clone()
+                        } else {
+                            key.clone()
+                        };
+                        seen_keys.insert(sanitized_key.clone());
+                        results.push((sanitized_key, val));
+                    }
+                }
+            }
+            offset += c_size;
+        }
+    }
+
+    results
+}
+
 /// Dump all resources and assets into `output_dir`.
 /// Binary AXML files are decoded to human-readable XML where possible.
 pub fn dump_resources_and_assets(pkg: &ApkPackage, output_dir: &Path) -> Result<usize, AppError> {
@@ -826,6 +942,22 @@ mod tests {
             let ext = analysis.extracted.unwrap();
             assert_eq!(ext.name, "assets/app_config.json");
             assert!(ext.content.contains("environment"));
+        }
+    }
+
+    #[test]
+    fn test_extract_arsc_strings_and_generate_xml() {
+        let apk_path = fixtures_dir().join("sample_raw.apk");
+        if apk_path.is_file() {
+            let pkg = ApkPackage::open(&apk_path).unwrap();
+            if let Ok(bytes) = pkg.read_entry("resources.arsc") {
+                let strings = extract_arsc_strings(&bytes);
+                assert!(!strings.is_empty(), "Extracted ARSC strings should not be empty");
+                let xml = generate_strings_xml(&strings);
+                assert!(xml.contains("<resources>"));
+                assert!(xml.contains("</resources>"));
+                assert!(xml.contains("<string name="));
+            }
         }
     }
 }

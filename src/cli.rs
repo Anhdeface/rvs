@@ -212,6 +212,25 @@ pub enum ApkCommands {
         #[arg(long)]
         verify: bool,
     },
+
+    /// Unpack, decode, and extract an APK package into a structured directory (manifest, resources, smali, assets, lib).
+    #[command(alias = "decode")]
+    Unpack {
+        /// Path to the APK package archive
+        path: PathBuf,
+
+        /// Destination directory (defaults to <apk_stem>_unpacked)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Force overwrite of existing destination directory
+        #[arg(short = 'F', long)]
+        force: bool,
+
+        /// Force pure-Rust unpacking (skip Java/apktool even if present)
+        #[arg(long)]
+        no_java: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

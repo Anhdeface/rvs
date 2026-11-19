@@ -776,6 +776,21 @@ pub struct SignatureData {
     pub warnings: Vec<String>,
 }
 
+/// APK unpack payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApkUnpackData {
+    pub destination: PathBuf,
+    pub engine: String,
+    pub file_count: usize,
+    pub manifest_extracted: bool,
+    pub resources_extracted: bool,
+    pub smali_generated: bool,
+    #[serde(default)]
+    pub agent_summary: Option<rvs::apk::container::AgentSummary>,
+    #[serde(default)]
+    pub repairs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignerInfoData {
     pub subject: String,
