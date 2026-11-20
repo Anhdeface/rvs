@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::apk::sanitize::sanitize_identifier;
 pub use crate::error::AppError;
 
-pub const CURRENT_FORMAT_VERSION: &str = "0.4.2";
+pub const CURRENT_FORMAT_VERSION: &str = "0.4.3";
 
 /// Standard API response envelope wrapping all CLI outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

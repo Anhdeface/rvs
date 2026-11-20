@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::all)]
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
@@ -676,6 +677,8 @@ pub struct DexAnalysisData {
     pub smali: Option<String>,
     #[serde(default)]
     pub decompiled: Option<String>,
+    #[serde(default)]
+    pub summary: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +692,16 @@ pub struct DexClassSummaryData {
     pub methods: Vec<DexMethodSummaryData>,
     #[serde(default)]
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub detailed_fields: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub interfaces: Option<Vec<String>>,
+    #[serde(default)]
+    pub source_file: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub dex_source: Option<String>,
     #[serde(default)]
     pub smali: Option<String>,
 }
@@ -707,6 +720,12 @@ pub struct DexMethodSummaryData {
     pub insns_size: Option<u32>,
     #[serde(default)]
     pub disassembly: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub cfg: Option<serde_json::Value>,
+    #[serde(default)]
+    pub xrefs: Option<serde_json::Value>,
+    #[serde(default)]
+    pub annotations: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub smali: Option<String>,
     #[serde(default)]

@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::r2::R2Driver;
 
 /// Payload for `agent flow` command
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentFlowData {
     pub function_name: String,
     pub function_addr: u64,
@@ -15,7 +15,7 @@ pub struct AgentFlowData {
     pub loop_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BranchGateNode {
     pub addr: u64,
     pub addr_hex: String,
@@ -127,8 +127,10 @@ pub fn run_flow(driver: &R2Driver, function: &str) -> Result<AgentFlowData, AppE
 }
 
 /// Classifies branch instruction into standard decision gate types.
-/// Supports both x86/x86_64 mnemonics and AArch64 conditional branches:
-/// b.eq, b.ne, b.cs, b.cc, b.mi, b.pl, b.vs, b.vc, b.hi, b.ls, b.ge, b.lt, b.gt, b.le, cbz, cbnz, tbz, tbnz.
+/// Supports x86/x86_64, AArch64, and Dalvik DEX conditional branches:
+/// - x86: je, jz, jne, jnz, jg, ja, jl, jb, etc.
+/// - AArch64: b.eq, b.ne, b.cs, b.cc, b.mi, b.pl, b.vs, b.vc, b.hi, b.ls, b.ge, b.lt, b.gt, b.le, cbz, cbnz, tbz, tbnz.
+/// - Dalvik: if-eq, if-ne, if-lt, if-ge, if-gt, if-le, if-eqz, if-nez, if-ltz, if-gez, if-gtz, if-lez.
 pub fn classify_gate_type(branch_inst: &str) -> Option<String> {
     let lower = branch_inst.to_lowercase();
     let mnemonic = lower.split_whitespace().next().unwrap_or("");
@@ -138,6 +140,7 @@ pub fn classify_gate_type(branch_inst: &str) -> Option<String> {
         || mnemonic == "b.eq"
         || mnemonic == "cbz"
         || mnemonic == "tbz"
+        || mnemonic.starts_with("if-eq")
     {
         Some("equality_zero_check".to_string())
     } else if mnemonic.starts_with("jne")
@@ -145,6 +148,7 @@ pub fn classify_gate_type(branch_inst: &str) -> Option<String> {
         || mnemonic == "b.ne"
         || mnemonic == "cbnz"
         || mnemonic == "tbnz"
+        || mnemonic.starts_with("if-ne")
     {
         Some("inequality_nonzero_check".to_string())
     } else if mnemonic.starts_with("jg")
@@ -153,6 +157,8 @@ pub fn classify_gate_type(branch_inst: &str) -> Option<String> {
         || mnemonic == "b.hi"
         || mnemonic == "b.ge"
         || mnemonic == "b.pl"
+        || mnemonic.starts_with("if-gt")
+        || mnemonic.starts_with("if-ge")
     {
         Some("greater_check".to_string())
     } else if mnemonic.starts_with("jl")
@@ -163,6 +169,8 @@ pub fn classify_gate_type(branch_inst: &str) -> Option<String> {
         || mnemonic == "b.ls"
         || mnemonic == "b.cc"
         || mnemonic == "b.mi"
+        || mnemonic.starts_with("if-lt")
+        || mnemonic.starts_with("if-le")
     {
         Some("less_check".to_string())
     } else {

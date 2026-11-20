@@ -152,8 +152,8 @@ class TestPathologicalBudgets(unittest.TestCase):
 
     def test_boundary_zero_vs_one_behavior(self) -> None:
         """
-        Document empirical finding: B <= 0 retains empty collection dictionary (168-202 tokens),
-        whereas B in [1, 150] collapses data to exhausted marker (124-126 tokens).
+        Document empirical finding: B <= 0 and B = 1 symmetrize minimal floor,
+        collapsing data to minimal marker {"truncated": True} to preserve monotonicity.
         Both remain strictly <= max(B, B_min).
         """
         res_0 = self.harness.disasm(FIXTURE_PATH, "main", compact=True, budget=0)
@@ -166,12 +166,10 @@ class TestPathologicalBudgets(unittest.TestCase):
         self.assertLessEqual(tok_0, 210)
         self.assertLessEqual(tok_1, 210)
 
-        # B=0 keeps blocks: [] list inside data dict
-        self.assertIn("blocks", res_0.get("data", {}))
-        self.assertEqual(res_0["data"]["blocks"], [])
-
-        # B=1 collapses data to {"truncated": True, "note": "Budget exhausted"}
-        self.assertIn("note", res_1.get("data", {}))
+        # Both collapse data to minimal marker {"truncated": True}
+        self.assertTrue(res_0.get("data", {}).get("truncated", False))
+        self.assertTrue(res_1.get("data", {}).get("truncated", False))
+        self.assertLessEqual(tok_0, tok_1)
 
 
 class TestPathologicalRepetitiveStreams(unittest.TestCase):

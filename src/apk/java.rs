@@ -115,9 +115,8 @@ impl JavaEnvironment {
     pub fn check_java_version_supported(version_str: &str) -> bool {
         let trimmed = version_str.trim();
         let cleaned = trimmed.strip_prefix('v').unwrap_or(trimmed);
-        if cleaned.starts_with("1.") {
+        if let Some(rest) = cleaned.strip_prefix("1.") {
             // Legacy version scheme: 1.8, 1.7, 1.8.0_312, etc.
-            let rest = &cleaned[2..];
             let minor_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(minor) = minor_str.parse::<u32>() {
                 minor >= 8

@@ -39,6 +39,79 @@ pub struct DexDebugInfo {
     pub source_file: Option<String>,
 }
 
+/// Detailed representation of a Dalvik class field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexFieldSummary {
+    pub name: String,
+    pub type_descriptor: String,
+    pub access_flags: u32,
+    pub is_static: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<DexAnnotationSummary>,
+}
+
+/// Annotation metadata associated with a class, method, or field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexAnnotationSummary {
+    pub visibility: String, // "build", "runtime", "system"
+    pub type_descriptor: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elements: Vec<(String, String)>, // (key, value preview)
+}
+
+/// Basic block in Dalvik control flow graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexBasicBlock {
+    pub id: usize,
+    pub start_addr: u64,
+    pub end_addr: u64,
+    pub instructions: Vec<DalvikInstruction>,
+    pub successors: Vec<usize>,
+    pub predecessors: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump_target: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_target: Option<u64>,
+}
+
+/// Complete Control Flow Graph representation for a Dalvik method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexMethodCfg {
+    pub method_name: String,
+    pub total_blocks: usize,
+    pub blocks: Vec<DexBasicBlock>,
+    pub decision_gates: Vec<crate::agent::flow::BranchGateNode>,
+    pub loop_count: usize,
+}
+
+/// Cross-reference summary for a method, field, or string.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexXrefSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callees: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strings_referenced: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields_read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields_written: Vec<String>,
+}
+
+/// High-level summary of DEX classes and methods for `--summary` CLI output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexSummary {
+    pub total_classes: usize,
+    pub total_methods: usize,
+    pub total_fields: usize,
+    pub total_strings: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_classes: Vec<String>,
+}
+
 /// Summary representation of a Dalvik method inside a DEX class.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DexMethodSummary {
@@ -59,6 +132,12 @@ pub struct DexMethodSummary {
     pub smali: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompiled: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<DexMethodCfg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xrefs: Option<DexXrefSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<DexAnnotationSummary>,
 }
 
 /// Summary representation of a Dalvik class definition.
@@ -70,8 +149,18 @@ pub struct DexClassSummary {
     pub access_flags: u32,
     pub methods: Vec<DexMethodSummary>,
     pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detailed_fields: Vec<DexFieldSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<DexAnnotationSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smali: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dex_source: Option<String>,
 }
 
 /// Aggregate result of DEX file analysis.
@@ -90,9 +179,11 @@ pub struct DexAnalysisResult {
     pub smali: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompiled: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<DexSummary>,
 }
 
-/// Disassembled Dalvik instruction representation from radare2 `pdj`.
+/// Disassembled Dalvik instruction representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DalvikInstruction {
     pub addr: u64,
@@ -647,6 +738,60 @@ fn extract_method_code_offsets(bytes: &[u8], class_data_off: usize) -> (Vec<Opti
     (direct_offsets, virtual_offsets)
 }
 
+/// Formats an encoded value into a human-readable string preview.
+fn format_encoded_value(val: &dex::encoded_value::EncodedValue) -> String {
+    use dex::encoded_value::EncodedValue;
+    match val {
+        EncodedValue::Byte(b) => b.to_string(),
+        EncodedValue::Short(s) => s.to_string(),
+        EncodedValue::Char(c) => format!("{:?}", char::from_u32(*c as u32).unwrap_or('?')),
+        EncodedValue::Int(i) => i.to_string(),
+        EncodedValue::Long(l) => l.to_string(),
+        EncodedValue::Float(f) => f.to_string(),
+        EncodedValue::Double(d) => d.to_string(),
+        EncodedValue::String(s) => format!("\"{}\"", s),
+        EncodedValue::Type(t) => t.type_descriptor().to_string(),
+        EncodedValue::Array(arr) => {
+            let inner = arr.iter().take(5).map(format_encoded_value).collect::<Vec<_>>().join(", ");
+            if arr.len() > 5 {
+                format!("[{}, ...]", inner)
+            } else {
+                format!("[{}]", inner)
+            }
+        }
+        EncodedValue::Annotation(a) => format!("@{}", a.jtype().type_descriptor()),
+        EncodedValue::Null => "null".to_string(),
+        EncodedValue::Boolean(b) => b.to_string(),
+        _ => format!("{:?}", val),
+    }
+}
+
+/// Extracts annotation summaries from a DEX AnnotationSetItem.
+fn extract_annotations(set: &dex::annotation::AnnotationSetItem) -> Vec<DexAnnotationSummary> {
+    set.annotations()
+        .iter()
+        .map(|item| {
+            let vis = match item.visibility() {
+                dex::annotation::Visibility::Build => "build",
+                dex::annotation::Visibility::Runtime => "runtime",
+                dex::annotation::Visibility::System => "system",
+            };
+            let type_desc = sanitize_identifier(item.annotation().jtype().type_descriptor());
+            let elements = item
+                .annotation()
+                .elements()
+                .iter()
+                .map(|e| (e.name().to_string(), format_encoded_value(e.value())))
+                .collect();
+            DexAnnotationSummary {
+                visibility: vis.to_string(),
+                type_descriptor: type_desc,
+                elements,
+            }
+        })
+        .collect()
+}
+
 /// Parse raw Dalvik DEX binary bytes and return structured analysis result.
 pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResult, AppError> {
     if bytes.is_empty() {
@@ -701,6 +846,15 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
 
         let access_flags = class.access_flags().bits();
 
+        let interfaces: Vec<String> = class
+            .interfaces()
+            .iter()
+            .map(|t| sanitize_identifier(t.type_descriptor()))
+            .collect();
+
+        let source_file = class.source_file().map(|s| s.to_string());
+        let class_annotations = extract_annotations(class.annotations());
+
         // Extract code offsets for direct and virtual methods from class_data
         let (direct_offsets, virtual_offsets) = if class_def.class_data_off() != 0 {
             extract_method_code_offsets(&normalized_bytes, class_def.class_data_off() as usize)
@@ -709,14 +863,42 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
         };
 
         let mut class_fields = Vec::new();
+        let mut detailed_fields = Vec::new();
         let mut class_methods = Vec::new();
 
-        // Collect fields
+        // Collect static fields
         for f in class.static_fields() {
-            class_fields.push(sanitize_identifier(f.name()));
+            let name = sanitize_identifier(f.name());
+            let type_desc = sanitize_identifier(f.jtype().type_descriptor());
+            let f_access = f.access_flags().bits() as u32;
+            let initial_value = f.initial_value().map(format_encoded_value);
+            let f_annots = extract_annotations(f.annotations());
+            detailed_fields.push(DexFieldSummary {
+                name: name.clone(),
+                type_descriptor: type_desc,
+                access_flags: f_access,
+                is_static: true,
+                initial_value,
+                annotations: f_annots,
+            });
+            class_fields.push(name);
         }
+
+        // Collect instance fields
         for f in class.instance_fields() {
-            class_fields.push(sanitize_identifier(f.name()));
+            let name = sanitize_identifier(f.name());
+            let type_desc = sanitize_identifier(f.jtype().type_descriptor());
+            let f_access = f.access_flags().bits() as u32;
+            let f_annots = extract_annotations(f.annotations());
+            detailed_fields.push(DexFieldSummary {
+                name: name.clone(),
+                type_descriptor: type_desc,
+                access_flags: f_access,
+                is_static: false,
+                initial_value: None,
+                annotations: f_annots,
+            });
+            class_fields.push(name);
         }
 
         // Direct methods
@@ -730,6 +912,7 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
             let signature = format!("({}){}", params_str, sanitize_identifier(m.return_type().type_descriptor()));
             let m_access = m.access_flags().bits() as u32;
             let code_offset = direct_offsets.get(idx).copied().flatten();
+            let m_annotations = extract_annotations(m.annotations());
 
             let (registers_size, insns_size, debug_info) = if let Some(off) = code_offset {
                 let off_usize = off as usize;
@@ -771,6 +954,9 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
                 disassembly: None,
                 smali: None,
                 decompiled: None,
+                cfg: None,
+                xrefs: None,
+                annotations: m_annotations,
             });
         }
 
@@ -785,6 +971,7 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
             let signature = format!("({}){}", params_str, sanitize_identifier(m.return_type().type_descriptor()));
             let m_access = m.access_flags().bits() as u32;
             let code_offset = virtual_offsets.get(idx).copied().flatten();
+            let m_annotations = extract_annotations(m.annotations());
 
             let (registers_size, insns_size, debug_info) = if let Some(off) = code_offset {
                 let off_usize = off as usize;
@@ -826,6 +1013,9 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
                 disassembly: None,
                 smali: None,
                 decompiled: None,
+                cfg: None,
+                xrefs: None,
+                annotations: m_annotations,
             });
         }
 
@@ -837,7 +1027,12 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
             access_flags,
             methods: class_methods,
             fields: class_fields,
+            detailed_fields,
+            interfaces,
+            source_file,
+            annotations: class_annotations,
             smali: None,
+            dex_source: Some(file_name.to_string()),
         });
     }
 
@@ -853,10 +1048,11 @@ pub fn parse_dex_bytes(bytes: &[u8], file_name: &str) -> Result<DexAnalysisResul
         disassembly: None,
         smali: None,
         decompiled: None,
+        summary: None,
     })
 }
 
-/// Disassembles Dalvik bytecode at a specific instruction address or method offset.
+/// Disassembles Dalvik bytecode at a specific instruction address or method offset using pure-Rust decoder.
 pub fn disassemble_dalvik_at(
     dex_path: &Path,
     offset: u64,
@@ -866,45 +1062,16 @@ pub fn disassemble_dalvik_at(
         return Err(AppError::FileNotFound(dex_path.display().to_string()));
     }
 
+    let bytes = std::fs::read(dex_path)?;
     let count = if instruction_count == 0 { 20 } else { instruction_count };
-    let cmd = format!("pdj {} @ {}", count, offset);
-
-    let output = std::process::Command::new("radare2")
-        .arg("-N")
-        .arg("-q")
-        .arg("-e")
-        .arg("scr.color=0")
-        .arg("-a")
-        .arg("dalvik")
-        .arg("-c")
-        .arg(&cmd)
-        .arg(dex_path)
-        .env("TERM", "dumb")
-        .env("NO_COLOR", "1")
-        .output()
-        .map_err(|e| AppError::R2ExecutionError(format!("Failed to spawn radare2: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::R2ExecutionError(format!(
-            "radare2 Dalvik disassembly failed: {}",
-            stderr
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let trimmed = stdout.trim();
-
-    if trimmed.is_empty() || trimmed == "[]" {
-        return Ok(Vec::new());
-    }
-
-    serde_json::from_str::<Vec<DalvikInstruction>>(trimmed).map_err(|e| {
-        AppError::R2ExecutionError(format!(
-            "Failed to parse radare2 Dalvik disassembly JSON: {}. Output was: {}",
-            e, trimmed
-        ))
-    })
+    let resolver = crate::apk::dalvik::DexResolver::new(&bytes);
+    let insts = crate::apk::dalvik::disassemble_dalvik_instructions(
+        &bytes,
+        offset,
+        count as u32,
+        resolver.as_ref(),
+    );
+    Ok(insts)
 }
 
 /// Disassembles a specific Dalvik method in a DEX file identified by class and method names.
@@ -988,9 +1155,8 @@ pub fn is_invalid_instruction(inst: &DalvikInstruction) -> bool {
         || inst.ins_type.as_deref() == Some("ill")
 }
 
-/// Disassembles Dalvik bytecode strictly bounded to `insns_size * 2` bytes,
+/// Disassembles Dalvik bytecode strictly bounded to `insns_size * 2` bytes using pure-Rust decoder,
 /// preventing instruction spillover across method boundaries.
-/// When invalid opcodes or gaps follow unconditional control flow, falls back to `.byte 0xXX`.
 pub fn disassemble_dalvik_bounded(
     dex_path: &Path,
     instruction_addr: u64,
@@ -1003,148 +1169,15 @@ pub fn disassemble_dalvik_bounded(
         return Ok(Vec::new());
     }
 
-    let file_bytes = std::fs::read(dex_path).ok();
-    let max_addr = instruction_addr + (insns_size as u64) * 2;
-    let count = (insns_size as usize).max(1);
-
-    let raw_res = disassemble_dalvik_at(dex_path, instruction_addr, count);
-
-    // If radare2 fails on a method, convert method bytecode range to .byte 0xXX instructions
-    let raw = match raw_res {
-        Ok(insts) => insts,
-        Err(_) => {
-            if let Some(bytes) = &file_bytes {
-                let start = (instruction_addr as usize).min(bytes.len());
-                let end = (max_addr as usize).min(bytes.len());
-                let mut fallback = Vec::with_capacity(end.saturating_sub(start));
-                for (i, &b) in bytes[start..end].iter().enumerate() {
-                    fallback.push(DalvikInstruction {
-                        addr: instruction_addr + i as u64,
-                        opcode: ".byte".to_string(),
-                        disasm: format!(".byte {:#04x}", b),
-                        bytes: Some(format!("{:02x}", b)),
-                        ins_type: Some("data".to_string()),
-                    });
-                }
-                return Ok(fallback);
-            } else {
-                return Ok(Vec::new());
-            }
-        }
-    };
-
-    let filtered: Vec<DalvikInstruction> = raw
-        .into_iter()
-        .filter(|i| i.addr >= instruction_addr && i.addr < max_addr)
-        .collect();
-
-    // If no instructions were disassembled but insns_size > 0, fallback to raw bytes
-    if filtered.is_empty() && insns_size > 0 {
-        if let Some(bytes) = &file_bytes {
-            let start = (instruction_addr as usize).min(bytes.len());
-            let end = (max_addr as usize).min(bytes.len());
-            let mut fallback = Vec::with_capacity(end.saturating_sub(start));
-            for (i, &b) in bytes[start..end].iter().enumerate() {
-                fallback.push(DalvikInstruction {
-                    addr: instruction_addr + i as u64,
-                    opcode: ".byte".to_string(),
-                    disasm: format!(".byte {:#04x}", b),
-                    bytes: Some(format!("{:02x}", b)),
-                    ins_type: Some("data".to_string()),
-                });
-            }
-            return Ok(fallback);
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut current_addr = instruction_addr;
-
-    for inst in filtered {
-        if inst.addr < current_addr {
-            continue;
-        }
-
-        // Gap before instruction
-        if inst.addr > current_addr {
-            if let Some(bytes) = &file_bytes {
-                let gap_start = (current_addr as usize).min(bytes.len());
-                let gap_end = (inst.addr as usize).min(bytes.len());
-                for (i, &b) in bytes[gap_start..gap_end].iter().enumerate() {
-                    out.push(DalvikInstruction {
-                        addr: current_addr + i as u64,
-                        opcode: ".byte".to_string(),
-                        disasm: format!(".byte {:#04x}", b),
-                        bytes: Some(format!("{:02x}", b)),
-                        ins_type: Some("data".to_string()),
-                    });
-                }
-            }
-        }
-
-        let inst_len = inst
-            .bytes
-            .as_ref()
-            .map(|s| s.len() / 2)
-            .unwrap_or(2)
-            .max(1) as u64;
-        let inst_end = (inst.addr + inst_len).min(max_addr);
-
-        if is_invalid_instruction(&inst) {
-            if let Some(bytes) = &file_bytes {
-                let start = (inst.addr as usize).min(bytes.len());
-                let end = (inst_end as usize).min(bytes.len());
-                for (i, &b) in bytes[start..end].iter().enumerate() {
-                    out.push(DalvikInstruction {
-                        addr: inst.addr + i as u64,
-                        opcode: ".byte".to_string(),
-                        disasm: format!(".byte {:#04x}", b),
-                        bytes: Some(format!("{:02x}", b)),
-                        ins_type: Some("data".to_string()),
-                    });
-                }
-            } else if let Some(hex) = &inst.bytes {
-                for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-                    if let Ok(s) = std::str::from_utf8(chunk) {
-                        if let Ok(b) = u8::from_str_radix(s, 16) {
-                            out.push(DalvikInstruction {
-                                addr: inst.addr + i as u64,
-                                opcode: ".byte".to_string(),
-                                disasm: format!(".byte {:#04x}", b),
-                                bytes: Some(format!("{:02x}", b)),
-                                ins_type: Some("data".to_string()),
-                            });
-                        }
-                    }
-                }
-            } else {
-                out.push(inst);
-            }
-        } else {
-            out.push(inst);
-        }
-
-        current_addr = inst_end;
-    }
-
-    // Trailing gap up to max_addr
-    if current_addr < max_addr {
-        if let Some(bytes) = &file_bytes {
-            let gap_start = (current_addr as usize).min(bytes.len());
-            let gap_end = (max_addr as usize).min(bytes.len());
-            for (i, &b) in bytes[gap_start..gap_end].iter().enumerate() {
-                out.push(DalvikInstruction {
-                    addr: current_addr + i as u64,
-                    opcode: ".byte".to_string(),
-                    disasm: format!(".byte {:#04x}", b),
-                    bytes: Some(format!("{:02x}", b)),
-                    ins_type: Some("data".to_string()),
-                });
-            }
-        }
-    }
-
-    Ok(out)
+    let bytes = std::fs::read(dex_path)?;
+    let resolver = crate::apk::dalvik::DexResolver::new(&bytes);
+    let insts = crate::apk::dalvik::disassemble_dalvik_instructions(
+        &bytes,
+        instruction_addr,
+        insns_size,
+        resolver.as_ref(),
+    );
+    Ok(insts)
 }
 
 /// Formats class access flags into Smali syntax keywords.
@@ -1255,7 +1288,7 @@ pub fn format_class_smali(c: &DexClassSummary) -> String {
     out.trim_end().to_string()
 }
 
-/// Decompiles Dalvik bytecode at a specific instruction address into pseudo-code using radare2 (`af; pdc`).
+/// Decompiles Dalvik bytecode at a specific instruction address into structured pseudo-Java using pure-Rust decompiler.
 pub fn decompile_dalvik_method(
     dex_path: &Path,
     instruction_addr: u64,
@@ -1264,33 +1297,186 @@ pub fn decompile_dalvik_method(
         return Err(AppError::FileNotFound(dex_path.display().to_string()));
     }
 
-    let cmd = format!("af @ {}; pdc @ {}", instruction_addr, instruction_addr);
+    let bytes = std::fs::read(dex_path)?;
+    let analysis = parse_dex_bytes(&bytes, &dex_path.to_string_lossy()).ok();
+    let resolver = crate::apk::dalvik::DexResolver::new(&bytes);
 
-    let output = std::process::Command::new("radare2")
-        .arg("-N")
-        .arg("-q")
-        .arg("-e")
-        .arg("scr.color=0")
-        .arg("-a")
-        .arg("dalvik")
-        .arg("-c")
-        .arg(&cmd)
-        .arg(dex_path)
-        .env("TERM", "dumb")
-        .env("NO_COLOR", "1")
-        .output()
-        .map_err(|e| AppError::R2ExecutionError(format!("Failed to spawn radare2: {}", e)))?;
+    let (class_name, method_summary) = if let Some(an) = &analysis {
+        let mut found = None;
+        'search: for c in &an.classes {
+            for m in &c.methods {
+                if let Some(off) = m.code_offset {
+                    if off + 16 == instruction_addr {
+                        found = Some((c.name.clone(), m.clone()));
+                        break 'search;
+                    }
+                }
+            }
+        }
+        found.unwrap_or_else(|| {
+            ("UnknownClass".to_string(), DexMethodSummary {
+                name: "unknownMethod".to_string(),
+                signature: "()V".to_string(),
+                access_flags: 1,
+                code_offset: Some(instruction_addr.saturating_sub(16)),
+                registers_size: None,
+                insns_size: Some(100),
+                debug_info: None,
+                disassembly: None,
+                smali: None,
+                decompiled: None,
+                cfg: None,
+                xrefs: None,
+                annotations: Vec::new(),
+            })
+        })
+    } else {
+        ("UnknownClass".to_string(), DexMethodSummary {
+            name: "unknownMethod".to_string(),
+            signature: "()V".to_string(),
+            access_flags: 1,
+            code_offset: Some(instruction_addr.saturating_sub(16)),
+            registers_size: None,
+            insns_size: Some(100),
+            debug_info: None,
+            disassembly: None,
+            smali: None,
+            decompiled: None,
+            cfg: None,
+            xrefs: None,
+            annotations: Vec::new(),
+        })
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::R2ExecutionError(format!(
-            "radare2 Dalvik decompilation failed: {}",
-            stderr
-        )));
+    let insns_sz = method_summary.insns_size.unwrap_or(100);
+    let insts = crate::apk::dalvik::disassemble_dalvik_instructions(
+        &bytes,
+        instruction_addr,
+        insns_sz,
+        resolver.as_ref(),
+    );
+    let cfg = crate::apk::dalvik::build_dalvik_cfg(&method_summary.name, &insts);
+    Ok(crate::apk::dalvik::decompile_dalvik_method_pure_rust(&class_name, &method_summary, &cfg))
+}
+
+/// Extracts a field reference from a Dalvik instruction disassembly string.
+/// Handles resolved references (e.g. `Lcom/.../Class;->field type`) as well as unresolved (`field@123`).
+fn extract_field_ref(dis: &str) -> Option<String> {
+    // In Dalvik instructions (iget/iput/sget/sput), registers precede the field operand:
+    // e.g. "iget-boolean v0, v1, Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z"
+    // or "sget-object v0, Ljava/lang/System;->out Ljava/io/PrintStream;"
+    // or unresolved: "sget v0, field@123"
+    if let Some(comma_pos) = dis.rfind(',') {
+        let field_part = dis[comma_pos + 1..].trim();
+        if (field_part.contains("->") || field_part.starts_with("field@")) && !field_part.contains('(') {
+            return Some(field_part.to_string());
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.trim().to_string())
+    // Fallback: scan all whitespace-separated tokens
+    for token in dis.split_whitespace() {
+        let clean = token.trim_matches(',');
+        if (clean.contains("->") || clean.starts_with("field@")) && !clean.contains('(') {
+            return Some(clean.to_string());
+        }
+    }
+
+    None
+}
+
+/// Populates cross-references (callers, callees, strings, fields read/written) across all classes.
+pub fn populate_multidex_xrefs(
+    classes: &mut [DexClassSummary],
+    dex_bytes_map: &std::collections::HashMap<String, Vec<u8>>,
+) {
+    use std::collections::BTreeSet;
+
+    let mut caller_map: std::collections::HashMap<String, BTreeSet<String>> = std::collections::HashMap::new();
+    let mut callee_map: std::collections::HashMap<String, BTreeSet<String>> = std::collections::HashMap::new();
+    let mut strings_map: std::collections::HashMap<String, BTreeSet<String>> = std::collections::HashMap::new();
+    let mut fields_read_map: std::collections::HashMap<String, BTreeSet<String>> = std::collections::HashMap::new();
+    let mut fields_written_map: std::collections::HashMap<String, BTreeSet<String>> = std::collections::HashMap::new();
+
+    // Cache resolvers per DEX name
+    let resolvers: std::collections::HashMap<&str, crate::apk::dalvik::DexResolver> = dex_bytes_map
+        .iter()
+        .filter_map(|(name, bytes)| {
+            crate::apk::dalvik::DexResolver::new(bytes).map(|r| (name.as_str(), r))
+        })
+        .collect();
+
+    for class in classes.iter_mut() {
+        let dex_name = class.dex_source.as_deref().unwrap_or("classes.dex");
+        let dex_bytes = dex_bytes_map.get(dex_name).or_else(|| dex_bytes_map.values().next());
+        let resolver = resolvers.get(dex_name).or_else(|| resolvers.values().next());
+
+        for method in &mut class.methods {
+            let method_key = format!("{}->{}{}", class.name, method.name, method.signature);
+
+            // Get or decode instructions
+            let insts: Vec<DalvikInstruction> = if let Some(existing) = &method.disassembly {
+                existing.clone()
+            } else if let (Some(off), Some(insns_sz), Some(bytes)) = (method.code_offset, method.insns_size, dex_bytes) {
+                let inst_addr = off + 16;
+                crate::apk::dalvik::disassemble_dalvik_instructions(bytes, inst_addr, insns_sz, resolver)
+            } else {
+                Vec::new()
+            };
+
+            for inst in &insts {
+                let op = inst.opcode.trim();
+                let dis = inst.disasm.trim();
+
+                if op.starts_with("invoke-") {
+                    if let Some(brace_end) = dis.find('}') {
+                        let target = dis[brace_end + 1..].trim().trim_start_matches(',').trim();
+                        if !target.is_empty() {
+                            callee_map.entry(method_key.clone()).or_default().insert(target.to_string());
+                            caller_map.entry(target.to_string()).or_default().insert(method_key.clone());
+                        }
+                    }
+                } else if op.starts_with("sget") || op.starts_with("iget") {
+                    if let Some(field_ref) = extract_field_ref(dis) {
+                        fields_read_map.entry(method_key.clone()).or_default().insert(field_ref);
+                    }
+                } else if op.starts_with("sput") || op.starts_with("iput") {
+                    if let Some(field_ref) = extract_field_ref(dis) {
+                        fields_written_map.entry(method_key.clone()).or_default().insert(field_ref);
+                    }
+                } else if op.starts_with("const-string") {
+                    if let Some(first_quote) = dis.find('"') {
+                        if let Some(last_quote) = dis.rfind('"') {
+                            if last_quote > first_quote {
+                                let s = &dis[first_quote + 1..last_quote];
+                                strings_map.entry(method_key.clone()).or_default().insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Second pass: attach XREFs to each method
+    for class in classes.iter_mut() {
+        for method in &mut class.methods {
+            let method_key = format!("{}->{}{}", class.name, method.name, method.signature);
+
+            let callers = caller_map.remove(&method_key).map(|s| s.into_iter().collect()).unwrap_or_default();
+            let callees = callee_map.remove(&method_key).map(|s| s.into_iter().collect()).unwrap_or_default();
+            let strings_referenced = strings_map.remove(&method_key).map(|s| s.into_iter().collect()).unwrap_or_default();
+            let fields_read = fields_read_map.remove(&method_key).map(|s| s.into_iter().collect()).unwrap_or_default();
+            let fields_written = fields_written_map.remove(&method_key).map(|s| s.into_iter().collect()).unwrap_or_default();
+
+            method.xrefs = Some(DexXrefSummary {
+                callers,
+                callees,
+                strings_referenced,
+                fields_read,
+                fields_written,
+            });
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1508,6 +1694,9 @@ mod tests {
             }]),
             smali: None,
             decompiled: None,
+            cfg: None,
+            xrefs: None,
+            annotations: Vec::new(),
         };
         let smali = format_method_smali(&m);
         assert!(smali.contains(".method public testMethod(I)V"));
@@ -1652,5 +1841,48 @@ mod tests {
         assert_eq!(info3.line_start, 0x80000000);
         assert_eq!(info3.positions.len(), 1);
         assert_eq!(info3.positions[0].line, 0x80000000 - 4);
+    }
+
+    #[test]
+    fn test_extract_field_ref_various_formats() {
+        // Resolved instance field
+        let dis1 = "iget-boolean v0, v1, Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z";
+        assert_eq!(
+            extract_field_ref(dis1),
+            Some("Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z".to_string())
+        );
+
+        // Resolved static field
+        let dis2 = "sget-object v0, Ljava/lang/System;->out Ljava/io/PrintStream;";
+        assert_eq!(
+            extract_field_ref(dis2),
+            Some("Ljava/lang/System;->out Ljava/io/PrintStream;".to_string())
+        );
+
+        // Resolved store field
+        let dis3 = "iput-boolean v2, v1, Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z";
+        assert_eq!(
+            extract_field_ref(dis3),
+            Some("Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z".to_string())
+        );
+
+        // Unresolved field
+        let dis4 = "iget v0, v1, field@123";
+        assert_eq!(extract_field_ref(dis4), Some("field@123".to_string()));
+
+        // Unresolved static put
+        let dis5 = "sput v0, field@456";
+        assert_eq!(extract_field_ref(dis5), Some("field@456".to_string()));
+
+        // Fallback token match without comma
+        let dis6 = "sget field@789";
+        assert_eq!(extract_field_ref(dis6), Some("field@789".to_string()));
+
+        // Non-field instructions
+        let dis7 = "return-void";
+        assert_eq!(extract_field_ref(dis7), None);
+
+        let dis8 = "invoke-virtual {v1}, Lcom/foo/Bar;->baz()V";
+        assert_eq!(extract_field_ref(dis8), None);
     }
 }

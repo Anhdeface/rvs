@@ -605,6 +605,138 @@ class NeutralBinaryOrchestrator:
 
             return {"strings": strs, "total": len(strs)}, None, True
 
+        elif command == "functions":
+            fn_filter = kwargs.get("filter")
+            limit = kwargs.get("limit")
+            offset = kwargs.get("offset")
+            compact = kwargs.get("compact", True)
+            budget = kwargs.get("budget")
+
+            resp = self.harness.apk_dex(
+                file=dex_path,
+                method=fn_filter,
+                limit=limit,
+                offset=offset,
+                compact=compact,
+                budget=budget,
+            )
+            success = bool(resp.get("success", False))
+            error = resp.get("error") if not success else None
+            data = resp.get("data")
+            if not isinstance(data, dict):
+                data = {"result": data} if data is not None else {}
+            functions = []
+            raw_classes = data.get("class_list")
+            if not isinstance(raw_classes, list):
+                raw_classes = data.get("classes")
+            classes = [c for c in raw_classes if isinstance(c, dict)] if isinstance(raw_classes, list) else []
+            for c in classes:
+                cname = c.get("name", "")
+                methods = c.get("methods")
+                if not isinstance(methods, list):
+                    continue
+                for m in methods:
+                    if not isinstance(m, dict):
+                        continue
+                    mname = m.get("name", "")
+                    sig = m.get("sig") or m.get("signature", "")
+                    full_name = f"{cname}->{mname}{sig}"
+                    functions.append({
+                        "name": full_name,
+                        "class": cname,
+                        "method": mname,
+                        "signature": sig,
+                        "offset": m.get("off") or m.get("code_offset"),
+                    })
+            if functions and "functions" not in data:
+                data["functions"] = functions
+                data["total"] = len(functions)
+            return data, error, success
+
+        elif command == "disasm":
+            fn_or_addr = kwargs.get("function_or_addr") or kwargs.get("function") or kwargs.get("target") or kwargs.get("method")
+            compact = kwargs.get("compact", True)
+            budget = kwargs.get("budget")
+            class_name = kwargs.get("class") or kwargs.get("class_name")
+
+            resp = self.harness.apk_dex(
+                file=dex_path,
+                class_name=class_name,
+                method=str(fn_or_addr) if fn_or_addr else None,
+                disasm=True,
+                compact=compact,
+                budget=budget,
+            )
+            success = bool(resp.get("success", False))
+            error = resp.get("error") if not success else None
+            data = resp.get("data")
+            if not isinstance(data, dict):
+                data = {"result": data} if data is not None else {}
+            return data, error, success
+
+        elif command == "decompile":
+            fn_or_addr = kwargs.get("function_or_addr") or kwargs.get("function") or kwargs.get("target") or kwargs.get("method")
+            compact = kwargs.get("compact", True)
+            budget = kwargs.get("budget")
+            class_name = kwargs.get("class") or kwargs.get("class_name")
+
+            resp = self.harness.apk_dex(
+                file=dex_path,
+                class_name=class_name,
+                method=str(fn_or_addr) if fn_or_addr else None,
+                decompile=True,
+                compact=compact,
+                budget=budget,
+            )
+            success = bool(resp.get("success", False))
+            error = resp.get("error") if not success else None
+            data = resp.get("data")
+            if not isinstance(data, dict):
+                data = {"result": data} if data is not None else {}
+            return data, error, success
+
+        elif command == "flow":
+            fn_or_addr = kwargs.get("function_or_addr") or kwargs.get("function") or kwargs.get("target") or kwargs.get("method")
+            compact = kwargs.get("compact", True)
+            budget = kwargs.get("budget")
+            class_name = kwargs.get("class") or kwargs.get("class_name")
+
+            resp = self.harness.apk_dex(
+                file=dex_path,
+                class_name=class_name,
+                method=str(fn_or_addr) if fn_or_addr else None,
+                cfg=True,
+                compact=compact,
+                budget=budget,
+            )
+            success = bool(resp.get("success", False))
+            error = resp.get("error") if not success else None
+            data = resp.get("data")
+            if not isinstance(data, dict):
+                data = {"result": data} if data is not None else {}
+            return data, error, success
+
+        elif command == "xrefs":
+            fn_or_addr = kwargs.get("function_or_addr") or kwargs.get("symbol_or_addr") or kwargs.get("target") or kwargs.get("method")
+            compact = kwargs.get("compact", True)
+            budget = kwargs.get("budget")
+            class_name = kwargs.get("class") or kwargs.get("class_name")
+
+            resp = self.harness.apk_dex(
+                file=dex_path,
+                class_name=class_name,
+                method=str(fn_or_addr) if fn_or_addr else None,
+                xrefs=True,
+                compact=compact,
+                budget=budget,
+            )
+            success = bool(resp.get("success", False))
+            error = resp.get("error") if not success else None
+            data = resp.get("data")
+            if not isinstance(data, dict):
+                data = {"result": data} if data is not None else {}
+            return data, error, success
+
         else:
             return {}, {
                 "code": "UNSUPPORTED_DEX_OPERATION",

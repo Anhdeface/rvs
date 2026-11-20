@@ -3179,3 +3179,355 @@ fn test_tier2_hybrid_cooperative_post_unpack_manifest_repair() {
     assert!(dest.join("rvs_agent_summary.json").is_file());
     assert!(dest.join("rvs_agent_summary.md").is_file());
 }
+
+// =============================================================================
+// Milestone 1 Deep Java & Dalvik Core Integration Tests (F1 - F6)
+// =============================================================================
+
+#[test]
+fn test_tier1_m1_pure_rust_dalvik_disassembly() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "setChecked", "--disasm",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert_eq!(data.classes.len(), 1);
+    let cls = &data.classes[0];
+    assert_eq!(cls.methods.len(), 1);
+    let method = &cls.methods[0];
+    assert_eq!(method.name, "setChecked");
+
+    let disasm = method.disassembly.as_ref().expect("disassembly expected");
+    assert_eq!(disasm.len(), 5); // iget-boolean, if-eq, iput-boolean, invoke-virtual, return-void
+
+    let ops: Vec<String> = disasm
+        .iter()
+        .map(|inst| inst["disasm"].as_str().unwrap_or("").to_string())
+        .collect();
+
+    assert!(ops[0].starts_with("iget-boolean"));
+    assert!(ops[1].starts_with("if-eq"));
+    assert!(ops[2].starts_with("iput-boolean"));
+    assert!(ops[3].starts_with("invoke-virtual"));
+    assert_eq!(ops[4], "return-void");
+}
+
+#[test]
+fn test_tier1_m1_dalvik_cfg_and_decision_gates() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "setChecked", "--cfg",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let method = &data.classes[0].methods[0];
+    let cfg = method.cfg.as_ref().expect("cfg expected");
+
+    assert_eq!(cfg["method_name"].as_str(), Some("setChecked"));
+    assert_eq!(cfg["total_blocks"].as_u64(), Some(3));
+    assert_eq!(cfg["loop_count"].as_u64(), Some(0));
+
+    let blocks = cfg["blocks"].as_array().expect("blocks array expected");
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0]["id"].as_u64(), Some(0));
+    assert_eq!(blocks[1]["id"].as_u64(), Some(1));
+    assert_eq!(blocks[2]["id"].as_u64(), Some(2));
+
+    let gates = cfg["decision_gates"].as_array().expect("decision_gates array expected");
+    assert_eq!(gates.len(), 1);
+    let gate = &gates[0];
+    assert_eq!(gate["addr"].as_u64(), Some(108092));
+    assert_eq!(gate["gate_type"].as_str(), Some("equality_zero_check"));
+    assert!(gate["branch_instruction"].as_str().unwrap().starts_with("if-eq"));
+    assert_eq!(gate["jump_target"].as_u64(), Some(108106));
+    assert_eq!(gate["fail_target"].as_u64(), Some(108096));
+}
+
+#[test]
+fn test_tier1_m1_multidex_xrefs_correlation() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "--xrefs",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let cls = &data.classes[0];
+
+    // Find setChecked
+    let set_checked = cls.methods.iter().find(|m| m.name == "setChecked").unwrap();
+    let xrefs = set_checked.xrefs.as_ref().expect("xrefs expected for setChecked");
+    let callers = xrefs["callers"].as_array().expect("callers array");
+    assert!(callers.iter().any(|c| c.as_str().unwrap().contains("toggle")));
+    // Cross-class caller from QuickActionWindow must be preserved when filtering by class
+    assert!(callers.iter().any(|c| c.as_str().unwrap().contains("QuickActionWindow")));
+
+    let callees = xrefs["callees"].as_array().expect("callees array");
+    assert!(callees.iter().any(|c| c.as_str().unwrap().contains("refreshDrawableState")));
+
+    // Field access tracking (fields_read and fields_written)
+    let fields_read = xrefs["fields_read"].as_array().expect("fields_read array");
+    assert!(!fields_read.is_empty(), "fields_read must not be empty for setChecked");
+    assert!(fields_read.iter().any(|f| f.as_str().unwrap().contains("QuickActionItem;->mChecked")));
+
+    let fields_written = xrefs["fields_written"].as_array().expect("fields_written array");
+    assert!(!fields_written.is_empty(), "fields_written must not be empty for setChecked");
+    assert!(fields_written.iter().any(|f| f.as_str().unwrap().contains("QuickActionItem;->mChecked")));
+
+    // Find isChecked
+    let is_checked = cls.methods.iter().find(|m| m.name == "isChecked").unwrap();
+    let is_checked_xrefs = is_checked.xrefs.as_ref().expect("xrefs expected for isChecked");
+    let is_checked_callers = is_checked_xrefs["callers"].as_array().expect("callers array");
+    assert!(is_checked_callers.iter().any(|c| c.as_str().unwrap().contains("onCreateDrawableState")));
+}
+
+#[test]
+fn test_tier1_m1_filtered_caller_retention_and_multidex_xrefs() {
+    let multi_apk = multi_dex_apk_fixture();
+    let multi_str = multi_apk.to_str().unwrap();
+
+    // Query with both class and method filters: -C QuickActionItem -m setChecked --xrefs
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", multi_str, "-C", "QuickActionItem", "-m", "setChecked", "--xrefs",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert!(!data.classes.is_empty());
+    let cls = &data.classes[0];
+    assert!(cls.name.contains("QuickActionItem"));
+
+    let method = &cls.methods[0];
+    assert_eq!(method.name, "setChecked");
+    let xrefs = method.xrefs.as_ref().expect("xrefs expected for filtered method");
+
+    // Callers from external classes and secondary DEX must be retained
+    let callers = xrefs["callers"].as_array().expect("callers array");
+    assert!(!callers.is_empty(), "Filtered method must retain external callers");
+    assert!(
+        callers.iter().any(|c| c.as_str().unwrap().contains("QuickActionWindow")),
+        "Callers must include QuickActionWindow"
+    );
+
+    // Field accesses must be non-empty and accurately track field read/written
+    let fields_read = xrefs["fields_read"].as_array().expect("fields_read array");
+    assert_eq!(
+        fields_read[0].as_str(),
+        Some("Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z")
+    );
+
+    let fields_written = xrefs["fields_written"].as_array().expect("fields_written array");
+    assert_eq!(
+        fields_written[0].as_str(),
+        Some("Lcom/devoteam/quickaction/QuickActionItem;->mChecked Z")
+    );
+}
+
+#[test]
+fn test_tier1_m1_rich_structural_typing() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "--fields", "--annotations",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let cls = &data.classes[0];
+
+    // Backward compatibility: fields Vec<String>
+    assert_eq!(cls.fields, vec!["CHECKED_STATE_SET", "mChecked"]);
+
+    // Rich structural typing: detailed_fields
+    let detailed = cls.detailed_fields.as_ref().expect("detailed_fields expected");
+    assert_eq!(detailed.len(), 2);
+
+    let f0 = &detailed[0];
+    assert_eq!(f0["name"].as_str(), Some("CHECKED_STATE_SET"));
+    assert_eq!(f0["type_descriptor"].as_str(), Some("[I"));
+    assert_eq!(f0["is_static"].as_bool(), Some(true));
+
+    let f1 = &detailed[1];
+    assert_eq!(f1["name"].as_str(), Some("mChecked"));
+    assert_eq!(f1["type_descriptor"].as_str(), Some("Z"));
+    assert_eq!(f1["is_static"].as_bool(), Some(false));
+
+    // Interfaces and source_file
+    let interfaces = cls.interfaces.as_ref().expect("interfaces expected");
+    assert!(interfaces.contains(&"Landroid/widget/Checkable;".to_string()));
+    assert_eq!(cls.source_file.as_deref(), Some("QuickActionItem.java"));
+}
+
+#[test]
+fn test_tier1_m1_pure_rust_decompilation() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "setChecked", "--decompile",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let method = &data.classes[0].methods[0];
+    let decompiled = method.decompiled.as_ref().expect("decompiled expected");
+
+    assert!(decompiled.contains("public void setChecked(boolean p0)"));
+    assert!(decompiled.contains("v0 = v1.mChecked;"));
+    assert!(decompiled.contains("if (v0 == v2) goto 0x1a64a;"));
+    assert!(decompiled.contains("v1.mChecked = v2;"));
+    assert!(decompiled.contains("refreshDrawableState()V(v1);"));
+    assert!(decompiled.contains("return;"));
+}
+
+#[test]
+fn test_tier1_m1_decompilation_unconditional_goto_no_duplicate() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", dex_str, "-C", "QuickActionItem", "-m", "toggle", "--decompile",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let method = &data.classes[0].methods[0];
+    let decompiled = method.decompiled.as_ref().expect("decompiled expected");
+
+    assert!(decompiled.contains("public void toggle()"));
+    assert!(decompiled.contains("goto 0x1a6be;"));
+    // Exactly 1 goto 0x1a6be; statement must be emitted, not 2
+    assert_eq!(
+        decompiled.matches("goto 0x1a6be;").count(),
+        1,
+        "Expected exactly 1 'goto 0x1a6be;', found:\n{}",
+        decompiled
+    );
+}
+
+#[test]
+fn test_tier1_m1_cli_pagination_and_summary() {
+    let multi_apk = multi_dex_apk_fixture();
+    let multi_str = multi_apk.to_str().unwrap();
+
+    // Test --summary
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", multi_str, "--summary",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    let summary = data.summary.expect("summary expected");
+    assert_eq!(summary["total_classes"].as_u64(), Some(646));
+    assert_eq!(summary["total_methods"].as_u64(), Some(4352));
+    assert_eq!(summary["total_fields"].as_u64(), Some(4904));
+    assert_eq!(summary["total_strings"].as_u64(), Some(13018));
+
+    // Test pagination: --limit 2 --offset 0
+    let (resp1, out1) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", multi_str, "--limit", "2", "--offset", "0",
+    ]);
+    assert!(out1.status.success());
+    let data1 = resp1.data.expect("DexAnalysisData expected");
+    assert_eq!(data1.classes.len(), 2);
+    let first_class_name = data1.classes[0].name.clone();
+
+    // Test pagination: --limit 2 --offset 2
+    let (resp2, out2) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", multi_str, "--limit", "2", "--offset", "2",
+    ]);
+    assert!(out2.status.success());
+    let data2 = resp2.data.expect("DexAnalysisData expected");
+    assert_eq!(data2.classes.len(), 2);
+    assert_ne!(data2.classes[0].name, first_class_name);
+}
+
+#[test]
+fn test_tier1_m1_compact_dex_enhancements() {
+    let dex = classes_dex_fixture();
+    let dex_str = dex.to_str().unwrap();
+
+    let (resp, out) = run_rvs_json::<serde_json::Value>(&[
+        "-c", "apk", "dex", dex_str, "-C", "QuickActionItem", "--fields", "--cfg",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("data expected");
+
+    let class_list = data["class_list"].as_array().expect("class_list array");
+    assert_eq!(class_list.len(), 1);
+    let cls = &class_list[0];
+    assert_eq!(cls["name"].as_str(), Some("Lcom/devoteam/quickaction/QuickActionItem;"));
+    assert_eq!(cls["super_cls"].as_str(), Some("Landroid/widget/LinearLayout;"));
+    assert_eq!(cls["source_file"].as_str(), Some("QuickActionItem.java"));
+
+    let interfaces = cls["interfaces"].as_array().expect("interfaces array");
+    assert!(interfaces.iter().any(|i| i.as_str() == Some("Landroid/widget/Checkable;")));
+
+    let detailed_fields = cls["detailed_fields"].as_array().expect("detailed_fields array");
+    assert_eq!(detailed_fields.len(), 2);
+    assert_eq!(detailed_fields[0]["name"].as_str(), Some("CHECKED_STATE_SET"));
+    assert_eq!(detailed_fields[0]["type"].as_str(), Some("[I"));
+
+    let methods = cls["methods"].as_array().expect("methods array");
+    let set_checked = methods.iter().find(|m| m["name"].as_str() == Some("setChecked")).unwrap();
+    let cfg = &set_checked["cfg"];
+    assert_eq!(cfg["bb"].as_u64(), Some(3));
+    assert_eq!(cfg["gates"].as_u64(), Some(1));
+}
+
+#[test]
+fn test_tier2_m1_multidex_classes2_routing() {
+    let multi_apk = multi_dex_apk_fixture();
+    let pkg = rvs::apk::ApkPackage::open(&multi_apk).expect("open multi dex apk");
+    let dex_results = pkg.analyze_dex(None).expect("analyze dex");
+
+    assert_eq!(dex_results.len(), 2);
+    assert_eq!(dex_results[0].file_name, "classes.dex");
+    assert_eq!(dex_results[1].file_name, "classes2.dex");
+
+    // Check that classes from classes2.dex have correct dex_source
+    let classes2_classes: Vec<_> = dex_results[1].classes.iter().collect();
+    assert!(!classes2_classes.is_empty(), "classes2.dex must contain classes");
+    for cls in &classes2_classes {
+        assert_eq!(cls.dex_source.as_deref(), Some("classes2.dex"));
+    }
+
+    // Verify multi-DEX CLI disasm on a method in classes2.dex
+    let multi_str = multi_apk.to_str().unwrap();
+    let class_name = &classes2_classes[0].name;
+    let method_name = &classes2_classes[0].methods[0].name;
+
+    let (resp, out) = run_rvs_json::<DexAnalysisData>(&[
+        "apk", "dex", multi_str, "-C", class_name, "-m", method_name, "--disasm",
+    ]);
+
+    assert!(out.status.success());
+    assert!(resp.success);
+    let data = resp.data.expect("DexAnalysisData expected");
+    assert!(!data.classes.is_empty());
+    let target_method = &data.classes[0].methods[0];
+    if target_method.code_offset.is_some() {
+        let disasm = target_method.disassembly.as_ref().expect("disassembly expected for method in classes2.dex");
+        assert!(!disasm.is_empty(), "Method in classes2.dex must disassemble without failure");
+    }
+}

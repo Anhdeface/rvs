@@ -156,9 +156,41 @@ pub enum ApkCommands {
         #[arg(long)]
         smali: bool,
 
-        /// Decompile Dalvik bytecode into pseudo-code using radare2
+        /// Decompile Dalvik bytecode into pseudo-Java
         #[arg(long)]
         decompile: bool,
+
+        /// Generate control flow graph (CFG), basic blocks, and branch gate nodes for matched methods
+        #[arg(long)]
+        cfg: bool,
+
+        /// Cross-reference index (callers, callees, strings, field accesses) across all DEX files
+        #[arg(long)]
+        xrefs: bool,
+
+        /// Include detailed structural typing (field types, static values, annotations)
+        #[arg(long)]
+        fields: bool,
+
+        /// Extract annotations for classes and methods
+        #[arg(long)]
+        annotations: bool,
+
+        /// Output high-level summary of DEX classes and methods
+        #[arg(long)]
+        summary: bool,
+
+        /// Maximum number of classes to return (pagination)
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Number of classes to skip (pagination)
+        #[arg(long)]
+        offset: Option<usize>,
+
+        /// Include string pool in compact output (default omitted in compact mode)
+        #[arg(long)]
+        include_strings: bool,
     },
 
     /// Native .so libraries, exported symbols, static JNI functions with demangled class/methods, dynamic RegisterNatives detection, and cross-references.
@@ -1220,8 +1252,25 @@ mod tests {
         // dex
         let cli3 = Cli::try_parse_from([
             "rvs", "apk", "dex", "app.apk", "--dex-file", "classes.dex", "--class", "MainActivity", "--disasm", "--smali", "--decompile",
+            "--cfg", "--xrefs", "--fields", "--annotations", "--summary", "--limit", "10", "--offset", "5", "--include-strings",
         ]).unwrap();
-        if let Commands::Apk(ApkCommands::Dex { path, dex_file, class, method, disasm, smali, decompile }) = cli3.command {
+        if let Commands::Apk(ApkCommands::Dex {
+            path,
+            dex_file,
+            class,
+            method,
+            disasm,
+            smali,
+            decompile,
+            cfg,
+            xrefs,
+            fields,
+            annotations,
+            summary,
+            limit,
+            offset,
+            include_strings,
+        }) = cli3.command {
             assert_eq!(path, PathBuf::from("app.apk"));
             assert_eq!(dex_file.as_deref(), Some("classes.dex"));
             assert_eq!(class.as_deref(), Some("MainActivity"));
@@ -1229,6 +1278,14 @@ mod tests {
             assert!(disasm);
             assert!(smali);
             assert!(decompile);
+            assert!(cfg);
+            assert!(xrefs);
+            assert!(fields);
+            assert!(annotations);
+            assert!(summary);
+            assert_eq!(limit, Some(10));
+            assert_eq!(offset, Some(5));
+            assert!(include_strings);
         } else {
             panic!("Expected ApkCommands::Dex");
         }

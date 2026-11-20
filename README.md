@@ -1,6 +1,6 @@
 # rvs: High-Performance Binary Analysis, Dynamic RE, Debugging & Instrumentation Engine
 
-[![Version](https://img.shields.io/badge/version-v0.4.2-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v0.4.3-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 [![MCP](https://img.shields.io/badge/protocol-MCP_Compliant-purple.svg)](https://modelcontextprotocol.io/)

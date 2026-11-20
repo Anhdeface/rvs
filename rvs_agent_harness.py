@@ -76,7 +76,7 @@ DEFAULT_TIMEOUT_SECONDS: float = 30.0
 
 MCP_PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "rvs-mcp-server"
-SERVER_VERSION: str = "0.4.2"
+SERVER_VERSION: str = "0.4.3"
 
 # Regex for stripping ANSI escape codes
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -2462,6 +2462,133 @@ def prune_step(data: Dict[str, Any], mode: OutputMode) -> Dict[str, Any]:
     }
 
 
+def apply_field_filter(res: Dict[str, Any], fields_arg: Any) -> Dict[str, Any]:
+    """Filter response data dictionary keys to only retain requested fields."""
+    if not isinstance(res, dict) or not res.get("success") or not isinstance(res.get("data"), dict):
+        return res
+    if not fields_arg or isinstance(fields_arg, bool):
+        return res
+    if isinstance(fields_arg, str):
+        allowed = {f.strip() for f in fields_arg.split(",") if f.strip()}
+    elif isinstance(fields_arg, (list, tuple, set)):
+        allowed = {str(f).strip() for f in fields_arg if str(f).strip()}
+    else:
+        return res
+    if not allowed:
+        return res
+
+    data = res["data"]
+    filtered_data = {k: v for k, v in data.items() if k in allowed}
+    res["data"] = filtered_data
+    if "token_estimate" in res:
+        res["token_estimate"] = TokenEstimator.estimate_obj(res["data"])
+    return res
+
+
+def prune_apk_inspect(data: Dict[str, Any], mode: OutputMode, budget: Optional[int] = None) -> Dict[str, Any]:
+    """Prune APK inspection metadata."""
+    if mode == "full" and budget is None:
+        return data
+    pruned = dict(data)
+    if budget is not None and budget < 400:
+        pruned.pop("recommendations", None)
+        pruned.pop("raw_strings", None)
+    return pruned
+
+
+def prune_apk_manifest(data: Dict[str, Any], mode: OutputMode, budget: Optional[int] = None) -> Dict[str, Any]:
+    """Prune AndroidManifest metadata."""
+    if mode == "full" and budget is None:
+        return data
+    pruned = dict(data)
+    if budget is not None:
+        # Avoid bloated raw_xml dump under budget
+        pruned.pop("raw_xml", None)
+        if budget < 300:
+            pruned.pop("meta_data", None)
+            pruned.pop("intent_filters", None)
+    return pruned
+
+
+def prune_apk_dex(
+    data: Dict[str, Any],
+    mode: OutputMode,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    budget: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Prune Dalvik DEX analysis output."""
+    if mode == "full" and budget is None and limit is None and offset == 0:
+        return data
+    pruned = dict(data)
+    class_list = pruned.get("class_list")
+    if isinstance(class_list, list):
+        if offset > 0:
+            class_list = class_list[offset:]
+        if limit is not None and limit >= 0:
+            class_list = class_list[:limit]
+        pruned["class_list"] = class_list
+    elif isinstance(pruned.get("classes"), list):
+        classes = pruned["classes"]
+        if offset > 0:
+            classes = classes[offset:]
+        if limit is not None and limit >= 0:
+            classes = classes[:limit]
+        pruned["classes"] = classes
+    return pruned
+
+
+def prune_apk_so(
+    data: Dict[str, Any],
+    mode: OutputMode,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    budget: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Prune native library analysis, prioritizing JNI symbols."""
+    if mode == "full" and budget is None and limit is None and offset == 0:
+        return data
+    pruned = dict(data)
+    if budget is not None and budget < 400:
+        pruned.pop("symbols", None)
+        if budget < 250:
+            pruned.pop("exports", None)
+            pruned.pop("imports", None)
+    return pruned
+
+
+def prune_apk_resources(
+    data: Dict[str, Any],
+    mode: OutputMode,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    budget: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Prune resource table and asset listing."""
+    if mode == "full" and budget is None and limit is None and offset == 0:
+        return data
+    pruned = dict(data)
+    entries = pruned.get("entries")
+    if isinstance(entries, list):
+        if offset > 0:
+            entries = entries[offset:]
+        if limit is not None and limit >= 0:
+            entries = entries[:limit]
+        pruned["entries"] = entries
+    return pruned
+
+
+def prune_apk_signature(data: Dict[str, Any], mode: OutputMode, budget: Optional[int] = None) -> Dict[str, Any]:
+    """Prune APK signature details."""
+    if mode == "full" and budget is None:
+        return data
+    pruned = dict(data)
+    if budget is not None and budget < 300:
+        pruned.pop("warnings", None)
+        pruned.pop("verification_errors", None)
+    return pruned
+
+
 def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDict:
     """
     Strict finite termination guard ensuring 0 <= Tokens(env) <= max(budget, B_min).
@@ -2477,19 +2604,24 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
 
     # If data is a dict containing collections
     if isinstance(data, dict):
+        list_keys = [
+            "blocks", "functions", "strings", "symbols", "decision_nodes", "gates",
+            "callers", "callees", "data_refs", "xrefs", "modules", "classes",
+            "class_list", "entries", "perms", "permissions", "activities",
+            "services", "receivers", "providers", "jni", "exports", "imports",
+            "signers", "certificates", "libraries", "dex", "langs",
+        ]
+
         if budget <= 0:
-            collapsed: Dict[str, Any] = {"truncated": True, "note": "Budget exhausted"}
-            for lk in ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]:
-                if lk in data and isinstance(data[lk], list):
-                    collapsed[lk] = []
-            env["data"] = collapsed
-            if "original_tokens" in env:
-                del env["original_tokens"]
+            env["data"] = {"truncated": True}
+            for extra in ("original_tokens", "warnings", "telemetry", "codebook", "execution_time_seconds", "timestamp", "mode"):
+                if extra in env:
+                    del env[extra]
+            env["target"] = ""
             env["token_estimate"] = TokenEstimator.estimate_obj(env)
             return env
 
         # 1. Truncate list fields in data via bisection
-        list_keys = ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]
         for lk in list_keys:
             if lk in data and isinstance(data[lk], list):
                 items = data[lk]
@@ -2497,13 +2629,11 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                     # Fine-grained instruction trimming from non-entry blocks first (bisection search)
                     if len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
                         orig_blocks = list(items)
-                        # Check if block 0 alone exceeds budget
                         data["blocks"] = [dict(orig_blocks[0])]
                         if TokenEstimator.estimate_obj(env) > budget:
                             data["blocks"] = [dict(orig_blocks[0])]
                             items = data["blocks"]
                         else:
-                            # Binary search for block boundary k in 1..len(orig_blocks)
                             low_b = 1
                             high_b = len(orig_blocks)
                             best_k = 1
@@ -2516,7 +2646,6 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                                 else:
                                     high_b = mid - 1
 
-                            # If a boundary block exists, fine-tune its instructions with bisection
                             if best_k < len(orig_blocks):
                                 cand_b = dict(orig_blocks[best_k])
                                 cand_insts = list(cand_b.get("instructions", []))
@@ -2544,7 +2673,6 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                                 data["blocks"] = [dict(b) for b in orig_blocks[:best_k]]
                             items = data["blocks"]
 
-                    # Fine-grained instruction trimming on the entry block (items[0])
                     if len(items) == 1 and isinstance(items[0], dict) and TokenEstimator.estimate_obj(env) > budget:
                         b0 = items[0]
                         b0_insts = list(b0.get("instructions", []))
@@ -2562,7 +2690,6 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                                     high_i = mid_i - 1
                             b0["instructions"] = list(b0_insts[:best_i])
 
-                        # If still over budget, trim optional jump/fail/size before dropping entry block
                         if TokenEstimator.estimate_obj(env) > budget:
                             for opt_field in ("fail", "jump", "size"):
                                 if opt_field in b0:
@@ -2580,7 +2707,6 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                                     if TokenEstimator.estimate_obj(env) <= budget:
                                         break
 
-                        # If still exceeding budget, drop entry block as last resort (preserving entry anchor down to B=200)
                         if budget < 200 and TokenEstimator.estimate_obj(env) > budget:
                             items.pop()
                     elif len(items) > 1 and TokenEstimator.estimate_obj(env) > budget:
@@ -2606,42 +2732,62 @@ def _apply_termination_guard(env: ApiResponseDict, budget: int) -> ApiResponseDi
                 if "displayed" in data and isinstance(data["displayed"], int):
                     data["displayed"] = len(items)
 
-        # 2. Truncate pseudo_c if present (bisection line trimming)
-        if "pseudo_c" in data and isinstance(data["pseudo_c"], str):
-            code_lines = data["pseudo_c"].splitlines()
-            trunc_marker = "// ... [budget truncated] ..."
-            lines_clean = [l for l in code_lines if trunc_marker not in l]
-            if lines_clean and TokenEstimator.estimate_obj(env) > budget:
-                low = 1
-                high = len(lines_clean)
-                best_l = 0
-                while low <= high:
-                    mid = (low + high) // 2
-                    data["pseudo_c"] = "\n".join(lines_clean[:mid]) + f"\n    {trunc_marker}"
-                    if TokenEstimator.estimate_obj(env) <= budget:
-                        best_l = mid
-                        low = mid + 1
+        # 2. Truncate pseudo_c, decompiled, and smali if present (bisection line trimming)
+        for code_key in ("pseudo_c", "decompiled", "smali"):
+            if code_key in data and isinstance(data[code_key], str):
+                code_lines = data[code_key].splitlines()
+                trunc_marker = "// ... [budget truncated] ..."
+                lines_clean = [l for l in code_lines if trunc_marker not in l]
+                if lines_clean and TokenEstimator.estimate_obj(env) > budget:
+                    low = 1
+                    high = len(lines_clean)
+                    best_l = 0
+                    while low <= high:
+                        mid = (low + high) // 2
+                        data[code_key] = "\n".join(lines_clean[:mid]) + f"\n    {trunc_marker}"
+                        if TokenEstimator.estimate_obj(env) <= budget:
+                            best_l = mid
+                            low = mid + 1
+                        else:
+                            high = mid - 1
+                    if best_l > 0:
+                        data[code_key] = "\n".join(lines_clean[:best_l]) + f"\n    {trunc_marker}"
                     else:
-                        high = mid - 1
-                if best_l > 0:
-                    data["pseudo_c"] = "\n".join(lines_clean[:best_l]) + f"\n    {trunc_marker}"
-                else:
-                    data["pseudo_c"] = "// [budget truncated: 0 tokens]"
-            if TokenEstimator.estimate_obj(env) > budget and lines_clean:
-                data["pseudo_c"] = "// [budget truncated: 0 tokens]"
+                        data[code_key] = "// [budget truncated: 0 tokens]"
+                if TokenEstimator.estimate_obj(env) > budget and lines_clean:
+                    data[code_key] = "// [budget truncated: 0 tokens]"
 
-        # 3. If still exceeding budget, collapse data to minimal marker (preserving entry block anchor down to B=200)
-        if budget < 200 and TokenEstimator.estimate_obj(env) > budget:
+        # 3. Drop non-essential verbose fields if still over budget
+        if TokenEstimator.estimate_obj(env) > budget:
+            for opt_key in ("raw_xml", "meta_data", "intent_filters", "recommendations", "warnings", "verification_errors", "extracted", "string_pool", "strings"):
+                if opt_key in data:
+                    del data[opt_key]
+                    if TokenEstimator.estimate_obj(env) <= budget:
+                        break
+
+        if "summary" in data and isinstance(data["summary"], dict) and TokenEstimator.estimate_obj(env) > budget:
+            if "sample_classes" in data["summary"]:
+                data["summary"]["sample_classes"] = []
+
+        # 4. If still exceeding budget, collapse data to minimal marker
+        if TokenEstimator.estimate_obj(env) > budget:
             collapsed = {"truncated": True, "note": "Budget exhausted"}
-            for lk in ["blocks", "functions", "strings", "symbols", "decision_nodes", "gates", "callers", "callees", "data_refs", "xrefs", "modules", "classes"]:
-                if lk in data and isinstance(data[lk], list):
-                    collapsed[lk] = []
+            for keep_id in ("file", "pkg", "src", "target"):
+                if keep_id in data:
+                    collapsed[keep_id] = data[keep_id]
             env["data"] = collapsed
 
-        # 4. If envelope still exceeds budget, trim non-critical metadata to respect budget
+        # 5. If envelope still exceeds budget, trim non-critical metadata to respect budget
         if TokenEstimator.estimate_obj(env) > budget:
-            if "original_tokens" in env:
-                del env["original_tokens"]
+            for extra in ("original_tokens", "warnings", "telemetry", "codebook", "execution_time_seconds", "timestamp", "mode"):
+                if extra in env:
+                    del env[extra]
+
+        # 6. If envelope still exceeds budget, simplify data further
+        if TokenEstimator.estimate_obj(env) > budget and isinstance(env.get("data"), dict):
+            env["data"] = {"truncated": True}
+        if TokenEstimator.estimate_obj(env) > budget:
+            env["target"] = ""
 
     env["token_estimate"] = TokenEstimator.estimate_obj(env)
     return env
@@ -2690,7 +2836,20 @@ def _transform_single_budget(
     cmd = resp_envelope.get("command", "").lower()
     transformed_data: Dict[str, Any]
 
-    if "info" in cmd:
+    if "apk inspect" in cmd or "apk info" in cmd:
+        transformed_data = prune_apk_inspect(raw_data, mode, budget=budget)
+    elif "apk manifest" in cmd:
+        transformed_data = prune_apk_manifest(raw_data, mode, budget=budget)
+    elif "apk dex" in cmd:
+        transformed_data = prune_apk_dex(raw_data, mode, limit=limit, offset=offset, budget=budget)
+    elif "apk so" in cmd or "apk native" in cmd:
+        transformed_data = prune_apk_so(raw_data, mode, limit=limit, offset=offset, budget=budget)
+    elif "apk resources" in cmd or "apk res" in cmd:
+        transformed_data = prune_apk_resources(raw_data, mode, limit=limit, offset=offset, budget=budget)
+    elif "apk signature" in cmd or "apk sig" in cmd or "apk cert" in cmd:
+        transformed_data = prune_apk_signature(raw_data, mode, budget=budget)
+    elif "info" in cmd:
+        transformed_data = prune_info(raw_data, mode)
         transformed_data = prune_info(raw_data, mode)
     elif "functions" in cmd or "funcs" in cmd:
         transformed_data = prune_functions(raw_data, mode, limit=limit, offset=offset, budget=budget)
@@ -4206,6 +4365,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "string",
                 "description": "Path to the target APK archive, extracted directory, or standalone DEX/SO file.",
             },
+            "fields": {
+                "type": "string",
+                "description": "Optional comma-separated list of field names to retain in response data (e.g. 'pkg,langs').",
+            },
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
@@ -4220,6 +4383,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "file": {
                 "type": "string",
                 "description": "Path to the target APK archive, extracted directory, or standalone AndroidManifest.xml.",
+            },
+            "fields": {
+                "type": "string",
+                "description": "Optional comma-separated list of field names to retain in response data (e.g. 'pkg,perms').",
             },
             "compact": {
                 "type": "boolean",
@@ -4256,6 +4423,42 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Decompile Dalvik bytecode into high-level pseudo-Java representation for matched methods. Defaults to false.",
             },
+            "cfg": {
+                "type": "boolean",
+                "description": "Generate Control Flow Graph (CFG), basic blocks, and branch gate nodes. Defaults to false.",
+            },
+            "xrefs": {
+                "type": "boolean",
+                "description": "Multi-DEX cross-reference index (callers, callees, strings referenced, fields read/written). Defaults to false.",
+            },
+            "fields": {
+                "type": "string",
+                "description": "Optional comma-separated list of field names to retain in response data, or detailed structural field typing flag.",
+            },
+            "annotations": {
+                "type": "boolean",
+                "description": "Extract annotations for classes and methods. Defaults to false.",
+            },
+            "summary": {
+                "type": "boolean",
+                "description": "Emit high-level summary of DEX classes, methods, fields, and strings. Defaults to false.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of classes to return (pagination).",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Number of classes to skip (pagination).",
+            },
+            "include_strings": {
+                "type": "boolean",
+                "description": "Include string pool in output. Defaults to false.",
+            },
+            "smali": {
+                "type": "boolean",
+                "description": "Format matched classes and methods as Smali assembly. Defaults to false.",
+            },
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
@@ -4287,6 +4490,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Extract cross-references for detected JNI functions. Defaults to false.",
             },
+            "fields": {
+                "type": "string",
+                "description": "Optional comma-separated list of field names to retain in response data (e.g. 'jni,exports').",
+            },
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
@@ -4314,6 +4521,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
                 "type": "boolean",
                 "description": "Dump raw text or decoded content of matched resource entries. Defaults to false.",
             },
+            "fields": {
+                "type": "string",
+                "description": "Optional comma-separated list of field names to retain in response data (e.g. 'res_cnt,entries').",
+            },
             "compact": {
                 "type": "boolean",
                 "description": "Emit token-optimized compact output. Defaults to true.",
@@ -4332,6 +4543,10 @@ CANONICAL_TOOLS: List[Dict[str, Any]] = [
             "verify": {
                 "type": "boolean",
                 "description": "Perform cryptographic signature integrity verification. Defaults to true.",
+            },
+            "fields": {
+                "type": "string",
+                "description": "Optional comma-separated list of field names to retain in response data (e.g. 'signed,schemes,signers').",
             },
             "compact": {
                 "type": "boolean",
@@ -5485,6 +5700,7 @@ class RvsHarness:
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
+        fields: Optional[Union[str, List[str]]] = None,
     ) -> ApiResponseDict:
         """Inspect APK package metadata, manifest summary, DEX and native .so libraries."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
@@ -5496,7 +5712,7 @@ class RvsHarness:
             langs = data.get("langs")
             if not langs and "languages" in data:
                 langs = [l.get("language") for l in data["languages"] if isinstance(l, dict)]
-            if langs and "recommendations" not in data:
+            if langs and "recommendations" not in data and (budget is None or budget >= 400):
                 recs = []
                 for lang in langs:
                     if "React Native" in lang:
@@ -5509,6 +5725,12 @@ class RvsHarness:
                         recs.append("Dalvik DEX bytecode detected: analyze classes, methods, and strings via 'rvs_apk_dex'.")
                 if recs:
                     data["recommendations"] = recs
+        if fields:
+            res = apply_field_filter(res, fields)
+        if budget is not None:
+            res = _apply_termination_guard(res, budget)
+        elif "token_estimate" in res:
+            res["token_estimate"] = TokenEstimator.estimate_obj(res)
         return res
 
     def apk_manifest(
@@ -5517,12 +5739,16 @@ class RvsHarness:
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
+        fields: Optional[Union[str, List[str]]] = None,
     ) -> ApiResponseDict:
         """Inspect full AndroidManifest details (permissions, components, SDK versions)."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
         mode: OutputMode = "compact" if eff_compact else "full"
         args = ["apk", "manifest", str(file)]
-        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+        res = self.run(args, timeout=timeout, mode=mode, budget=budget)
+        if fields:
+            res = apply_field_filter(res, fields)
+        return res
 
     def apk_dex(
         self,
@@ -5535,6 +5761,16 @@ class RvsHarness:
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
+        cfg: bool = False,
+        xrefs: bool = False,
+        fields_flag: bool = False,
+        fields: Optional[Union[str, List[str], bool]] = None,
+        annotations: bool = False,
+        summary: bool = False,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        include_strings: bool = False,
+        smali: bool = False,
     ) -> ApiResponseDict:
         """Analyze DEX bytecode, classes, methods, signatures, strings, and decompilation."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
@@ -5550,7 +5786,28 @@ class RvsHarness:
             args.append("--disasm")
         if decompile:
             args.append("--decompile")
-        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+        if cfg:
+            args.append("--cfg")
+        if xrefs:
+            args.append("--xrefs")
+        if fields_flag or (isinstance(fields, bool) and fields):
+            args.append("--fields")
+        if annotations:
+            args.append("--annotations")
+        if summary:
+            args.append("--summary")
+        if limit is not None:
+            args.extend(["--limit", str(limit)])
+        if offset is not None:
+            args.extend(["--offset", str(offset)])
+        if include_strings:
+            args.append("--include-strings")
+        if smali:
+            args.append("--smali")
+        res = self.run(args, timeout=timeout, mode=mode, budget=budget)
+        if fields and not isinstance(fields, bool):
+            res = apply_field_filter(res, fields)
+        return res
 
     def apk_native(
         self,
@@ -5562,6 +5819,7 @@ class RvsHarness:
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
+        fields: Optional[Union[str, List[str]]] = None,
     ) -> ApiResponseDict:
         """Analyze native .so libraries, exported symbols, static JNI, and RegisterNatives."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
@@ -5575,7 +5833,10 @@ class RvsHarness:
             args.extend(["--symbol", str(symbol)])
         if xrefs:
             args.append("--xrefs")
-        return self.run(args, timeout=timeout, mode=mode, budget=budget)
+        res = self.run(args, timeout=timeout, mode=mode, budget=budget)
+        if fields:
+            res = apply_field_filter(res, fields)
+        return res
 
     def apk_resources(
         self,
@@ -5586,6 +5847,7 @@ class RvsHarness:
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
+        fields: Optional[Union[str, List[str]]] = None,
     ) -> ApiResponseDict:
         """Inspect and dump Android APK resources, asset directories, and string table values."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
@@ -5661,6 +5923,8 @@ class RvsHarness:
                     ]
                 data["entries"] = filtered_entries
 
+        if fields:
+            res = apply_field_filter(res, fields)
         return res
 
     def apk_signature(
@@ -5670,6 +5934,7 @@ class RvsHarness:
         compact: Optional[bool] = None,
         timeout: Optional[float] = None,
         budget: Optional[int] = None,
+        fields: Optional[Union[str, List[str]]] = None,
     ) -> ApiResponseDict:
         """Extract and verify APK signing details (v1 JAR, v2/v3 signing schemes, and X.509 certs)."""
         eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
@@ -5677,6 +5942,31 @@ class RvsHarness:
         args = ["apk", "signature", str(file)]
         if verify:
             args.append("--verify")
+        res = self.run(args, timeout=timeout, mode=mode, budget=budget)
+        if fields:
+            res = apply_field_filter(res, fields)
+        return res
+
+    def apk_unpack(
+        self,
+        file: Union[str, Path],
+        output: Optional[Union[str, Path]] = None,
+        force: bool = False,
+        no_java: bool = False,
+        compact: Optional[bool] = None,
+        timeout: Optional[float] = None,
+        budget: Optional[int] = None,
+    ) -> ApiResponseDict:
+        """Unpack APK into directory tree: AndroidManifest.xml, res/values/strings.xml, smali code, native .so libraries, and assets."""
+        eff_compact = compact if compact is not None else getattr(self, "default_compact", True)
+        mode: OutputMode = "compact" if eff_compact else "full"
+        args = ["apk", "unpack", str(file)]
+        if output:
+            args.extend(["-o", str(output)])
+        if force:
+            args.append("--force")
+        if no_java:
+            args.append("--no-java")
         return self.run(args, timeout=timeout, mode=mode, budget=budget)
 
     # -------------------------------------------------------------------------
@@ -6047,7 +6337,7 @@ class RvsHarness:
                 "command": "frida attach",
                 "target": str(f_tgt or attach_id),
                 "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "format_version": "0.4.2",
+                "format_version": "0.4.3",
                 "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                 "data": data,
                 "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6144,7 +6434,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": str(spawn_path or target_id),
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.4.2",
+                    "format_version": "0.4.3",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -6173,7 +6463,7 @@ class RvsHarness:
                     "command": "frida spawn",
                     "target": resolved_path,
                     "timestamp": res.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "format_version": "0.4.2",
+                    "format_version": "0.4.3",
                     "execution_time_seconds": res.get("execution_time_seconds", 0.0),
                     "data": data,
                     "warnings": ["r2frida plugin not installed; operating in graceful fallback mode"],
@@ -8411,14 +8701,26 @@ if (fopenPtr) {
 
             elif tool_name in ("rvs_apk_info", "apk_info"):
                 target_apk = file or arguments.get("path")
-                return self.apk_info(file=target_apk, compact=compact, budget=budget)
+                return self.apk_info(
+                    file=target_apk,
+                    compact=compact,
+                    budget=budget,
+                    fields=arguments.get("fields"),
+                )
 
             elif tool_name in ("rvs_apk_manifest", "apk_manifest"):
                 target_apk = file or arguments.get("path")
-                return self.apk_manifest(file=target_apk, compact=compact, budget=budget)
+                return self.apk_manifest(
+                    file=target_apk,
+                    compact=compact,
+                    budget=budget,
+                    fields=arguments.get("fields"),
+                )
 
             elif tool_name in ("rvs_apk_dex", "apk_dex"):
                 target_apk = file or arguments.get("path")
+                f_arg = arguments.get("fields")
+                fields_flag = coerce_bool_param(f_arg, False, "fields") if isinstance(f_arg, bool) else False
                 return self.apk_dex(
                     file=target_apk,
                     dex_file=arguments.get("dex_file"),
@@ -8428,6 +8730,16 @@ if (fopenPtr) {
                     decompile=coerce_bool_param(arguments.get("decompile"), False, "decompile"),
                     compact=compact,
                     budget=budget,
+                    cfg=coerce_bool_param(arguments.get("cfg"), False, "cfg"),
+                    xrefs=coerce_bool_param(arguments.get("xrefs"), False, "xrefs"),
+                    fields_flag=fields_flag,
+                    fields=f_arg,
+                    annotations=coerce_bool_param(arguments.get("annotations"), False, "annotations"),
+                    summary=coerce_bool_param(arguments.get("summary"), False, "summary"),
+                    limit=int(arguments["limit"]) if arguments.get("limit") is not None else None,
+                    offset=int(arguments["offset"]) if arguments.get("offset") is not None else None,
+                    include_strings=coerce_bool_param(arguments.get("include_strings"), False, "include_strings"),
+                    smali=coerce_bool_param(arguments.get("smali"), False, "smali"),
                 )
 
             elif tool_name in ("rvs_apk_native", "apk_native"):
@@ -8440,6 +8752,7 @@ if (fopenPtr) {
                     xrefs=coerce_bool_param(arguments.get("xrefs"), False, "xrefs"),
                     compact=compact,
                     budget=budget,
+                    fields=arguments.get("fields"),
                 )
 
             elif tool_name in ("rvs_apk_resources", "apk_resources", "rvs_apk_res", "apk_res"):
@@ -8458,6 +8771,7 @@ if (fopenPtr) {
                     dump=dump_param,
                     compact=compact,
                     budget=budget,
+                    fields=arguments.get("fields"),
                 )
 
             elif tool_name in ("rvs_apk_signature", "apk_signature", "rvs_apk_cert", "apk_cert", "rvs_apk_sig", "apk_sig"):
@@ -8468,6 +8782,7 @@ if (fopenPtr) {
                     verify=verify_param,
                     compact=compact,
                     budget=budget,
+                    fields=arguments.get("fields"),
                 )
 
             else:

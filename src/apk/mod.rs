@@ -6,6 +6,7 @@
 pub mod container;
 pub mod manifest;
 pub mod dex;
+pub mod dalvik;
 pub mod native_so;
 pub mod resources;
 pub mod signature;
@@ -28,8 +29,14 @@ pub use manifest::{
 pub use dex::{
     decompile_dalvik_method, disassemble_dalvik_at, disassemble_dalvik_bounded,
     disassemble_dalvik_method, format_access_flags_class, format_access_flags_method,
-    format_class_smali, format_method_smali, parse_dex_bytes, DalvikInstruction,
-    DexAnalysisResult, DexClassSummary, DexMethodSummary,
+    format_class_smali, format_method_smali, parse_dex_bytes, populate_multidex_xrefs,
+    DalvikInstruction, DexAnalysisResult, DexAnnotationSummary, DexBasicBlock,
+    DexClassSummary, DexFieldSummary, DexMethodCfg, DexMethodSummary, DexSummary,
+    DexXrefSummary,
+};
+pub use dalvik::{
+    build_dalvik_cfg, decompile_dalvik_method_pure_rust, disassemble_dalvik_instructions,
+    DexResolver,
 };
 pub use native_so::{
     analyze_jni_xrefs, correlate_jni_methods, cross_reference_classes,

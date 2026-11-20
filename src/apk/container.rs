@@ -1153,15 +1153,11 @@ impl ApkPackage {
                             exported_services.push(comp.name.clone());
                         }
                     }
-                    "receiver" => {
-                        if !exported_receivers.contains(&comp.name) {
-                            exported_receivers.push(comp.name.clone());
-                        }
+                    "receiver" if !exported_receivers.contains(&comp.name) => {
+                        exported_receivers.push(comp.name.clone());
                     }
-                    "provider" => {
-                        if !exported_providers.contains(&comp.name) {
-                            exported_providers.push(comp.name.clone());
-                        }
+                    "provider" if !exported_providers.contains(&comp.name) => {
+                        exported_providers.push(comp.name.clone());
                     }
                     _ => {}
                 }
@@ -2082,6 +2078,9 @@ pub fn parse_smali_file(path: &Path) -> Result<super::dex::DexClassSummary, AppE
                     disassembly: None,
                     smali: Some(current_method_lines.join("\n")),
                     decompiled: None,
+                    cfg: None,
+                    xrefs: None,
+                    annotations: Vec::new(),
                 });
                 current_method_lines.clear();
             }
@@ -2139,7 +2138,12 @@ pub fn parse_smali_file(path: &Path) -> Result<super::dex::DexClassSummary, AppE
         access_flags,
         methods,
         fields,
+        detailed_fields: Vec::new(),
+        interfaces: Vec::new(),
+        source_file: None,
+        annotations: Vec::new(),
         smali: Some(content),
+        dex_source: None,
     })
 }
 
@@ -2215,6 +2219,7 @@ pub fn parse_smali_directory(dir: &Path) -> Result<super::dex::DexAnalysisResult
         disassembly: None,
         smali: None,
         decompiled: None,
+        summary: None,
     })
 }
 

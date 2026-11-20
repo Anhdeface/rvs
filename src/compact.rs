@@ -1563,6 +1563,37 @@ impl From<ManifestInfo> for CompactManifestInfo {
     }
 }
 
+/// Compact representation of DEX field summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactDexField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub field_type: String,
+    pub access: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init: Option<String>,
+}
+
+/// Compact representation of DEX annotation summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactDexAnnotation {
+    pub vis: String,
+    #[serde(rename = "type")]
+    pub annot_type: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub elem: Vec<(String, String)>,
+}
+
+/// Compact representation of DEX method CFG.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactDexMethodCfg {
+    pub bb: usize,
+    pub loops: usize,
+    pub gates: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub decision_gates: Vec<crate::agent::flow::BranchGateNode>,
+}
+
 /// Compact representation of DEX method summary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactDexMethod {
@@ -1576,6 +1607,12 @@ pub struct CompactDexMethod {
     pub smali: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompiled: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<CompactDexMethodCfg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xrefs: Option<crate::apk::dex::DexXrefSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<CompactDexAnnotation>,
 }
 
 /// Compact representation of DEX class summary.
@@ -1587,6 +1624,14 @@ pub struct CompactDexClass {
     pub methods: Vec<CompactDexMethod>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub detailed_fields: Vec<CompactDexField>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<CompactDexAnnotation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smali: Option<String>,
 }
@@ -1607,6 +1652,8 @@ pub struct CompactDexAnalysisResult {
     pub smali: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompiled: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::apk::dex::DexSummary>,
 }
 
 impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
@@ -1618,20 +1665,66 @@ impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
                 let methods = c
                     .methods
                     .iter()
-                    .map(|m| CompactDexMethod {
-                        name: m.name.clone(),
-                        sig: m.signature.clone(),
-                        off: m.code_offset.map(|o| format!("0x{:x}", o)),
-                        disassembly: m.disassembly.clone(),
-                        smali: m.smali.clone(),
-                        decompiled: m.decompiled.clone(),
+                    .map(|m| {
+                        let compact_cfg = m.cfg.as_ref().map(|cfg| CompactDexMethodCfg {
+                            bb: cfg.total_blocks,
+                            loops: cfg.loop_count,
+                            gates: cfg.decision_gates.len(),
+                            decision_gates: cfg.decision_gates.clone(),
+                        });
+                        let compact_annots = m
+                            .annotations
+                            .iter()
+                            .map(|a| CompactDexAnnotation {
+                                vis: a.visibility.clone(),
+                                annot_type: a.type_descriptor.clone(),
+                                elem: a.elements.clone(),
+                            })
+                            .collect();
+                        CompactDexMethod {
+                            name: m.name.clone(),
+                            sig: m.signature.clone(),
+                            off: m.code_offset.map(|o| format!("0x{:x}", o)),
+                            disassembly: m.disassembly.clone(),
+                            smali: m.smali.clone(),
+                            decompiled: m.decompiled.clone(),
+                            cfg: compact_cfg,
+                            xrefs: m.xrefs.clone(),
+                            annotations: compact_annots,
+                        }
                     })
                     .collect();
+
+                let detailed_fields = c
+                    .detailed_fields
+                    .iter()
+                    .map(|f| CompactDexField {
+                        name: f.name.clone(),
+                        field_type: f.type_descriptor.clone(),
+                        access: f.access_flags,
+                        init: f.initial_value.clone(),
+                    })
+                    .collect();
+
+                let annotations = c
+                    .annotations
+                    .iter()
+                    .map(|a| CompactDexAnnotation {
+                        vis: a.visibility.clone(),
+                        annot_type: a.type_descriptor.clone(),
+                        elem: a.elements.clone(),
+                    })
+                    .collect();
+
                 CompactDexClass {
                     name: c.name.clone(),
                     super_cls: c.super_class.clone(),
                     methods,
                     fields: c.fields.clone(),
+                    detailed_fields,
+                    interfaces: c.interfaces.clone(),
+                    source_file: c.source_file.clone(),
+                    annotations,
                     smali: c.smali.clone(),
                 }
             })
@@ -1647,6 +1740,7 @@ impl From<&DexAnalysisResult> for CompactDexAnalysisResult {
             disassembly: d.disassembly.clone(),
             smali: d.smali.clone(),
             decompiled: d.decompiled.clone(),
+            summary: d.summary.clone(),
         }
     }
 }

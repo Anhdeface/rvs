@@ -1127,6 +1127,14 @@ fn handle_apk_command(
             disasm,
             smali,
             decompile,
+            cfg,
+            xrefs,
+            fields,
+            annotations,
+            summary,
+            limit,
+            offset,
+            include_strings,
         } => {
             if !path.exists() {
                 return Err(AppError::FileNotFound(path.display().to_string()));
@@ -1148,11 +1156,12 @@ fn handle_apk_command(
                 b.len() >= 4 && (&b[..4] == b"PK\x03\x04" || &b[..4] == b"PK\x05\x06")
             }).unwrap_or(false);
 
-            let mut _temp_guard = TempFileGuard(None);
-            let mut resolved_dex_path = path.to_path_buf();
+            let mut dex_bytes_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
 
             let mut analysis_result = if !is_archive_or_dir {
                 let bytes = file_bytes.unwrap();
+                dex_bytes_map.insert(path.display().to_string(), bytes.clone());
+                dex_bytes_map.insert("classes.dex".to_string(), bytes.clone());
                 apk::parse_dex_bytes(&bytes, &path.display().to_string())?
             } else {
                 let pkg = ApkPackage::open(path)?;
@@ -1210,6 +1219,7 @@ fn handle_apk_command(
                             disassembly: None,
                             smali: None,
                             decompiled: None,
+                            summary: None,
                         }
                     }
                 } else if let Some(target_dex) = &dex_file {
@@ -1221,33 +1231,13 @@ fn handle_apk_command(
                             target_dex
                         ))
                     })?;
-                    if let Some(p) = &entry.path {
-                        if p.is_file() {
-                            resolved_dex_path = p.clone();
-                        }
-                    } else {
-                        let bytes = pkg.read_entry(&entry.name)?;
-                        let t_path = std::env::temp_dir().join(format!("rvs_dex_{}_{}.dex", std::process::id(), entry.name.replace('/', "_")));
-                        std::fs::write(&t_path, &bytes)?;
-                        resolved_dex_path = t_path.clone();
-                        _temp_guard = TempFileGuard(Some(t_path));
-                    }
                     let bytes = pkg.read_entry(&entry.name)?;
+                    dex_bytes_map.insert(entry.name.clone(), bytes.clone());
                     apk::parse_dex_bytes(&bytes, &entry.name)?
                 } else if pkg.dex_entries.len() == 1 {
                     let entry = &pkg.dex_entries[0];
-                    if let Some(p) = &entry.path {
-                        if p.is_file() {
-                            resolved_dex_path = p.clone();
-                        }
-                    } else {
-                        let bytes = pkg.read_entry(&entry.name)?;
-                        let t_path = std::env::temp_dir().join(format!("rvs_dex_{}_{}.dex", std::process::id(), entry.name.replace('/', "_")));
-                        std::fs::write(&t_path, &bytes)?;
-                        resolved_dex_path = t_path.clone();
-                        _temp_guard = TempFileGuard(Some(t_path));
-                    }
                     let bytes = pkg.read_entry(&entry.name)?;
+                    dex_bytes_map.insert(entry.name.clone(), bytes.clone());
                     apk::parse_dex_bytes(&bytes, &entry.name)?
                 } else {
                     // Multi-DEX merge
@@ -1258,6 +1248,7 @@ fn handle_apk_command(
 
                     for entry in &pkg.dex_entries {
                         let bytes = pkg.read_entry(&entry.name)?;
+                        dex_bytes_map.insert(entry.name.clone(), bytes.clone());
                         let r = apk::parse_dex_bytes(&bytes, &entry.name)?;
                         total_methods += r.methods_count;
                         total_strings += r.strings_count;
@@ -1265,21 +1256,6 @@ fn handle_apk_command(
                             all_strings.extend(strs);
                         }
                         combined_classes.extend(r.classes);
-                    }
-
-                    // For multi-DEX, point resolved_dex_path to the primary DEX entry
-                    if let Some(first) = pkg.dex_entries.first() {
-                        if let Some(p) = &first.path {
-                            if p.is_file() {
-                                resolved_dex_path = p.clone();
-                            }
-                        } else if let Ok(bytes) = pkg.read_entry(&first.name) {
-                            let t_path = std::env::temp_dir().join(format!("rvs_dex_{}_{}.dex", std::process::id(), first.name.replace('/', "_")));
-                            if std::fs::write(&t_path, &bytes).is_ok() {
-                                resolved_dex_path = t_path.clone();
-                                _temp_guard = TempFileGuard(Some(t_path));
-                            }
-                        }
                     }
 
                     apk::DexAnalysisResult {
@@ -1292,9 +1268,15 @@ fn handle_apk_command(
                         disassembly: None,
                         smali: None,
                         decompiled: None,
+                        summary: None,
                     }
                 }
             };
+
+            // Wire up --xrefs flag: populate Multi-DEX XREFs across all classes before filtering
+            if *xrefs {
+                apk::populate_multidex_xrefs(&mut analysis_result.classes, &dex_bytes_map);
+            }
 
             // Apply class filter if specified
             if let Some(class_filter) = &class {
@@ -1311,27 +1293,52 @@ fn handle_apk_command(
                 analysis_result.methods_count = analysis_result.classes.iter().map(|c| c.methods.len()).sum();
             }
 
-            // Wire up --disasm and --smali flags: populate Dalvik bytecode disassembly
-            if *disasm || *smali {
+            // Wire up --disasm, --smali, --cfg, and --decompile
+            if *disasm || *smali || *cfg || *decompile {
                 let is_filtered = class.is_some() || method.is_some();
                 let max_disasm_methods = if is_filtered { usize::MAX } else { 20 };
                 let mut methods_disassembled = 0;
                 let mut all_disasm = Vec::new();
+                let mut decompiled_methods = Vec::new();
 
                 'disasm_loop: for c in &mut analysis_result.classes {
+                    let dex_name = c.dex_source.as_deref().unwrap_or("classes.dex");
+                    let dex_bytes = dex_bytes_map.get(dex_name).or_else(|| dex_bytes_map.values().next());
+                    let resolver = dex_bytes.and_then(|b| apk::DexResolver::new(b));
+
                     for m in &mut c.methods {
-                        if methods_disassembled >= max_disasm_methods {
+                        if methods_disassembled >= max_disasm_methods && !(*cfg || *decompile) {
                             break 'disasm_loop;
                         }
-                        if let Some(code_offset) = m.code_offset {
+                        if let (Some(code_offset), Some(insns_size)) = (m.code_offset, m.insns_size) {
                             let instruction_addr = code_offset + 16;
-                            let insts_res = if let Some(insns) = m.insns_size {
-                                apk::disassemble_dalvik_bounded(&resolved_dex_path, instruction_addr, insns)
+                            let insts = if let Some(bytes) = dex_bytes {
+                                apk::disassemble_dalvik_instructions(bytes, instruction_addr, insns_size, resolver.as_ref())
                             } else {
-                                apk::disassemble_dalvik_at(&resolved_dex_path, instruction_addr, 50)
+                                Vec::new()
                             };
 
-                            if let Ok(insts) = insts_res {
+                            let method_cfg = if *cfg || *decompile {
+                                let c_cfg = apk::build_dalvik_cfg(&m.name, &insts);
+                                if *cfg {
+                                    m.cfg = Some(c_cfg.clone());
+                                }
+                                Some(c_cfg)
+                            } else {
+                                None
+                            };
+
+                            if *decompile {
+                                if let Some(ref c_cfg) = method_cfg {
+                                    let decomp = apk::decompile_dalvik_method_pure_rust(&c.name, m, c_cfg);
+                                    if !decomp.is_empty() {
+                                        m.decompiled = Some(decomp.clone());
+                                        decompiled_methods.push(decomp);
+                                    }
+                                }
+                            }
+
+                            if *disasm || *smali {
                                 m.disassembly = Some(insts.clone());
                                 all_disasm.extend(insts);
                                 methods_disassembled += 1;
@@ -1341,6 +1348,9 @@ fn handle_apk_command(
                 }
                 if *disasm && !all_disasm.is_empty() {
                     analysis_result.disassembly = Some(all_disasm);
+                }
+                if *decompile && !decompiled_methods.is_empty() {
+                    analysis_result.decompiled = Some(decompiled_methods.join("\n\n"));
                 }
             }
 
@@ -1366,29 +1376,73 @@ fn handle_apk_command(
                 }
             }
 
-            // Wire up --decompile flag: decompile matched methods using radare2 (af; pdc)
-            if *decompile {
-                let mut decompiled_methods = Vec::new();
+            // Field and annotation filtering: if not requested on CLI, clear detailed_fields and annotations to minimize output
+            if !*fields {
                 for c in &mut analysis_result.classes {
-                    for m in &mut c.methods {
-                        if let Some(code_offset) = m.code_offset {
-                            let instruction_addr = code_offset + 16;
-                            if let Ok(decomp) = apk::decompile_dalvik_method(&resolved_dex_path, instruction_addr) {
-                                if !decomp.is_empty() {
-                                    m.decompiled = Some(decomp.clone());
-                                    decompiled_methods.push(decomp);
-                                }
-                            }
-                        }
-                    }
+                    c.detailed_fields.clear();
                 }
-                if !decompiled_methods.is_empty() {
-                    analysis_result.decompiled = Some(decompiled_methods.join("\n\n"));
+            }
+            if !*annotations {
+                for c in &mut analysis_result.classes {
+                    c.annotations.clear();
+                    for m in &mut c.methods {
+                        m.annotations.clear();
+                    }
                 }
             }
 
+            // Wire up --summary flag
+            if *summary {
+                let total_classes = analysis_result.classes_count;
+                let total_methods = analysis_result.methods_count;
+                let total_fields = analysis_result.classes.iter().map(|c| c.fields.len()).sum();
+                let total_strings = analysis_result.strings_count;
+                let sample_classes = analysis_result.classes.iter().take(10).map(|c| c.name.clone()).collect();
+                analysis_result.summary = Some(apk::DexSummary {
+                    total_classes,
+                    total_methods,
+                    total_fields,
+                    total_strings,
+                    sample_classes,
+                });
+                if limit.is_none() && offset.is_none() {
+                    analysis_result.classes.clear();
+                    analysis_result.classes_count = 0;
+                    analysis_result.methods_count = 0;
+                }
+            }
+
+            // Pagination (--offset, --limit)
+            if let Some(off) = *offset {
+                if off < analysis_result.classes.len() {
+                    analysis_result.classes = analysis_result.classes.split_off(off);
+                } else {
+                    analysis_result.classes.clear();
+                }
+            }
+            if let Some(lim) = *limit {
+                analysis_result.classes.truncate(lim);
+            }
+            analysis_result.classes_count = analysis_result.classes.len();
+            analysis_result.methods_count = analysis_result.classes.iter().map(|c| c.methods.len()).sum();
+
+            // String pool pruning: avoid dumping the full string pool in non-compact mode unless --include-strings is explicitly specified
+            if !*include_strings && analysis_result.strings_count > 100 {
+                analysis_result.strings = None;
+            }
+
             if compact_flag {
-                let comp = compact::CompactDexAnalysisResult::from(&analysis_result);
+                let mut comp = compact::CompactDexAnalysisResult::from(&analysis_result);
+                if !*include_strings {
+                    comp.string_pool = None;
+                }
+                // In compact mode, deduplicate root-level disassembly and decompiled strings when class_list has them
+                if comp.class_list.iter().any(|c| c.methods.iter().any(|m| m.disassembly.is_some())) {
+                    comp.disassembly = None;
+                }
+                if comp.class_list.iter().any(|c| c.methods.iter().any(|m| m.decompiled.is_some())) {
+                    comp.decompiled = None;
+                }
                 let resp = make_compact_response(command_name, target_str, comp);
                 resp.to_json(pretty).map_err(Into::into)
             } else {
